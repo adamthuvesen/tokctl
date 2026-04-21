@@ -1,5 +1,5 @@
 import Table from 'cli-table3';
-import type { AggregateRow } from './reports/shared.js';
+import type { AggregateRow } from './store/rowTypes.js';
 import type { Source } from './types.js';
 
 export type ReportKind = 'daily' | 'monthly' | 'session';
