@@ -7,7 +7,7 @@ describe('resolveRoots', () => {
   it('prefers CLI flag over env and defaults', () => {
     const { roots, userSupplied } = resolveRoots({
       flag: '/a/claude,/b/claude',
-      aiusageEnv: '/nope',
+      tokctlEnv: '/nope',
       toolEnv: '/also-nope',
       defaults: ['/d'],
     });
@@ -15,9 +15,9 @@ describe('resolveRoots', () => {
     expect(roots).toEqual(['/a/claude', '/b/claude']);
   });
 
-  it('falls back to AIUSAGE_* env when no flag', () => {
+  it('falls back to TOKCTL_* env when no flag', () => {
     const { roots, userSupplied } = resolveRoots({
-      aiusageEnv: '/env/a,/env/b',
+      tokctlEnv: '/env/a,/env/b',
       toolEnv: '/should-not-win',
       defaults: ['/d'],
     });
