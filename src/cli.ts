@@ -63,7 +63,7 @@ interface ResolvedRoots {
 
 function resolveRootsFor(
   flag: string | undefined,
-  aiusageEnv: string | undefined,
+  tokctlEnv: string | undefined,
   toolEnv: string | undefined,
   toolEnvSuffix: string | undefined,
   defaults: string[],
@@ -73,7 +73,7 @@ function resolveRootsFor(
     v.split(',').map((s) => s.trim()).filter(Boolean).map(expand);
 
   if (flag && flag.trim()) return { roots: split(flag), userSupplied: true };
-  if (aiusageEnv && aiusageEnv.trim()) return { roots: split(aiusageEnv), userSupplied: true };
+  if (tokctlEnv && tokctlEnv.trim()) return { roots: split(tokctlEnv), userSupplied: true };
   if (toolEnv && toolEnv.trim()) {
     const parts = split(toolEnv);
     return {
@@ -122,14 +122,14 @@ async function runReportFromCacheAsync(kind: ReportKind, opts: GlobalOpts): Prom
 
   const claudeRoots = resolveRootsFor(
     opts.claudeDir,
-    process.env.AIUSAGE_CLAUDE_DIR,
+    process.env.TOKCTL_CLAUDE_DIR,
     process.env.CLAUDE_CONFIG_DIR,
     'projects',
     resolveDefaultClaudeRoots(process.env),
   );
   const codexRoots = resolveRootsFor(
     opts.codexDir,
-    process.env.AIUSAGE_CODEX_DIR,
+    process.env.TOKCTL_CODEX_DIR,
     process.env.CODEX_HOME,
     'sessions',
     resolveDefaultCodexRoots(process.env),
@@ -278,7 +278,7 @@ function attachCommonFlags(cmd: Command): Command {
 
 const program = new Command();
 program
-  .name('aiusage')
+  .name('tokctl')
   .description('Token usage and cost report for Claude Code, Claude Desktop, Codex CLI, and Codex Desktop.')
   .version(pkg.version);
 

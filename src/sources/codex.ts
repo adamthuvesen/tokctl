@@ -113,7 +113,7 @@ export async function ingestCodex(options: CodexSourceOptions): Promise<SourceRu
 
   const { roots, userSupplied } = resolveRoots({
     flag: options.flag,
-    aiusageEnv: options.env.AIUSAGE_CODEX_DIR,
+    tokctlEnv: options.env.TOKCTL_CODEX_DIR,
     toolEnv: options.env.CODEX_HOME,
     toolEnvSuffix: 'sessions',
     defaults: [path.join(os.homedir(), '.codex', 'sessions')],
