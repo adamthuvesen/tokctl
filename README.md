@@ -1,4 +1,4 @@
-# aiusage
+# tokctl
 
 Local-only CLI that reports token usage and cost across **Claude Code**, **Claude Desktop**, **Codex CLI**, and **Codex Desktop** on macOS/Linux. Reads JSONL session logs from disk; no network calls. A small SQLite cache keeps warm runs well under 200 ms.
 
@@ -7,7 +7,7 @@ Local-only CLI that reports token usage and cost across **Claude Code**, **Claud
 ```sh
 npm install
 npm run build
-npm link   # makes `aiusage` available on your PATH
+npm link   # makes `tokctl` available on your PATH
 ```
 
 `npm install` builds a native addon (`better-sqlite3`), so Xcode command-line tools or equivalent are required. Remove them with `npm rebuild` if you ever need to force a rebuild.
@@ -15,28 +15,28 @@ npm link   # makes `aiusage` available on your PATH
 ## Usage
 
 ```sh
-aiusage daily               # tokens + cost grouped by date
-aiusage monthly             # grouped by YYYY-MM
-aiusage session             # grouped by session id
+tokctl daily               # tokens + cost grouped by date
+tokctl monthly             # grouped by YYYY-MM
+tokctl session             # grouped by session id
 
 # filter one tool
-aiusage daily --source claude
-aiusage daily --source codex
+tokctl daily --source claude
+tokctl daily --source codex
 
 # narrow to a date range
-aiusage monthly --since 2026-01-01 --until 2026-03-31
+tokctl monthly --since 2026-01-01 --until 2026-03-31
 
 # JSON output for scripts
-aiusage daily --json
+tokctl daily --json
 
 # multiple or alternate directories
-aiusage daily --claude-dir /path/a,/path/b
-aiusage daily --codex-dir $CODEX_HOME/sessions
+tokctl daily --claude-dir /path/a,/path/b
+tokctl daily --codex-dir $CODEX_HOME/sessions
 
 # cache controls
-aiusage daily --rebuild     # delete the cache DB and re-ingest from scratch
-aiusage daily --no-cache    # bypass the cache for this invocation
-aiusage export-db           # print the absolute path of the cache DB
+tokctl daily --rebuild     # delete the cache DB and re-ingest from scratch
+tokctl daily --no-cache    # bypass the cache for this invocation
+tokctl export-db           # print the absolute path of the cache DB
 ```
 
 ### Example table output
@@ -63,9 +63,9 @@ aiusage export-db           # print the absolute path of the cache DB
 
 | Source | Default roots | Env overrides |
 |---|---|---|
-| Claude | `~/.claude/projects/`, `~/.config/claude/projects/` | `AIUSAGE_CLAUDE_DIR` (csv), `CLAUDE_CONFIG_DIR` (csv, ccusage-compatible) |
-| Codex  | `~/.codex/sessions/` | `AIUSAGE_CODEX_DIR` (csv), `CODEX_HOME` (single path, `/sessions` appended) |
-| Cache  | `$XDG_CACHE_HOME/aiusage/aiusage.db` (or `~/.cache/aiusage/aiusage.db`) | `AIUSAGE_CACHE_DIR` |
+| Claude | `~/.claude/projects/`, `~/.config/claude/projects/` | `TOKCTL_CLAUDE_DIR` (csv), `CLAUDE_CONFIG_DIR` (csv, ccusage-compatible) |
+| Codex  | `~/.codex/sessions/` | `TOKCTL_CODEX_DIR` (csv), `CODEX_HOME` (single path, `/sessions` appended) |
+| Cache  | `$XDG_CACHE_HOME/tokctl/tokctl.db` (or `~/.cache/tokctl/tokctl.db`) | `TOKCTL_CACHE_DIR` |
 
 **macOS Desktop apps are covered automatically** — both `/Applications/Claude.app` and `/Applications/Codex.app` write their session JSONL to the same paths as the CLIs. The Electron data under `~/Library/Application Support/{Claude,Codex}/` holds only UI metadata (no token buckets) and is deliberately not parsed.
 
@@ -88,7 +88,7 @@ Model prices are a hand-maintained table at [`src/pricing.ts`](src/pricing.ts). 
 ## Debugging / ad-hoc queries
 
 ```sh
-sqlite3 "$(aiusage export-db)"
+sqlite3 "$(tokctl export-db)"
 ```
 
 Useful tables: `events` (one row per token-bearing turn), `files` (per-JSONL manifest), `meta` (schema version). All joins are on `events.file_path = files.path`.
