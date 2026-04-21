@@ -1,5 +1,5 @@
 {
-  "name": "aiusage",
+  "name": "tokctl",
   "version": "0.1.0",
   "description": "Local-only CLI that reports token usage and cost across Claude Code, Claude Desktop, Codex CLI, and Codex Desktop.",
   "type": "module",
@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "bin": {
-    "aiusage": "./dist/cli.js"
+    "tokctl": "./dist/cli.js"
   },
   "files": [
     "dist",
