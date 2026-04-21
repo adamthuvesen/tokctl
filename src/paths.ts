@@ -3,7 +3,7 @@ import path from 'node:path';
 
 export interface ResolveRootsInput {
   flag?: string;
-  aiusageEnv?: string;
+  tokctlEnv?: string;
   toolEnv?: string;
   toolEnvSuffix?: string;
   defaults: string[];
@@ -34,8 +34,8 @@ export function resolveRoots(input: ResolveRootsInput): ResolveRootsResult {
   if (input.flag && input.flag.trim()) {
     return { roots: splitCsv(input.flag), userSupplied: true };
   }
-  if (input.aiusageEnv && input.aiusageEnv.trim()) {
-    return { roots: splitCsv(input.aiusageEnv), userSupplied: true };
+  if (input.tokctlEnv && input.tokctlEnv.trim()) {
+    return { roots: splitCsv(input.tokctlEnv), userSupplied: true };
   }
   if (input.toolEnv && input.toolEnv.trim()) {
     const parts = splitCsv(input.toolEnv);

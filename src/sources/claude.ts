@@ -115,7 +115,7 @@ export async function ingestClaude(options: ClaudeSourceOptions): Promise<Source
 
   const { roots, userSupplied } = resolveRoots({
     flag: options.flag,
-    aiusageEnv: options.env.AIUSAGE_CLAUDE_DIR,
+    tokctlEnv: options.env.TOKCTL_CLAUDE_DIR,
     toolEnv: options.env.CLAUDE_CONFIG_DIR,
     toolEnvSuffix: 'projects',
     defaults: [path.join(os.homedir(), '.claude', 'projects'), path.join(os.homedir(), '.config', 'claude', 'projects')],
