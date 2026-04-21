@@ -11,8 +11,8 @@ let tmpDir = '';
 let dbPath = '';
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aiusage-store-'));
-  dbPath = path.join(tmpDir, 'aiusage.db');
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tokctl-store-'));
+  dbPath = path.join(tmpDir, 'tokctl.db');
 });
 
 afterEach(() => {

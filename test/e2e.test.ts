@@ -19,7 +19,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aiusage-e2e-'));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tokctl-e2e-'));
 });
 
 afterEach(() => {
@@ -34,11 +34,11 @@ async function run(args: string[]) {
   return exec('node', [CLI, ...args], {
     env: {
       ...process.env,
-      AIUSAGE_CLAUDE_DIR: '',
-      AIUSAGE_CODEX_DIR: '',
+      TOKCTL_CLAUDE_DIR: '',
+      TOKCTL_CODEX_DIR: '',
       CLAUDE_CONFIG_DIR: '',
       CODEX_HOME: '',
-      AIUSAGE_CACHE_DIR: tmpDir,
+      TOKCTL_CACHE_DIR: tmpDir,
       HOME: '/tmp',
     },
   });
@@ -126,7 +126,7 @@ describe('e2e — error codes', () => {
 
 describe('e2e — cache behavior', () => {
   it('creates the cache DB on first run and reuses it on second run', async () => {
-    const dbPath = path.join(tmpDir, 'aiusage.db');
+    const dbPath = path.join(tmpDir, 'tokctl.db');
     expect(fs.existsSync(dbPath)).toBe(false);
 
     const { stdout: first } = await run([
@@ -141,7 +141,7 @@ describe('e2e — cache behavior', () => {
   });
 
   it('--rebuild nukes and recreates the DB', async () => {
-    const dbPath = path.join(tmpDir, 'aiusage.db');
+    const dbPath = path.join(tmpDir, 'tokctl.db');
     await run(['daily', '--json', '--claude-dir', FIX_CLAUDE, '--codex-dir', FIX_CODEX]);
     const sizeBefore = fs.statSync(dbPath).size;
     const mtimeBefore = fs.statSync(dbPath).mtimeMs;
@@ -159,7 +159,7 @@ describe('e2e — cache behavior', () => {
   });
 
   it('--no-cache does not create the DB', async () => {
-    const dbPath = path.join(tmpDir, 'aiusage.db');
+    const dbPath = path.join(tmpDir, 'tokctl.db');
     await run([
       'daily', '--json', '--no-cache',
       '--claude-dir', FIX_CLAUDE, '--codex-dir', FIX_CODEX,
@@ -181,7 +181,7 @@ describe('e2e — cache behavior', () => {
     const firstTotalInput = firstRows.reduce((s, r) => s + (r.input ?? 0), 0);
 
     // Append one new assistant usage row to an existing claude session file.
-    const sessFile = path.join(liveClaude, '-Users-dev-aiusage', 'sess-a.jsonl');
+    const sessFile = path.join(liveClaude, '-Users-dev-tokctl', 'sess-a.jsonl');
     const appended = {
       type: 'assistant',
       timestamp: '2026-04-21T00:00:00.000Z',
@@ -213,7 +213,7 @@ describe('e2e — cache behavior', () => {
 
 describe('e2e — export-db', () => {
   it('prints the resolved cache path and does not create it', async () => {
-    const dbPath = path.join(tmpDir, 'aiusage.db');
+    const dbPath = path.join(tmpDir, 'tokctl.db');
     expect(fs.existsSync(dbPath)).toBe(false);
     const { stdout } = await run(['export-db']);
     expect(stdout.trim()).toBe(dbPath);

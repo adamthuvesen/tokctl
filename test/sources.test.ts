@@ -15,7 +15,7 @@ describe('Claude source', () => {
     for (const ev of events) {
       expect(ev.source).toBe('claude');
       expect(ev.sessionId).toBe('sess-a');
-      expect(ev.projectPath).toBe('/Users/dev/aiusage');
+      expect(ev.projectPath).toBe('/Users/dev/tokctl');
     }
   });
 
