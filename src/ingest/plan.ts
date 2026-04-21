@@ -153,25 +153,6 @@ function isRecentMtime(mtimeNs: bigint, safetyThresholdNs: bigint): boolean {
   return mtimeNs >= safetyThresholdNs;
 }
 
-async function walkAllFiles(
-  dir: string,
-  accept: (absPath: string, size: number, mtimeNs: bigint) => void | Promise<void>,
-): Promise<void> {
-  for (const e of await listDir(dir)) {
-    const abs = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      await walkAllFiles(abs, accept);
-    } else if (e.isFile() && e.name.endsWith('.jsonl')) {
-      try {
-        const st = await fsp.stat(abs, { bigint: true });
-        await accept(abs, Number(st.size), st.mtimeNs);
-      } catch {
-        // race; skip
-      }
-    }
-  }
-}
-
 /**
  * Walks a directory with dir-mtime short-circuit. If the directory's mtime is
  * older than any manifest mtime it contains (and no file under it is "recent"),
@@ -314,30 +295,4 @@ export async function discoverAll(input: {
     unchangedPaths: new Set<string>([...c.unchangedPaths, ...x.unchangedPaths]),
   };
   return merged;
-}
-
-// Legacy discovery path for --no-cache mode: no short-circuit, no manifest.
-export async function discoverClaudeLegacy(roots: string[]): Promise<DiscoveredFile[]> {
-  const out: DiscoveredFile[] = [];
-  for (const root of roots) {
-    for (const e of await listDir(root)) {
-      if (!e.isDirectory()) continue;
-      const projectDir = path.join(root, e.name);
-      const project = decodeClaudeSlug(e.name);
-      await walkAllFiles(projectDir, (abs, size, mtimeNs) => {
-        out.push({ path: abs, source: 'claude', project, size, mtimeNs });
-      });
-    }
-  }
-  return out;
-}
-
-export async function discoverCodexLegacy(roots: string[]): Promise<DiscoveredFile[]> {
-  const out: DiscoveredFile[] = [];
-  for (const root of roots) {
-    await walkAllFiles(root, (abs, size, mtimeNs) => {
-      out.push({ path: abs, source: 'codex', project: null, size, mtimeNs });
-    });
-  }
-  return out;
 }
