@@ -9,4 +9,5 @@ pub mod render;
 pub mod repo;
 pub mod sources;
 pub mod store;
+pub mod tui;
 pub mod types;
