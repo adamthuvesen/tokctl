@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS events (
   month        TEXT NOT NULL,
   session_id   TEXT NOT NULL,
   project_path TEXT,
+  repo         TEXT,
   model        TEXT NOT NULL,
   input        INTEGER NOT NULL,
   output       INTEGER NOT NULL,
@@ -35,10 +36,18 @@ CREATE TABLE IF NOT EXISTS events (
   cost_usd     REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS repos (
+  key          TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  origin_url   TEXT,
+  first_seen   INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_day       ON events(day);
 CREATE INDEX IF NOT EXISTS idx_events_month     ON events(month);
 CREATE INDEX IF NOT EXISTS idx_events_source_ts ON events(source, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session   ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_project   ON events(project_path);
+CREATE INDEX IF NOT EXISTS idx_events_repo      ON events(repo);
 CREATE INDEX IF NOT EXISTS idx_events_file      ON events(file_path);
 "#;
