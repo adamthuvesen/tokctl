@@ -1,6 +1,6 @@
-export const SCHEMA_VERSION = 2;
+pub const SCHEMA_VERSION: i64 = 2;
 
-export const DDL = `
+pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS events (
   file_path    TEXT NOT NULL,
   source       TEXT NOT NULL,
   ts           INTEGER NOT NULL,
-  day          TEXT NOT NULL,       -- YYYY-MM-DD, local time at insert
-  month        TEXT NOT NULL,       -- YYYY-MM,    local time at insert
+  day          TEXT NOT NULL,
+  month        TEXT NOT NULL,
   session_id   TEXT NOT NULL,
   project_path TEXT,
   model        TEXT NOT NULL,
@@ -41,4 +41,4 @@ CREATE INDEX IF NOT EXISTS idx_events_source_ts ON events(source, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session   ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_project   ON events(project_path);
 CREATE INDEX IF NOT EXISTS idx_events_file      ON events(file_path);
-`;
+"#;
