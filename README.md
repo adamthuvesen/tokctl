@@ -1,6 +1,17 @@
 # tokctl
 
-Local-only CLI that reports token usage and cost across **Claude Code**, **Claude Desktop**, **Codex CLI**, and **Codex Desktop** on macOS/Linux. Reads JSONL session logs from disk; no network calls. A small SQLite cache keeps warm runs well under 200 ms.
+Local-only CLI that reports token usage and cost across **Claude Code**, **Claude Desktop**, **Codex CLI**, and **Codex Desktop** on macOS/Linux. Reads JSONL session logs from disk; no network calls. A small SQLite cache keeps warm runs well under 100 ms.
+
+## Performance
+
+On a reference corpus of 2.1 GB / ~4,800 JSONL files (Apple Silicon, 8 cores):
+
+| Path                 | Cold (`--rebuild`) | Warm (cache hit) |
+|----------------------|--------------------|------------------|
+| Serial (`--threads 1`) | ~7.5 s           | ~0.7 s           |
+| Parallel (default)     | **~2.7 s**       | **~0.1 s CPU**   |
+
+Cold ingest is CPU-bound on JSON parsing. `tokctl` parses files concurrently using `rayon` (default: physical core count) with typed `serde` deserialization and memory-mapped reads for files ≥ 1 MB. All database writes remain serialized per-file for transactional safety.
 
 ## Install
 
