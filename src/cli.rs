@@ -53,6 +53,8 @@ enum Commands {
     Repo(RepoArgs),
     /// Print the absolute path of the cache DB (does not create it).
     ExportDb,
+    /// Launch the interactive terminal UI (read-only against the cache).
+    Ui,
 }
 
 #[derive(Debug, clap::Args)]
@@ -198,6 +200,7 @@ pub fn run() -> Result<()> {
             println!("{}", store_path().display());
             Ok(())
         }
+        Commands::Ui => crate::tui::run(),
     }
 }
 
