@@ -30,7 +30,7 @@ use crate::types::{AggregateRow, ReportKind, Source, SourceLabel, UsageEvent};
 #[command(
     name = "tokctl",
     version,
-    about = "Token usage and cost report for Claude Code, Claude Desktop, Codex CLI, and Codex Desktop."
+    about = "Token usage and cost report for Claude and Codex."
 )]
 struct Cli {
     /// Parallel parse threads (advanced). Default: physical core count.
