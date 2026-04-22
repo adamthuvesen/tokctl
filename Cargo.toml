@@ -2,7 +2,7 @@
 name = "tokctl"
 version = "0.1.0"
 edition = "2021"
-description = "Local-only CLI that reports token usage and cost across Claude Code, Claude Desktop, Codex CLI, and Codex Desktop."
+description = "Local-only CLI that reports token usage and cost across Claude and Codex."
 license = "MIT"
 repository = "https://github.com/adamthuvesen/tokctl"
 rust-version = "1.75"
