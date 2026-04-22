@@ -1,5 +1,6 @@
 use crate::types::UsageEvent;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PriceEntry {
@@ -221,11 +222,14 @@ pub fn normalize_model_id(model: &str) -> &str {
     }
 }
 
+fn price_table() -> &'static HashMap<&'static str, &'static PriceEntry> {
+    static TABLE: OnceLock<HashMap<&'static str, &'static PriceEntry>> = OnceLock::new();
+    TABLE.get_or_init(|| PRICES.iter().map(|(k, v)| (*k, v)).collect())
+}
+
 fn lookup(model: &str) -> Option<&'static PriceEntry> {
     let key = normalize_model_id(model);
-    PRICES
-        .iter()
-        .find_map(|(k, v)| if *k == key { Some(v) } else { None })
+    price_table().get(key).copied()
 }
 
 pub fn has_price(model: &str) -> bool {

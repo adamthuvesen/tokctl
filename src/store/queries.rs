@@ -1,7 +1,9 @@
+use crate::repo::project_basename;
 use crate::types::{AggregateRow, Source, SourceLabel};
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params_from_iter, types::Value, Connection};
+use std::str::FromStr;
 
 /// Sentinel string used in SQL to represent the "(no-repo)" bucket when
 /// repo IS NULL. Chosen to be unambiguous against any real repo key.
@@ -81,18 +83,6 @@ fn build_params(f: &QueryFilter) -> Vec<Value> {
         }
     }
     out
-}
-
-/// Best-effort basename for a raw `project_path`. Handles both real absolute
-/// paths and Claude's dash-encoded form.
-fn basename_of(s: &str) -> &str {
-    if s.starts_with('/') {
-        s.rsplit('/').next().filter(|x| !x.is_empty()).unwrap_or(s)
-    } else if s.starts_with('-') {
-        s.rsplit('-').next().filter(|x| !x.is_empty()).unwrap_or(s)
-    } else {
-        s
-    }
 }
 
 fn source_label(f: &QueryFilter) -> SourceLabel {
@@ -197,10 +187,7 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         let session_id: String = row.get(0)?;
         let src_str: String = row.get(1)?;
-        let source = match src_str.as_str() {
-            "claude" => Source::Claude,
-            _ => Source::Codex,
-        };
+        let source = Source::from_str(&src_str).unwrap_or(Source::Codex);
         let repo_display: Option<String> = row.get(2)?;
         let project_path: Option<String> = row.get(3)?;
         let latest_ms: i64 = row.get(4)?;
@@ -210,8 +197,12 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
             .unwrap_or_else(Utc::now);
         // Prefer the resolved repo display name; fall back to a basename of
         // the raw project_path so rows stay scannable even without a repo.
-        let shown =
-            repo_display.or_else(|| project_path.as_deref().map(basename_of).map(String::from));
+        let shown = repo_display.or_else(|| {
+            project_path
+                .as_deref()
+                .map(project_basename)
+                .map(String::from)
+        });
         Ok(AggregateRow {
             key: session_id,
             source: SourceLabel::Source(source),

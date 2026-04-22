@@ -1,6 +1,6 @@
 use crate::ingest::run::{local_day, local_month};
 use crate::pricing::cost_of;
-use crate::repo::{RepoIdentity, Resolver};
+use crate::repo::{project_basename, RepoIdentity, Resolver};
 use crate::store::queries::{RepoAggregateRow, RepoFilterSpec, NO_REPO_SENTINEL};
 use crate::types::{AggregateRow, Source, SourceLabel, UsageEvent};
 use chrono::{DateTime, Utc};
@@ -49,24 +49,6 @@ pub fn resolve_repos(events: &[UsageEvent]) -> Vec<(UsageEvent, RepoIdentity)> {
             (e, id)
         })
         .collect()
-}
-
-/// Compact display name for raw `project_path` values. Handles real absolute
-/// paths and Claude's dash-encoded folders. Returned as an owned `String`.
-fn display_basename(s: &str) -> String {
-    if s.starts_with('/') {
-        s.rsplit('/')
-            .find(|x| !x.is_empty())
-            .unwrap_or(s)
-            .to_owned()
-    } else if s.starts_with('-') {
-        s.rsplit('-')
-            .find(|x| !x.is_empty())
-            .unwrap_or(s)
-            .to_owned()
-    } else {
-        s.to_owned()
-    }
 }
 
 fn matches_repo_filter(id: &RepoIdentity, filter: &Option<RepoFilterSpec>) -> bool {
@@ -138,7 +120,10 @@ pub fn session_in_memory(
         let row = map.entry(key).or_insert_with(|| AggregateRow {
             key: e.session_id.clone(),
             source: SourceLabel::Source(e.source),
-            project_path: e.project_path.as_deref().map(display_basename),
+            project_path: e
+                .project_path
+                .as_deref()
+                .map(|p| project_basename(p).to_owned()),
             latest_timestamp: Some(e.timestamp),
             input_tokens: 0,
             output_tokens: 0,
@@ -156,7 +141,10 @@ pub fn session_in_memory(
         row.cost_usd += cost_of(e, Some(unknown));
 
         if row.project_path.is_none() && e.project_path.is_some() {
-            row.project_path = e.project_path.as_deref().map(display_basename);
+            row.project_path = e
+                .project_path
+                .as_deref()
+                .map(|p| project_basename(p).to_owned());
         }
         match row.latest_timestamp {
             Some(t) if e.timestamp > t => row.latest_timestamp = Some(e.timestamp),
