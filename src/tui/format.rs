@@ -1,18 +1,6 @@
 use chrono::{DateTime, Duration, Local, Utc};
 
-/// Thousands-separated count, matching `render::fmt_num`.
-pub fn fmt_num(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
+pub use crate::render::fmt_num;
 
 pub fn fmt_cost(n: f64) -> String {
     format!("${:.2}", n)

@@ -2,11 +2,13 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::{params_from_iter, types::Value, Connection};
 
+use crate::repo::project_basename;
 use crate::store::queries::{
-    daily_report, repo_report, session_report, QueryFilter, RepoAggregateRow, RepoFilterSpec,
+    repo_report, session_report, QueryFilter, RepoAggregateRow, RepoFilterSpec,
 };
 use crate::tui::state::{AppState, LeftAxis, SourceFilter, TrendGranularity};
 use crate::types::{AggregateRow, Source};
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct LeftRow {
@@ -340,15 +342,16 @@ fn load_sessions_by_model(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         let src_str: String = row.get(1)?;
-        let source = match src_str.as_str() {
-            "claude" => Source::Claude,
-            _ => Source::Codex,
-        };
+        let source = Source::from_str(&src_str).unwrap_or(Source::Codex);
         let repo_display: Option<String> = row.get(2)?;
         let project_path: Option<String> = row.get(3)?;
         let ms: i64 = row.get(4)?;
-        let shown = repo_display
-            .or_else(|| project_path.as_deref().map(basename_of).map(String::from));
+        let shown = repo_display.or_else(|| {
+            project_path
+                .as_deref()
+                .map(project_basename)
+                .map(String::from)
+        });
         Ok(SessionRow {
             session_id: row.get(0)?,
             source,
@@ -362,17 +365,6 @@ fn load_sessions_by_model(
         })
     })?;
     Ok(rows.filter_map(std::result::Result::ok).collect())
-}
-
-/// Display-name fallback when no repo is resolved: trailing path segment.
-fn basename_of(s: &str) -> &str {
-    if s.starts_with('/') {
-        s.rsplit('/').next().filter(|x| !x.is_empty()).unwrap_or(s)
-    } else if s.starts_with('-') {
-        s.rsplit('-').next().filter(|x| !x.is_empty()).unwrap_or(s)
-    } else {
-        s
-    }
 }
 
 fn day_bounds(day: &str) -> (i64, i64) {
@@ -401,55 +393,49 @@ pub fn load_sparkline(conn: &Connection, days: u32) -> Result<Vec<f64>> {
     Ok(pairs.into_iter().map(|(_, c)| c).collect())
 }
 
-/// Trend data: call daily_report twice (Claude-only, Codex-only) and bucket in Rust.
+/// Trend data: one query grouping by `(day, source)`; cost is split per source in Rust.
 pub fn load_trend(
     conn: &Connection,
     state: &AppState,
     now: DateTime<Utc>,
 ) -> Result<Vec<TrendRow>> {
-    let base = QueryFilter {
-        source: None,
-        since_ms: state.time_window.since_ms(now),
-        until_ms: None,
-        repo: None,
-    };
-    let claude_filter = QueryFilter {
-        source: Some(Source::Claude),
-        ..base.clone()
-    };
-    let codex_filter = QueryFilter {
-        source: Some(Source::Codex),
-        ..base.clone()
-    };
-    let combined = daily_report(conn, base)?;
-    let claude = daily_report(conn, claude_filter)?;
-    let codex = daily_report(conn, codex_filter)?;
-
-    // Apply source filter to the *visible* Claude/Codex splits.
-    let (claude, codex) = match state.source_filter {
-        SourceFilter::All => (claude, codex),
-        SourceFilter::Claude => (claude, Vec::new()),
-        SourceFilter::Codex => (Vec::new(), codex),
-    };
+    let since_ms = state.time_window.since_ms(now);
+    let sql = r#"SELECT
+                   e.day,
+                   e.source,
+                   SUM(e.cost_usd) AS cost,
+                   SUM(e.input + e.output + e.cache_read + e.cache_write) AS tokens
+                 FROM events e
+                 WHERE (?1 IS NULL OR e.ts >= ?1)
+                 GROUP BY e.day, e.source"#;
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([since_ms.map_or(Value::Null, Value::Integer)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, i64>(3)? as u64,
+        ))
+    })?;
 
     let mut days: std::collections::BTreeMap<String, (f64, f64, u64, f64)> = Default::default();
-    for r in &combined {
-        days.entry(r.key.clone())
-            .and_modify(|e| {
-                e.2 += r.total_tokens;
-                e.3 += r.cost_usd;
-            })
-            .or_insert((0.0, 0.0, r.total_tokens, r.cost_usd));
-    }
-    for r in &claude {
-        days.entry(r.key.clone())
-            .and_modify(|e| e.0 += r.cost_usd)
-            .or_insert((r.cost_usd, 0.0, 0, 0.0));
-    }
-    for r in &codex {
-        days.entry(r.key.clone())
-            .and_modify(|e| e.1 += r.cost_usd)
-            .or_insert((0.0, r.cost_usd, 0, 0.0));
+    for row in rows.filter_map(std::result::Result::ok) {
+        let (day, src_str, cost, tokens) = row;
+        let source = Source::from_str(&src_str).unwrap_or(Source::Codex);
+        let include_split = match state.source_filter {
+            SourceFilter::All => true,
+            SourceFilter::Claude => source == Source::Claude,
+            SourceFilter::Codex => source == Source::Codex,
+        };
+        let entry = days.entry(day).or_insert((0.0, 0.0, 0, 0.0));
+        entry.2 += tokens;
+        entry.3 += cost;
+        if include_split {
+            match source {
+                Source::Claude => entry.0 += cost,
+                Source::Codex => entry.1 += cost,
+            }
+        }
     }
 
     let current_day = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
