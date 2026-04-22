@@ -68,6 +68,18 @@ impl Resolver {
     }
 }
 
+/// Best-effort basename for a raw `project_path`. Handles both real absolute
+/// paths (`/a/b/c` → `c`) and Claude's dash-encoded form (`-a-b-c` → `c`).
+pub fn project_basename(s: &str) -> &str {
+    if s.starts_with('/') {
+        s.rsplit('/').find(|x| !x.is_empty()).unwrap_or(s)
+    } else if s.starts_with('-') {
+        s.rsplit('-').find(|x| !x.is_empty()).unwrap_or(s)
+    } else {
+        s
+    }
+}
+
 /// Resolve without memoization. Prefer [`Resolver::resolve`] in hot paths.
 pub fn resolve_path(project_path: &str) -> RepoIdentity {
     let candidates = decode_candidates(project_path);
