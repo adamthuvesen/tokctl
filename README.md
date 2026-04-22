@@ -90,7 +90,7 @@ A keyboard-driven two-pane dashboard over the cache — your chosen pivot axis o
 │  [ REPOS ]                             │  SESSIONS                             │
 │  ▸ tokctl                     $41.22   │  3m ago    claude  tokctl       $8.20 │
 │    cortex                     $18.40   │  2h ago    codex   my-project $3.10│
-│    (no-repo)                  $ 9.03   │  yesterday claude  api-service$1.40│
+│    (no-repo)                  $ 9.03   │  yesterday claude  api-service   $1.40│
 │  ▁▂▂▃▇▅▃▂▁▂▃▅▇▆▃  cost/day last 30d · window:month · source:all               │
 │  j/k move  ↵ drill  h/l pane  / filter  Tab axis  t trend  T/w/m/Y/a window   │
 └────────────────────────────────────────────────────────────────────────────────┘
