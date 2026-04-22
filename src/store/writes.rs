@@ -34,12 +34,21 @@ pub struct EventRow {
     pub month: String,
     pub session_id: String,
     pub project_path: Option<String>,
+    pub repo: Option<String>,
     pub model: String,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoRow {
+    pub key: String,
+    pub display_name: String,
+    pub origin_url: Option<String>,
+    pub first_seen: i64,
 }
 
 pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileManifestRow>> {
@@ -99,6 +108,19 @@ pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Resu
     Ok(())
 }
 
+/// Upsert a repo row. `first_seen` is preserved on conflict.
+pub fn upsert_repo(tx: &Transaction<'_>, row: &RepoRow) -> Result<()> {
+    tx.execute(
+        r#"INSERT INTO repos (key, display_name, origin_url, first_seen)
+           VALUES (?1, ?2, ?3, ?4)
+           ON CONFLICT(key) DO UPDATE SET
+             display_name = excluded.display_name,
+             origin_url   = excluded.origin_url"#,
+        params![row.key, row.display_name, row.origin_url, row.first_seen],
+    )?;
+    Ok(())
+}
+
 pub fn delete_file_and_events(tx: &Transaction<'_>, file_path: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM events WHERE file_path = ?1",
@@ -114,9 +136,9 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
     }
     let mut stmt = tx.prepare(
         r#"INSERT INTO events
-             (file_path, source, ts, day, month, session_id, project_path, model,
+             (file_path, source, ts, day, month, session_id, project_path, repo, model,
               input, output, cache_read, cache_write, cost_usd)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
     )?;
     let mut n = 0usize;
     for r in rows {
@@ -128,6 +150,7 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
             r.month,
             r.session_id,
             r.project_path,
+            r.repo,
             r.model,
             r.input as i64,
             r.output as i64,
@@ -149,6 +172,25 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(DDL).unwrap();
         c
+    }
+
+    fn sample_event(file: &str, repo: Option<&str>) -> EventRow {
+        EventRow {
+            file_path: file.into(),
+            source: Source::Claude,
+            ts: 1,
+            day: "2026-04-22".into(),
+            month: "2026-04".into(),
+            session_id: "s".into(),
+            project_path: None,
+            repo: repo.map(str::to_owned),
+            model: "claude-sonnet-4-6".into(),
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            cost_usd: 0.5,
+        }
     }
 
     #[test]
@@ -194,25 +236,7 @@ mod tests {
             },
         )
         .unwrap();
-        insert_events(
-            &tx,
-            &[EventRow {
-                file_path: "/a.jsonl".into(),
-                source: Source::Claude,
-                ts: 1,
-                day: "2026-04-22".into(),
-                month: "2026-04".into(),
-                session_id: "s".into(),
-                project_path: None,
-                model: "claude-sonnet-4-6".into(),
-                input: 1,
-                output: 2,
-                cache_read: 3,
-                cache_write: 4,
-                cost_usd: 0.5,
-            }],
-        )
-        .unwrap();
+        insert_events(&tx, &[sample_event("/a.jsonl", None)]).unwrap();
         tx.commit().unwrap();
 
         let tx = conn.transaction().unwrap();
@@ -225,5 +249,56 @@ mod tests {
         assert_eq!(n, 0);
         let manifest = load_file_manifest(&conn).unwrap();
         assert!(manifest.is_empty());
+    }
+
+    #[test]
+    fn upsert_repo_preserves_first_seen() {
+        let mut conn = fresh_conn();
+        let tx = conn.transaction().unwrap();
+        upsert_repo(
+            &tx,
+            &RepoRow {
+                key: "/a".into(),
+                display_name: "a".into(),
+                origin_url: None,
+                first_seen: 1000,
+            },
+        )
+        .unwrap();
+        // Second upsert with a later first_seen should NOT overwrite.
+        upsert_repo(
+            &tx,
+            &RepoRow {
+                key: "/a".into(),
+                display_name: "A".into(),
+                origin_url: Some("git@example.com:a.git".into()),
+                first_seen: 9999,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let (name, origin, first): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT display_name, origin_url, first_seen FROM repos WHERE key = '/a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "A");
+        assert_eq!(origin.as_deref(), Some("git@example.com:a.git"));
+        assert_eq!(first, 1000);
+    }
+
+    #[test]
+    fn events_round_trip_repo_column() {
+        let mut conn = fresh_conn();
+        let tx = conn.transaction().unwrap();
+        insert_events(&tx, &[sample_event("/a.jsonl", Some("/repo/a"))]).unwrap();
+        tx.commit().unwrap();
+        let repo: Option<String> = conn
+            .query_row("SELECT repo FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(repo.as_deref(), Some("/repo/a"));
     }
 }

@@ -2,7 +2,7 @@
 name = "tokctl"
 version = "0.1.0"
 edition = "2021"
-description = "Local-only CLI that reports token usage and cost across Claude Code, Claude Desktop, Codex CLI, and Codex Desktop."
+description = "Local-only CLI that reports token usage and cost across Claude and Codex."
 license = "MIT"
 repository = "https://github.com/adamthuvesen/tokctl"
 rust-version = "1.75"
@@ -23,6 +23,14 @@ comfy-table = "7"
 walkdir = "2"
 rayon = "1"
 memmap2 = "0.9"
+ratatui = "0.28"
+crossterm = "0.28"
+nucleo-matcher = "0.3"
+arboard = { version = "3", optional = true }
+
+[features]
+default = ["clipboard"]
+clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 tempfile = "3"
