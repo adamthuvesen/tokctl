@@ -2,9 +2,10 @@ use crate::discovery::{discover_claude, discover_codex, DiscoverOpts, Discovered
 use crate::ingest::file_range::{ingest_claude_range, ingest_codex_range, RangeResult};
 use crate::ingest::plan::{plan_ingest, IngestPlan, PlanInput};
 use crate::pricing::cost_of;
+use crate::repo::Resolver;
 use crate::store::writes::{
-    delete_file_and_events, insert_events, load_file_manifest, upsert_file_manifest, EventRow,
-    FileManifestRow,
+    delete_file_and_events, insert_events, load_file_manifest, upsert_file_manifest, upsert_repo,
+    EventRow, FileManifestRow, RepoRow,
 };
 use crate::types::{IngestStats, Source, UsageEvent};
 use anyhow::Result;
@@ -62,6 +63,7 @@ fn event_to_row(ev: &UsageEvent, file_path: &str, unknown: &mut HashSet<String>)
         month: local_month(&ev.timestamp),
         session_id: ev.session_id.clone(),
         project_path: ev.project_path.clone(),
+        repo: None,
         model: ev.model.clone(),
         input: ev.input_tokens,
         output: ev.output_tokens,
@@ -162,6 +164,40 @@ pub fn run_ingest(opts: RunIngestOptions<'_>) -> Result<IngestStats> {
     execute_plan(conn, plan, manifest)
 }
 
+/// Apply the repo resolver to a batch of event rows, returning the set of
+/// repo keys first seen in this batch along with the earliest timestamp per
+/// key. Mutates `rows` in place to stamp `repo`.
+fn stamp_repos(
+    rows: &mut [EventRow],
+    resolver: &mut Resolver,
+    first_seen: &mut HashMap<String, i64>,
+    no_repo_count: &mut usize,
+) {
+    for r in rows.iter_mut() {
+        let Some(pp) = r.project_path.as_deref() else {
+            *no_repo_count += 1;
+            continue;
+        };
+        let id = resolver.resolve(pp);
+        match id.key {
+            Some(key) => {
+                first_seen
+                    .entry(key.clone())
+                    .and_modify(|t| {
+                        if r.ts < *t {
+                            *t = r.ts;
+                        }
+                    })
+                    .or_insert(r.ts);
+                r.repo = Some(key);
+            }
+            None => {
+                *no_repo_count += 1;
+            }
+        }
+    }
+}
+
 fn execute_plan(
     conn: &mut Connection,
     plan: IngestPlan,
@@ -217,11 +253,25 @@ fn execute_plan(
             .extend(p.unknown_models.iter().cloned());
     }
 
+    // ---- Resolve repo identity for every row in the serial phase ----
+    // Parallel parsing doesn't touch the filesystem beyond the JSONL reads,
+    // so we resolve here where we also write to SQLite. One Resolver per
+    // run memoizes across files.
+    let mut resolver = Resolver::new();
+    let mut first_seen: HashMap<String, i64> = HashMap::new();
+
     // ---- Write phase (serial, per-file transactions) ----
-    for parsed in full_parsed {
+    for mut parsed in full_parsed {
         stats.files_full_parsed += 1;
         let path_str = parsed.file.path.to_string_lossy().into_owned();
         let n_events = parsed.rows.len() as u64;
+
+        stamp_repos(
+            &mut parsed.rows,
+            &mut resolver,
+            &mut first_seen,
+            &mut stats.events_no_repo,
+        );
 
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if manifest.contains_key(&parsed.file.path) {
@@ -246,13 +296,20 @@ fn execute_plan(
         tx.commit()?;
     }
 
-    for (parsed, _from_offset) in tail_parsed {
+    for (mut parsed, _from_offset) in tail_parsed {
         stats.files_tailed += 1;
         let n_events_added = parsed.rows.len() as u64;
         let prev_n = manifest
             .get(&parsed.file.path)
             .map(|r| r.n_events)
             .unwrap_or(0);
+
+        stamp_repos(
+            &mut parsed.rows,
+            &mut resolver,
+            &mut first_seen,
+            &mut stats.events_no_repo,
+        );
 
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let inserted = insert_events(&tx, &parsed.rows)?;
@@ -271,6 +328,25 @@ fn execute_plan(
                 model: parsed.first_model,
             },
         )?;
+        tx.commit()?;
+    }
+
+    // ---- Upsert repos in a single final transaction ----
+    if !first_seen.is_empty() {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (key, id) in resolver.resolved_repos() {
+            let ts = first_seen.get(key).copied().unwrap_or(0);
+            upsert_repo(
+                &tx,
+                &RepoRow {
+                    key: key.to_owned(),
+                    display_name: id.display_name.clone(),
+                    origin_url: id.origin_url.clone(),
+                    first_seen: ts,
+                },
+            )?;
+            stats.repos_resolved += 1;
+        }
         tx.commit()?;
     }
 

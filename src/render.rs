@@ -1,3 +1,4 @@
+use crate::store::queries::RepoAggregateRow;
 use crate::types::{AggregateRow, ReportKind};
 use comfy_table::{presets::UTF8_FULL, Cell, ContentArrangement, Row, Table};
 use serde_json::{json, Map, Value};
@@ -218,6 +219,122 @@ fn row_to_json(r: &AggregateRow, kind: ReportKind, show_source: bool) -> Value {
         json!((r.cost_usd * 10_000.0).round() / 10_000.0),
     );
     Value::Object(obj)
+}
+
+pub fn render_repo_table(rows: &[RepoAggregateRow]) -> String {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(
+        [
+            "repo",
+            "sessions",
+            "input",
+            "output",
+            "cache_read",
+            "cache_write",
+            "total",
+            "cost_usd",
+        ]
+        .iter()
+        .map(|s| Cell::new(*s)),
+    );
+
+    // Sort so that `(no-repo)` sinks to the bottom regardless of its cost.
+    let mut sorted: Vec<&RepoAggregateRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| match (a.is_no_repo(), b.is_no_repo()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b
+            .cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal),
+    });
+
+    for r in &sorted {
+        table.add_row(Row::from(vec![
+            Cell::new(&r.display_name),
+            Cell::new(fmt_num(r.sessions)),
+            Cell::new(fmt_num(r.input_tokens)),
+            Cell::new(fmt_num(r.output_tokens)),
+            Cell::new(fmt_num(r.cache_read_tokens)),
+            Cell::new(fmt_num(r.cache_write_tokens)),
+            Cell::new(fmt_num(r.total_tokens)),
+            Cell::new(fmt_cost(r.cost_usd)),
+        ]));
+    }
+
+    if !sorted.is_empty() {
+        let mut totals = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0f64);
+        for r in &sorted {
+            totals.0 += r.sessions;
+            totals.1 += r.input_tokens;
+            totals.2 += r.output_tokens;
+            totals.3 += r.cache_read_tokens;
+            totals.4 += r.cache_write_tokens;
+            totals.5 += r.total_tokens;
+            totals.6 += r.cost_usd;
+        }
+        table.add_row(Row::from(vec![
+            Cell::new("TOTAL"),
+            Cell::new(fmt_num(totals.0)),
+            Cell::new(fmt_num(totals.1)),
+            Cell::new(fmt_num(totals.2)),
+            Cell::new(fmt_num(totals.3)),
+            Cell::new(fmt_num(totals.4)),
+            Cell::new(fmt_num(totals.5)),
+            Cell::new(fmt_cost(totals.6)),
+        ]));
+    }
+
+    table.to_string()
+}
+
+pub fn render_repo_json(rows: &[RepoAggregateRow]) -> String {
+    let mut sorted: Vec<&RepoAggregateRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| match (a.is_no_repo(), b.is_no_repo()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b
+            .cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal),
+    });
+    let arr: Vec<Value> = sorted
+        .iter()
+        .map(|r| {
+            let mut obj = Map::new();
+            obj.insert("repo".into(), Value::String(r.display_name.clone()));
+            obj.insert(
+                "key".into(),
+                if r.is_no_repo() {
+                    Value::Null
+                } else {
+                    Value::String(r.key.clone())
+                },
+            );
+            obj.insert(
+                "origin_url".into(),
+                r.origin_url
+                    .as_ref()
+                    .map(|s| Value::String(s.clone()))
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert("sessions".into(), json!(r.sessions));
+            obj.insert("input".into(), json!(r.input_tokens));
+            obj.insert("output".into(), json!(r.output_tokens));
+            obj.insert("cache_read".into(), json!(r.cache_read_tokens));
+            obj.insert("cache_write".into(), json!(r.cache_write_tokens));
+            obj.insert("totalTokens".into(), json!(r.total_tokens));
+            obj.insert(
+                "costUsd".into(),
+                json!((r.cost_usd * 10_000.0).round() / 10_000.0),
+            );
+            Value::Object(obj)
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_else(|_| "[]".into())
 }
 
 pub fn render_warnings(unknown_models: &HashSet<String>, skipped_lines: usize) -> Vec<String> {
