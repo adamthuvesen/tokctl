@@ -1,5 +1,7 @@
 use crate::ingest::run::{local_day, local_month};
 use crate::pricing::cost_of;
+use crate::repo::{RepoIdentity, Resolver};
+use crate::store::queries::{RepoAggregateRow, RepoFilterSpec, NO_REPO_SENTINEL};
 use crate::types::{AggregateRow, Source, SourceLabel, UsageEvent};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -26,6 +28,54 @@ pub fn filter_by_date(
         })
         .cloned()
         .collect()
+}
+
+/// Resolve repo identity for every event and return an annotated pairing.
+/// The resolver is memoized across the call.
+pub fn resolve_repos(events: &[UsageEvent]) -> Vec<(UsageEvent, RepoIdentity)> {
+    let mut resolver = Resolver::new();
+    events
+        .iter()
+        .cloned()
+        .map(|e| {
+            let id = match &e.project_path {
+                Some(pp) => resolver.resolve(pp),
+                None => RepoIdentity {
+                    key: None,
+                    display_name: RepoIdentity::NO_REPO_DISPLAY.into(),
+                    origin_url: None,
+                },
+            };
+            (e, id)
+        })
+        .collect()
+}
+
+/// Compact display name for raw `project_path` values. Handles real absolute
+/// paths and Claude's dash-encoded folders. Returned as an owned `String`.
+fn display_basename(s: &str) -> String {
+    if s.starts_with('/') {
+        s.rsplit('/')
+            .find(|x| !x.is_empty())
+            .unwrap_or(s)
+            .to_owned()
+    } else if s.starts_with('-') {
+        s.rsplit('-')
+            .find(|x| !x.is_empty())
+            .unwrap_or(s)
+            .to_owned()
+    } else {
+        s.to_owned()
+    }
+}
+
+fn matches_repo_filter(id: &RepoIdentity, filter: &Option<RepoFilterSpec>) -> bool {
+    match filter {
+        None => true,
+        Some(RepoFilterSpec::NoRepo) => id.key.is_none(),
+        Some(RepoFilterSpec::DisplayName(n)) => id.key.is_some() && &id.display_name == n,
+        Some(RepoFilterSpec::KeyPrefix(p)) => id.key.as_deref().is_some_and(|k| k.starts_with(p)),
+    }
 }
 
 fn aggregate_by<K: Fn(&UsageEvent) -> String>(
@@ -82,14 +132,13 @@ pub fn session_in_memory(
     events: &[UsageEvent],
     unknown: &mut HashSet<String>,
 ) -> Vec<AggregateRow> {
-    // Grouped by (source, session_id)
     let mut map: HashMap<(Source, String), AggregateRow> = HashMap::new();
     for e in events {
         let key = (e.source, e.session_id.clone());
         let row = map.entry(key).or_insert_with(|| AggregateRow {
             key: e.session_id.clone(),
             source: SourceLabel::Source(e.source),
-            project_path: e.project_path.clone(),
+            project_path: e.project_path.as_deref().map(display_basename),
             latest_timestamp: Some(e.timestamp),
             input_tokens: 0,
             output_tokens: 0,
@@ -107,7 +156,7 @@ pub fn session_in_memory(
         row.cost_usd += cost_of(e, Some(unknown));
 
         if row.project_path.is_none() && e.project_path.is_some() {
-            row.project_path = e.project_path.clone();
+            row.project_path = e.project_path.as_deref().map(display_basename);
         }
         match row.latest_timestamp {
             Some(t) if e.timestamp > t => row.latest_timestamp = Some(e.timestamp),
@@ -120,6 +169,85 @@ pub fn session_in_memory(
         b.latest_timestamp
             .unwrap_or(DateTime::<Utc>::MIN_UTC)
             .cmp(&a.latest_timestamp.unwrap_or(DateTime::<Utc>::MIN_UTC))
+    });
+    rows
+}
+
+/// Filter events by repo in-memory and return the subset that passes. The
+/// returned events preserve original order.
+pub fn filter_by_repo(
+    resolved: &[(UsageEvent, RepoIdentity)],
+    spec: &Option<RepoFilterSpec>,
+) -> Vec<UsageEvent> {
+    resolved
+        .iter()
+        .filter(|(_, id)| matches_repo_filter(id, spec))
+        .map(|(e, _)| e.clone())
+        .collect()
+}
+
+/// Repo-grouped aggregation mirroring [`crate::store::queries::repo_report`].
+pub fn repo_in_memory(
+    resolved: &[(UsageEvent, RepoIdentity)],
+    repo_filter: &Option<RepoFilterSpec>,
+    unknown: &mut HashSet<String>,
+) -> Vec<RepoAggregateRow> {
+    // key used to aggregate: canonical repo key OR the no-repo sentinel
+    #[derive(Default)]
+    struct Bucket {
+        display_name: String,
+        origin_url: Option<String>,
+        sessions: HashSet<String>,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        total: u64,
+        cost: f64,
+    }
+    let mut buckets: HashMap<String, Bucket> = HashMap::new();
+
+    for (e, id) in resolved {
+        if !matches_repo_filter(id, repo_filter) {
+            continue;
+        }
+        let key = id
+            .key
+            .clone()
+            .unwrap_or_else(|| NO_REPO_SENTINEL.to_owned());
+        let b = buckets.entry(key).or_default();
+        if b.display_name.is_empty() {
+            b.display_name = id.display_name.clone();
+            b.origin_url = id.origin_url.clone();
+        }
+        b.sessions.insert(e.session_id.clone());
+        b.input += e.input_tokens;
+        b.output += e.output_tokens;
+        b.cache_read += e.cache_read_tokens;
+        b.cache_write += e.cache_write_tokens;
+        b.total += e.input_tokens + e.output_tokens + e.cache_read_tokens + e.cache_write_tokens;
+        b.cost += cost_of(e, Some(unknown));
+    }
+
+    let mut rows: Vec<RepoAggregateRow> = buckets
+        .into_iter()
+        .map(|(key, b)| RepoAggregateRow {
+            key,
+            display_name: b.display_name,
+            origin_url: b.origin_url,
+            sessions: b.sessions.len() as u64,
+            input_tokens: b.input,
+            output_tokens: b.output,
+            cache_read_tokens: b.cache_read,
+            cache_write_tokens: b.cache_write,
+            total_tokens: b.total,
+            cost_usd: b.cost,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     rows
 }
@@ -198,5 +326,30 @@ mod tests {
         let rows = daily_in_memory(&events, SourceLabel::Source(Source::Claude), &mut unknown);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].key < rows[1].key);
+    }
+
+    #[test]
+    fn repo_in_memory_buckets_no_repo_separately() {
+        let mut e1 = event(
+            Source::Claude,
+            "a",
+            "claude-sonnet-4-6",
+            "2026-04-18T09:00:00Z",
+            10,
+        );
+        e1.project_path = None;
+        let e2 = event(
+            Source::Claude,
+            "b",
+            "claude-sonnet-4-6",
+            "2026-04-18T10:00:00Z",
+            20,
+        );
+        let resolved = resolve_repos(&[e1, e2]);
+        let mut unknown = HashSet::new();
+        let rows = repo_in_memory(&resolved, &None, &mut unknown);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_no_repo());
+        assert_eq!(rows[0].sessions, 2);
     }
 }
