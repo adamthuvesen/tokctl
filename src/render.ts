@@ -90,6 +90,29 @@ export function renderTable(
       ]);
     }
   }
+
+  if (rows.length > 0) {
+    const tot = rows.reduce(
+      (acc, r) => {
+        acc.input += r.inputTokens;
+        acc.output += r.outputTokens;
+        acc.cacheRead += r.cacheReadTokens;
+        acc.cacheWrite += r.cacheWriteTokens;
+        acc.total += r.totalTokens;
+        acc.cost += r.costUsd;
+        return acc;
+      },
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+    );
+    if (kind === 'session') {
+      table.push(['TOTAL', '', '', '', fmtNum(tot.input), fmtNum(tot.output), fmtNum(tot.cacheRead), fmtNum(tot.cacheWrite), fmtNum(tot.total), fmtCost(tot.cost)]);
+    } else if (showSource) {
+      table.push(['TOTAL', '', fmtNum(tot.input), fmtNum(tot.output), fmtNum(tot.cacheRead), fmtNum(tot.cacheWrite), fmtNum(tot.total), fmtCost(tot.cost)]);
+    } else {
+      table.push(['TOTAL', fmtNum(tot.input), fmtNum(tot.output), fmtNum(tot.cacheRead), fmtNum(tot.cacheWrite), fmtNum(tot.total), fmtCost(tot.cost)]);
+    }
+  }
+
   return table.toString();
 }
 
