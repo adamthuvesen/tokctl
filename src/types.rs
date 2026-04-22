@@ -58,6 +58,10 @@ pub struct IngestStats {
     pub events_inserted: usize,
     pub skipped_lines: usize,
     pub unknown_models: HashSet<String>,
+    /// Distinct repo keys upserted during the run.
+    pub repos_resolved: usize,
+    /// Events inserted with `repo IS NULL` (no resolvable git ancestor).
+    pub events_no_repo: usize,
 }
 
 /// Label used on aggregate rows. `All` means "combined across sources".
