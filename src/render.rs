@@ -4,7 +4,7 @@ use comfy_table::{presets::UTF8_FULL, Cell, ContentArrangement, Row, Table};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
-fn fmt_num(n: u64) -> String {
+pub fn fmt_num(n: u64) -> String {
     // Thousands-separated, en-US style.
     let s = n.to_string();
     let bytes = s.as_bytes();
