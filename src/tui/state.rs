@@ -1,4 +1,3 @@
-use crossterm::event::KeyCode;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -470,10 +469,6 @@ impl AppState {
             PaneId::Left => &mut self.left_index,
             PaneId::Sessions => &mut self.sessions_index,
         }
-    }
-
-    pub fn keybind_key(&self) -> KeyCode {
-        KeyCode::Null
     }
 }
 
