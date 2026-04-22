@@ -210,7 +210,8 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
             .unwrap_or_else(Utc::now);
         // Prefer the resolved repo display name; fall back to a basename of
         // the raw project_path so rows stay scannable even without a repo.
-        let shown = repo_display.or_else(|| project_path.as_deref().map(basename_of).map(String::from));
+        let shown =
+            repo_display.or_else(|| project_path.as_deref().map(basename_of).map(String::from));
         Ok(AggregateRow {
             key: session_id,
             source: SourceLabel::Source(source),

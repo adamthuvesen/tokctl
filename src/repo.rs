@@ -206,7 +206,9 @@ fn main_repo_from_worktree_pointer(git_file: &Path) -> Option<PathBuf> {
     let gitdir_path = Path::new(gitdir);
     let main = gitdir_path.parent()?.parent()?.parent()?;
     if main.join(".git").is_dir() {
-        fs::canonicalize(main).ok().or_else(|| Some(main.to_path_buf()))
+        fs::canonicalize(main)
+            .ok()
+            .or_else(|| Some(main.to_path_buf()))
     } else {
         None
     }
