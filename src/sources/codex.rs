@@ -142,13 +142,19 @@ pub fn parse_codex_line(line: &str, ctx: &mut CodexCtx) -> Option<CodexParsed> {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned());
 
+            // OpenAI reports input_tokens as the full context size including the
+            // cached portion. Subtract cached_input_tokens so the fields are
+            // non-overlapping (matching Claude's accounting), and cost_of() can
+            // apply the correct rate to each bucket without double-billing.
+            let non_cached_input = last.input_tokens.saturating_sub(last.cached_input_tokens);
+
             Some(CodexParsed::Event(UsageEvent {
                 source: Source::Codex,
                 timestamp,
                 session_id,
                 project_path: ctx.project_path.clone(),
                 model,
-                input_tokens: last.input_tokens,
+                input_tokens: non_cached_input,
                 output_tokens: total_output,
                 cache_read_tokens: last.cached_input_tokens,
                 cache_write_tokens: 0,
@@ -195,7 +201,7 @@ mod tests {
         assert_eq!(ev.source, Source::Codex);
         assert_eq!(ev.session_id, "sess-x");
         assert_eq!(ev.model, "gpt-5.4");
-        assert_eq!(ev.input_tokens, 200);
+        assert_eq!(ev.input_tokens, 150); // 200 - 50 cached = non-cached input only
         assert_eq!(ev.output_tokens, 70);
         assert_eq!(ev.cache_read_tokens, 50);
         assert_eq!(ev.cache_write_tokens, 0);
