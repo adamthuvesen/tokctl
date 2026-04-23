@@ -192,6 +192,7 @@ fn draw_left_pane(
             let mut row = Row::new(vec![
                 Cell::from(r.label.clone()),
                 Cell::from(fmt_num(r.sessions)),
+                Cell::from(fmt_tokens_short(r.total_tokens)),
                 Cell::from(fmt_cost(r.cost)).style(cost_style),
             ]);
             if is_selected {
@@ -206,10 +207,11 @@ fn draw_left_pane(
         [
             Constraint::Percentage(60),
             Constraint::Length(5),
+            Constraint::Length(7),
             Constraint::Length(9),
         ],
     )
-    .header(Row::new(vec!["name", "sess", "cost"]).style(palette.dim_text()));
+    .header(Row::new(vec!["name", "sess", "tok", "cost"]).style(palette.dim_text()));
 
     frame.render_widget(table, inner);
 }
@@ -264,6 +266,7 @@ fn draw_sessions_pane(
                         .clone()
                         .unwrap_or_else(|| r.session_id.chars().take(8).collect()),
                 ),
+                Cell::from(fmt_tokens_short(r.total_tokens)),
                 Cell::from(fmt_cost(r.cost)).style(cost_style),
             ]);
             if is_selected {
@@ -279,10 +282,11 @@ fn draw_sessions_pane(
             Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Percentage(40),
+            Constraint::Length(7),
             Constraint::Length(9),
         ],
     )
-    .header(Row::new(vec!["when", "src", "project", "cost"]).style(palette.dim_text()));
+    .header(Row::new(vec!["when", "src", "project", "tok", "cost"]).style(palette.dim_text()));
 
     frame.render_widget(table, inner);
 }
