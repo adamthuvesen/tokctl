@@ -18,6 +18,7 @@ pub struct LeftRow {
     /// the raw key; for session it's the session id.
     pub key: String,
     pub sessions: u64,
+    pub total_tokens: u64,
     pub cost: f64,
     pub is_no_repo: bool,
 }
@@ -125,6 +126,7 @@ pub fn load_left_axis(
                     label: r.display_name.clone(),
                     key: r.key.clone(),
                     sessions: r.sessions,
+                    total_tokens: r.total_tokens,
                     cost: r.cost_usd,
                     is_no_repo: r.is_no_repo(),
                 })
@@ -140,6 +142,7 @@ pub fn load_left_axis(
                     label: r.key.chars().take(10).collect(),
                     key: r.key,
                     sessions: 1,
+                    total_tokens: r.total_tokens,
                     cost: r.cost_usd,
                     is_no_repo: false,
                 })
@@ -152,7 +155,8 @@ fn load_days(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
     let sql = format!(
         r#"SELECT e.day AS day,
                   COUNT(DISTINCT e.session_id) AS sessions,
-                  SUM(e.cost_usd) AS cost
+                  SUM(e.cost_usd) AS cost,
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
              FROM events e
              WHERE 1=1 {src} {ts}
              GROUP BY day
@@ -186,6 +190,7 @@ fn load_days(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             key: row.get::<_, String>(0)?,
             sessions: row.get::<_, i64>(1)? as u64,
             cost: row.get::<_, f64>(2)?,
+            total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
         })
     })?;
@@ -197,7 +202,8 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
     let sql = format!(
         r#"SELECT e.model AS model,
                   COUNT(DISTINCT e.session_id) AS sessions,
-                  SUM(e.cost_usd) AS cost
+                  SUM(e.cost_usd) AS cost,
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
              FROM events e
              WHERE 1=1 {src} {ts} {repo}
              GROUP BY model
@@ -232,6 +238,7 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             key: row.get::<_, String>(0)?,
             sessions: row.get::<_, i64>(1)? as u64,
             cost: row.get::<_, f64>(2)?,
+            total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
         })
     })?;
