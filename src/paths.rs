@@ -83,6 +83,35 @@ pub fn default_codex_roots() -> Vec<PathBuf> {
     vec![home_dir().join(".codex").join("sessions")]
 }
 
+pub fn default_cursor_roots() -> Vec<PathBuf> {
+    vec![
+        cursor_sync_cache_dir(),
+        home_dir()
+            .join(".config")
+            .join("tokscale")
+            .join("cursor-cache"),
+    ]
+}
+
+pub fn tokctl_config_dir() -> PathBuf {
+    home_dir().join(".config").join("tokctl")
+}
+
+pub fn cursor_sync_cache_dir() -> PathBuf {
+    tokctl_config_dir().join("cursor-cache")
+}
+
+pub fn cursor_credentials_path() -> PathBuf {
+    tokctl_config_dir().join("cursor-credentials.json")
+}
+
+pub fn tokscale_cursor_credentials_path() -> PathBuf {
+    home_dir()
+        .join(".config")
+        .join("tokscale")
+        .join("cursor-credentials.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

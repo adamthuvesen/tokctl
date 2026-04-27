@@ -1,5 +1,6 @@
 use crate::discovery::{DiscoveredFile, Discovery};
 use crate::store::writes::FileManifestRow;
+use crate::types::Source;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -58,6 +59,11 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
         // Unchanged
         if d.size == row.size && d.mtime_ns == row.mtime_ns {
             plan.to_skip.push(d.path.clone());
+            continue;
+        }
+
+        if d.source == Source::Cursor {
+            plan.to_full_parse.push(d.clone());
             continue;
         }
 
@@ -276,5 +282,43 @@ mod tests {
         });
         assert_eq!(plan.to_skip, vec![PathBuf::from("/dir/x.jsonl")]);
         assert!(plan.to_purge.is_empty());
+    }
+
+    #[test]
+    fn changed_cursor_file_goes_to_full_parse_not_tail() {
+        let mt = far_past_ns();
+        let discovery = Discovery {
+            files: vec![DiscoveredFile {
+                path: PathBuf::from("/cursor/usage.csv"),
+                source: Source::Cursor,
+                project: None,
+                size: 800,
+                mtime_ns: mt + 1,
+            }],
+            unchanged_paths: Default::default(),
+        };
+        let mut manifest = HashMap::new();
+        manifest.insert(
+            PathBuf::from("/cursor/usage.csv"),
+            FileManifestRow {
+                path: PathBuf::from("/cursor/usage.csv"),
+                source: Source::Cursor,
+                project: None,
+                size: 500,
+                mtime_ns: mt,
+                last_offset: 500,
+                n_events: 0,
+                session_id: None,
+                model: None,
+            },
+        );
+        let plan = plan_ingest(PlanInput {
+            manifest: &manifest,
+            discovery: &discovery,
+            safety_window_ms: 3_600_000,
+            now_ms: base_now_ms(),
+        });
+        assert_eq!(plan.to_full_parse.len(), 1);
+        assert!(plan.to_tail.is_empty());
     }
 }

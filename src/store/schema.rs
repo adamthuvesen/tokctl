@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
