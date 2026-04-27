@@ -57,6 +57,7 @@ pub fn map_key(state: &AppState, k: KeyEvent, last_g: &mut Option<Instant>) -> A
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('t') => Action::ToggleTrend,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char('e') => Action::ToggleExpand,
         KeyCode::Char('s') => Action::CycleSort,
         KeyCode::Char('i') => Action::ToggleDetail,
         KeyCode::Tab => Action::CycleAxis,
