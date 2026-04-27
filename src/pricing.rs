@@ -16,14 +16,32 @@ const PRICES: &[(&str, PriceEntry)] = &[
     (
         "claude-opus-4-7",
         PriceEntry {
-            input: 15.0,
-            output: 75.0,
-            cache_read: 1.5,
-            cache_write: 18.75,
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
         },
     ),
     (
         "claude-opus-4-6",
+        PriceEntry {
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+        },
+    ),
+    (
+        "claude-opus-4-5",
+        PriceEntry {
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+        },
+    ),
+    (
+        "claude-opus-4-1",
         PriceEntry {
             input: 15.0,
             output: 75.0,
@@ -32,7 +50,7 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     (
-        "claude-opus-4-5",
+        "claude-opus-4",
         PriceEntry {
             input: 15.0,
             output: 75.0,
@@ -59,12 +77,57 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     (
+        "claude-sonnet-4",
+        PriceEntry {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
+        "claude-3-7-sonnet",
+        PriceEntry {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
         "claude-haiku-4-5",
         PriceEntry {
             input: 1.0,
             output: 5.0,
             cache_read: 0.1,
             cache_write: 1.25,
+        },
+    ),
+    (
+        "claude-3-5-haiku",
+        PriceEntry {
+            input: 0.8,
+            output: 4.0,
+            cache_read: 0.08,
+            cache_write: 1.0,
+        },
+    ),
+    (
+        "claude-3-opus",
+        PriceEntry {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-3-haiku",
+        PriceEntry {
+            input: 0.25,
+            output: 1.25,
+            cache_read: 0.03,
+            cache_write: 0.3,
         },
     ),
     // OpenAI (Codex)
@@ -159,6 +222,15 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     (
+        "gpt-5.3-chat-latest",
+        PriceEntry {
+            input: 1.75,
+            output: 14.0,
+            cache_read: 0.175,
+            cache_write: 0.0,
+        },
+    ),
+    (
         "gpt-5.4",
         PriceEntry {
             input: 2.5,
@@ -195,11 +267,29 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     (
+        "gpt-5.4-pro",
+        PriceEntry {
+            input: 30.0,
+            output: 180.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        },
+    ),
+    (
         "gpt-5.5",
         PriceEntry {
             input: 5.0,
             output: 30.0,
             cache_read: 0.5,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-5.5-pro",
+        PriceEntry {
+            input: 30.0,
+            output: 180.0,
+            cache_read: 0.0,
             cache_write: 0.0,
         },
     ),
@@ -293,6 +383,18 @@ mod tests {
     }
 
     #[test]
+    fn updated_opus_price_is_used() {
+        let e = event(
+            "claude-opus-4-7",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert!((cost_of(&e, None) - 36.75).abs() < 1e-9);
+    }
+
+    #[test]
     fn cache_tokens_contribute() {
         let e = event("claude-sonnet-4-6", 0, 0, 1_000_000, 0);
         assert!((cost_of(&e, None) - 0.3).abs() < 1e-9);
@@ -321,8 +423,10 @@ mod tests {
     #[test]
     fn has_price_works() {
         assert!(has_price("claude-opus-4-7"));
+        assert!(has_price("claude-3-5-haiku-20241022"));
         assert!(has_price("claude-sonnet-4-6-20250101"));
         assert!(has_price("gpt-5.5"));
+        assert!(has_price("gpt-5.5-pro"));
         assert!(!has_price("gpt-99-ultra"));
     }
 
