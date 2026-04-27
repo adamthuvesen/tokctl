@@ -10,7 +10,7 @@ use crate::repo::project_basename;
 use crate::store::queries::{
     repo_report, session_report, QueryFilter, RepoAggregateRow, RepoFilterSpec,
 };
-use crate::tui::state::{AppState, LeftAxis, Sort, SourceFilter, TrendGranularity};
+use crate::tui::state::{AppState, Section, Sort, SourceFilter, TrendGranularity};
 use crate::types::{AggregateRow, Source};
 use std::str::FromStr;
 
@@ -92,13 +92,24 @@ impl DataCache {
         self.status = load_cache_status(conn, now).unwrap_or_else(|_| CacheStatus::default());
 
         if mask.left {
-            self.left = load_left_axis(conn, state.left_axis, filter.clone()).unwrap_or_default();
-            sort_left_rows(&mut self.left, state.left_axis, state.sort);
+            self.left = load_left_axis(
+                conn,
+                state.current_section,
+                filter.clone(),
+                state.trend_granularity,
+            )
+            .unwrap_or_default();
+            sort_left_rows(&mut self.left, state.current_section, state.sort);
         }
         if mask.sessions {
-            let sel_key = left_selected_key(state, &self.left);
+            // For drilled views, scope sessions to the drilled key.
+            // Otherwise, scope to whichever row is focused in the current section.
+            let (scope_section, sel_key): (Section, Option<String>) = match &state.drill {
+                Some(d) => (d.section, Some(d.key.clone())),
+                None => (state.current_section, left_selected_key(state, &self.left)),
+            };
             self.sessions =
-                load_sessions_for(conn, state.left_axis, sel_key.as_deref(), filter.clone())
+                load_sessions_for(conn, scope_section, sel_key.as_deref(), filter.clone())
                     .unwrap_or_default();
             sort_session_rows(&mut self.sessions, state.sort);
         }
@@ -140,7 +151,7 @@ fn relative_freshness(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-fn sort_left_rows(rows: &mut [LeftRow], axis: LeftAxis, sort: Sort) {
+fn sort_left_rows(rows: &mut [LeftRow], section: Section, sort: Sort) {
     rows.sort_by(|a, b| {
         let ordering = match sort {
             Sort::CostDesc => b
@@ -152,7 +163,7 @@ fn sort_left_rows(rows: &mut [LeftRow], axis: LeftAxis, sort: Sort) {
                 .partial_cmp(&b.cost)
                 .unwrap_or(std::cmp::Ordering::Equal),
             Sort::RecentDesc => {
-                if axis == LeftAxis::Day {
+                if section == Section::Days {
                     b.key.cmp(&a.key)
                 } else {
                     b.cost
@@ -162,7 +173,7 @@ fn sort_left_rows(rows: &mut [LeftRow], axis: LeftAxis, sort: Sort) {
             }
             Sort::AlphaAsc => a.label.cmp(&b.label),
         };
-        match (axis == LeftAxis::Repo, a.is_no_repo, b.is_no_repo) {
+        match (section == Section::Repos, a.is_no_repo, b.is_no_repo) {
             (true, true, false) => std::cmp::Ordering::Greater,
             (true, false, true) => std::cmp::Ordering::Less,
             _ => ordering.then_with(|| a.label.cmp(&b.label)),
@@ -214,17 +225,18 @@ fn left_selected_key(state: &AppState, left: &[LeftRow]) -> Option<String> {
     if left.is_empty() {
         return None;
     }
-    let idx = state.left_index.min(left.len() - 1);
+    let idx = state.current_index().min(left.len() - 1);
     Some(left[idx].key.clone())
 }
 
 pub fn load_left_axis(
     conn: &Connection,
-    axis: LeftAxis,
+    section: Section,
     filter: QueryFilter,
+    granularity: TrendGranularity,
 ) -> Result<Vec<LeftRow>> {
-    match axis {
-        LeftAxis::Repo => {
+    match section {
+        Section::Repos => {
             let rows: Vec<RepoAggregateRow> = repo_report(conn, filter)?;
             Ok(rows
                 .into_iter()
@@ -238,9 +250,9 @@ pub fn load_left_axis(
                 })
                 .collect())
         }
-        LeftAxis::Day => load_days(conn, filter),
-        LeftAxis::Model => load_models(conn, filter),
-        LeftAxis::Session => {
+        Section::Days => load_periods(conn, filter, granularity),
+        Section::Models => load_models(conn, filter),
+        Section::Sessions => {
             let rows = session_report(conn, filter)?;
             Ok(rows
                 .into_iter()
@@ -254,19 +266,37 @@ pub fn load_left_axis(
                 })
                 .collect())
         }
+        // Provider section uses load_trend; left-axis loading is a no-op.
+        Section::Provider => Ok(Vec::new()),
     }
 }
 
-fn load_days(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
+/// Group events into time buckets at the chosen granularity. Daily/Monthly
+/// use the existing pre-computed columns; weekly/yearly compute the bucket
+/// from the day string in SQLite.
+fn load_periods(
+    conn: &Connection,
+    filter: QueryFilter,
+    granularity: TrendGranularity,
+) -> Result<Vec<LeftRow>> {
+    // SQLite's strftime week (`%W`) is Sunday-based, not ISO. Close enough
+    // for visualization. Yearly buckets use the leading 4 chars of `day`.
+    let bucket_expr = match granularity {
+        TrendGranularity::Daily => "e.day",
+        TrendGranularity::Weekly => "strftime('%Y-W%W', e.day)",
+        TrendGranularity::Monthly => "e.month",
+        TrendGranularity::Yearly => "substr(e.day, 1, 4)",
+    };
     let sql = format!(
-        r#"SELECT e.day AS day,
+        r#"SELECT {bucket} AS bucket,
                   COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
                   SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
              FROM events e
              WHERE 1=1 {src} {ts}
-             GROUP BY day
-             ORDER BY day DESC"#,
+             GROUP BY bucket
+             ORDER BY bucket DESC"#,
+        bucket = bucket_expr,
         src = if filter.source.is_some() {
             "AND e.source = ?"
         } else {
@@ -353,12 +383,12 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
 
 pub fn load_sessions_for(
     conn: &Connection,
-    axis: LeftAxis,
+    section: Section,
     key: Option<&str>,
     mut filter: QueryFilter,
 ) -> Result<Vec<SessionRow>> {
-    match (axis, key) {
-        (LeftAxis::Repo, Some(k)) => {
+    match (section, key) {
+        (Section::Repos, Some(k)) => {
             filter.repo = Some(if k == crate::store::queries::NO_REPO_SENTINEL {
                 RepoFilterSpec::NoRepo
             } else {
@@ -369,7 +399,7 @@ pub fn load_sessions_for(
                 .map(to_session_row)
                 .collect())
         }
-        (LeftAxis::Day, Some(k)) => {
+        (Section::Days, Some(k)) => {
             // Filter by exact day (parse YYYY-MM-DD to ms bounds).
             let (since, until) = day_bounds(k);
             filter.since_ms = Some(since);
@@ -379,11 +409,11 @@ pub fn load_sessions_for(
                 .map(to_session_row)
                 .collect())
         }
-        (LeftAxis::Model, Some(k)) => {
+        (Section::Models, Some(k)) => {
             // No model filter on QueryFilter; do it via a direct SQL query.
             load_sessions_by_model(conn, k, &filter)
         }
-        (LeftAxis::Session, Some(k)) => {
+        (Section::Sessions, Some(k)) => {
             // Just return the one.
             let mut rows = session_report(conn, filter)?;
             rows.retain(|r| r.key == k);
@@ -653,7 +683,7 @@ mod tests {
                 is_no_repo: false,
             },
         ];
-        sort_left_rows(&mut left, LeftAxis::Repo, Sort::AlphaAsc);
+        sort_left_rows(&mut left, Section::Repos, Sort::AlphaAsc);
         assert_eq!(left[0].label, "alpha");
 
         let mut sessions = vec![

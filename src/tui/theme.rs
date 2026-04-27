@@ -22,24 +22,30 @@ pub struct Palette {
     pub bar_empty: Color,
     /// Border color for inactive panes (very faint on light bg).
     pub border_inactive: Color,
+    /// Background for the active main-pane tab pill.
+    pub tab_active_bg: Color,
+    /// Foreground for the active main-pane tab pill.
+    pub tab_active_fg: Color,
 }
 
 impl Default for Palette {
     fn default() -> Self {
         Self {
             fg: Color::Reset,
-            accent: Color::Rgb(0x7c, 0x3a, 0xed),          // violet-600
-            dim: Color::Rgb(0x71, 0x71, 0x7a),              // zinc-500
-            warn: Color::Rgb(0xd9, 0x77, 0x06),             // amber-600
-            info: Color::Rgb(0x08, 0x91, 0xb2),             // cyan-600
-            cost_low: Color::Rgb(0x15, 0x80, 0x3d),         // green-700
-            cost_mid: Color::Rgb(0xca, 0x8a, 0x04),         // yellow-600
-            cost_high: Color::Rgb(0xdc, 0x26, 0x26),        // red-600
-            selected_bg: Color::Rgb(0xed, 0xe9, 0xfe),      // violet-100 (soft lavender)
-            selected_fg: Color::Rgb(0x3b, 0x07, 0x64),      // violet-950 (dark)
-            bar_filled: Color::Rgb(0x8b, 0x5c, 0xf6),       // violet-500
-            bar_empty: Color::Rgb(0xd4, 0xd4, 0xd8),        // zinc-300
-            border_inactive: Color::Rgb(0xd4, 0xd4, 0xd8),  // zinc-300
+            accent: Color::Rgb(0x7c, 0x3a, 0xed),   // violet-600
+            dim: Color::Rgb(0x71, 0x71, 0x7a),      // zinc-500
+            warn: Color::Rgb(0xd9, 0x77, 0x06),     // amber-600
+            info: Color::Rgb(0x08, 0x91, 0xb2),     // cyan-600
+            cost_low: Color::Rgb(0x15, 0x80, 0x3d), // green-700
+            cost_mid: Color::Rgb(0xca, 0x8a, 0x04), // yellow-600
+            cost_high: Color::Rgb(0xdc, 0x26, 0x26), // red-600
+            selected_bg: Color::Rgb(0xed, 0xe9, 0xfe), // violet-100 (soft lavender)
+            selected_fg: Color::Rgb(0x3b, 0x07, 0x64), // violet-950 (dark)
+            bar_filled: Color::Rgb(0x8b, 0x5c, 0xf6), // violet-500
+            bar_empty: Color::Rgb(0xd4, 0xd4, 0xd8), // zinc-300
+            border_inactive: Color::Rgb(0xd4, 0xd4, 0xd8), // zinc-300
+            tab_active_bg: Color::Rgb(0xed, 0xe9, 0xfe), // violet-100 lavender pill
+            tab_active_fg: Color::Rgb(0x3b, 0x07, 0x64), // violet-950
         }
     }
 }
@@ -83,6 +89,19 @@ impl Palette {
     /// Empty remainder of proportion bars.
     pub fn bar_empty_style(&self) -> Style {
         Style::default().fg(self.bar_empty)
+    }
+
+    /// Active tab pill: bold violet text on lavender bg.
+    pub fn tab_active_style(&self) -> Style {
+        Style::default()
+            .bg(self.tab_active_bg)
+            .fg(self.tab_active_fg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Inactive tab label: dim text, no background.
+    pub fn tab_inactive_style(&self) -> Style {
+        Style::default().fg(self.dim)
     }
 
     /// Interpolate the cost gradient. `ratio` is clamped to `[0, 1]`.

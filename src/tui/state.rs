@@ -1,41 +1,83 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Top-level navigation entries — one per sidebar row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum LeftAxis {
-    Repo,
-    Day,
-    Model,
-    Session,
+pub enum Section {
+    Repos,
+    Days,
+    Models,
+    Sessions,
+    /// Time-bucketed costs with per-source (Claude/Codex/Cursor) columns.
+    #[serde(alias = "trend")]
+    Provider,
 }
 
-impl LeftAxis {
+impl Section {
+    pub const ALL: [Section; 5] = [
+        Section::Repos,
+        Section::Days,
+        Section::Models,
+        Section::Sessions,
+        Section::Provider,
+    ];
+
     pub fn next(self) -> Self {
+        let i = Section::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Section::ALL[(i + 1) % Section::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let i = Section::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Section::ALL[(i + Section::ALL.len() - 1) % Section::ALL.len()]
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
-            LeftAxis::Repo => LeftAxis::Day,
-            LeftAxis::Day => LeftAxis::Model,
-            LeftAxis::Model => LeftAxis::Session,
-            LeftAxis::Session => LeftAxis::Repo,
+            Section::Repos => "repos",
+            Section::Days => "days",
+            Section::Models => "models",
+            Section::Sessions => "sessions",
+            Section::Provider => "provider",
         }
     }
+
     pub fn title(self) -> &'static str {
         match self {
-            LeftAxis::Repo => "REPOS",
-            LeftAxis::Day => "DAYS",
-            LeftAxis::Model => "MODELS",
-            LeftAxis::Session => "SESSIONS",
+            Section::Repos => "REPOS",
+            Section::Days => "DAYS",
+            Section::Models => "MODELS",
+            Section::Sessions => "SESSIONS",
+            Section::Provider => "PROVIDER",
         }
     }
-    pub fn chip(self) -> &'static str {
+
+    /// Human-friendly label for the sidebar row.
+    pub fn label(self) -> &'static str {
         match self {
-            LeftAxis::Repo => "repo",
-            LeftAxis::Day => "day",
-            LeftAxis::Model => "model",
-            LeftAxis::Session => "session",
+            Section::Repos => "Repos",
+            Section::Days => "Days",
+            Section::Models => "Models",
+            Section::Sessions => "Sessions",
+            Section::Provider => "Provider",
         }
+    }
+
+    /// Tab labels for this section. Empty slice = single-lens (no tab row drawn).
+    pub fn tabs(self) -> &'static [&'static str] {
+        match self {
+            Section::Repos => &["Costs", "Provider"],
+            _ => &[],
+        }
+    }
+
+    /// Whether `Enter` on a row in this section pushes a drill view.
+    pub fn supports_drill(self) -> bool {
+        matches!(self, Section::Repos)
     }
 }
 
@@ -165,31 +207,22 @@ impl TrendGranularity {
     }
 }
 
+/// Which area currently owns keyboard focus. `Sidebar` = section list,
+/// `Main` = the active section's content (or its drill view).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaneId {
-    Left,
-    Sessions,
+pub enum Focus {
+    Sidebar,
+    Main,
 }
 
-impl PaneId {
-    pub fn left(self) -> Self {
-        match self {
-            PaneId::Left => PaneId::Left,
-            PaneId::Sessions => PaneId::Left,
-        }
-    }
-    pub fn right(self) -> Self {
-        match self {
-            PaneId::Left => PaneId::Sessions,
-            PaneId::Sessions => PaneId::Sessions,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SelectedKeys {
-    pub repo: Option<String>,
-    pub session: Option<String>,
+/// One level of in-main drill. `key` is the stable identifier (repo key,
+/// day bucket, etc.) for the row that was drilled into; `label` is the
+/// human-readable breadcrumb chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drill {
+    pub section: Section,
+    pub key: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,51 +233,92 @@ pub struct FilterState {
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    pub left_axis: LeftAxis,
+    pub current_section: Section,
     pub time_window: TimeWindow,
     pub source_filter: SourceFilter,
     pub sort: Sort,
     pub trend_granularity: TrendGranularity,
-    pub trend_open: bool,
     pub help_open: bool,
     pub detail_open: bool,
-    pub focus: PaneId,
-    /// Persisted pre-trend focus so Esc/t restores exactly.
-    pub focus_before_trend: PaneId,
-    pub selected: SelectedKeys,
-    /// Selection indices per pane (live, not persisted beyond `selected`).
-    pub left_index: usize,
-    pub sessions_index: usize,
-    pub trend_index: usize,
+    pub focus: Focus,
+    pub drill: Option<Drill>,
+    /// Active tab index per section (only meaningful when `Section::tabs()` is non-empty).
+    pub tab_per_section: BTreeMap<Section, u8>,
+    /// Last-selected row key per section (persisted; falls back to first row when stale).
+    pub section_selection: BTreeMap<Section, String>,
+    /// Live row-cursor index per section (not persisted).
+    pub section_index: BTreeMap<Section, usize>,
+    /// Live row-cursor index inside an active drill (not persisted).
+    pub drill_index: usize,
+    /// Sidebar row cursor (live, not persisted — derived from `current_section`).
+    pub sidebar_index: usize,
     pub filter: FilterState,
-    pub pane_widths: [u16; 2],
     pub flash: Option<String>,
-    /// Whether the left pane shows expanded columns (sessions + tokens + cost).
-    /// Default false = compact (tokens + cost only).
+    /// Whether tables show expanded columns. Default false = compact.
     pub expanded: bool,
+    /// One-shot intro flash on first launch under v3. Persisted so it shows once.
+    pub seen_v3_intro: bool,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let sidebar_index = Section::ALL
+            .iter()
+            .position(|s| *s == Section::Repos)
+            .unwrap_or(0);
         Self {
-            left_axis: LeftAxis::Repo,
+            current_section: Section::Repos,
             time_window: TimeWindow::Month,
             source_filter: SourceFilter::All,
             sort: Sort::CostDesc,
             trend_granularity: TrendGranularity::Monthly,
-            trend_open: false,
             help_open: false,
             detail_open: false,
-            focus: PaneId::Left,
-            focus_before_trend: PaneId::Left,
-            selected: SelectedKeys::default(),
-            left_index: 0,
-            sessions_index: 0,
-            trend_index: 0,
+            focus: Focus::Main,
+            drill: None,
+            tab_per_section: BTreeMap::new(),
+            section_selection: BTreeMap::new(),
+            section_index: BTreeMap::new(),
+            drill_index: 0,
+            sidebar_index,
             filter: FilterState::default(),
-            pane_widths: [50, 50],
             flash: None,
             expanded: false,
+            seen_v3_intro: false,
+        }
+    }
+}
+
+impl AppState {
+    pub fn active_tab_index(&self) -> u8 {
+        *self
+            .tab_per_section
+            .get(&self.current_section)
+            .unwrap_or(&0)
+    }
+
+    pub fn active_tab_label(&self) -> Option<&'static str> {
+        let tabs = self.current_section.tabs();
+        if tabs.is_empty() {
+            None
+        } else {
+            let i = (self.active_tab_index() as usize).min(tabs.len() - 1);
+            Some(tabs[i])
+        }
+    }
+
+    pub fn current_index(&self) -> usize {
+        if self.drill.is_some() {
+            return self.drill_index;
+        }
+        *self.section_index.get(&self.current_section).unwrap_or(&0)
+    }
+
+    pub fn set_current_index(&mut self, idx: usize) {
+        if self.drill.is_some() {
+            self.drill_index = idx;
+        } else {
+            self.section_index.insert(self.current_section, idx);
         }
     }
 }
@@ -283,21 +357,34 @@ pub struct ApplyOutcome {
 #[derive(Debug, Clone)]
 pub enum Action {
     Quit,
-    FocusLeft,
-    FocusRight,
-    MoveUp,
+    /// Move sidebar selection / row cursor down within the focused area.
     MoveDown,
-    PageUp,
+    MoveUp,
     PageDown,
+    PageUp,
     Top,
     Bottom,
+    /// Jump to next section (sidebar list), regardless of focus. (`]`)
+    NextSection,
+    /// Jump to previous section. (`[`)
+    PrevSection,
+    /// Jump directly to a specific section (e.g. `t` → `Provider`).
+    JumpToSection(Section),
+    /// Cycle to next tab within the active section. No-op if section has < 2 tabs.
+    CycleTab,
+    /// Push drill from the focused row, if the section supports it.
     Drill,
+    /// Pop drill (or, if not drilled, focus sidebar).
+    PopDrill,
+    /// Move focus to the sidebar.
+    FocusSidebar,
+    /// Move focus to the main pane.
+    FocusMain,
+    /// Cascading pop: drill → detail → help → filter → focus sidebar.
     Pop,
-    CycleAxis,
     CycleSort,
     ToggleHelp,
     ToggleDetail,
-    ToggleTrend,
     SetWindow(TimeWindow),
     SetSource(SourceFilter),
     SetTrendGranularity(TrendGranularity),
@@ -310,42 +397,91 @@ pub enum Action {
     Yank,
     YankSummary,
     ToggleExpand,
+    DismissFlash,
     None,
 }
 
 impl AppState {
     pub fn apply(&mut self, action: Action) -> ApplyOutcome {
         let mut out = ApplyOutcome::default();
-        self.flash = None;
+        let section_before = self.current_section;
+        // Most actions clear a stale flash. Filter-mode chars and movement
+        // keep it; we just clear unconditionally for simplicity — a flash
+        // is a one-shot anyway.
+        if !matches!(
+            action,
+            Action::None | Action::FilterChar(_) | Action::FilterBackspace
+        ) {
+            self.flash = None;
+        }
+
         match action {
             Action::Quit => out.quit = true,
             Action::None => {}
-            Action::FocusLeft => {
-                if self.trend_open {
-                    // no-op in overlay
-                } else {
-                    self.focus = self.focus.left();
-                }
+            Action::DismissFlash => {
+                // already cleared above
             }
-            Action::FocusRight => {
-                if !self.trend_open {
-                    self.focus = self.focus.right();
-                }
+            Action::FocusSidebar => {
+                self.focus = Focus::Sidebar;
             }
-            Action::MoveUp => {
-                self.nudge_selection(-1);
+            Action::FocusMain => {
+                self.focus = Focus::Main;
             }
-            Action::MoveDown => {
-                self.nudge_selection(1);
-                // mark refresh downstream
-            }
+            Action::MoveUp => self.nudge_selection(-1),
+            Action::MoveDown => self.nudge_selection(1),
             Action::PageUp => self.nudge_selection(-10),
             Action::PageDown => self.nudge_selection(10),
             Action::Top => self.set_selection(0),
             Action::Bottom => self.set_selection(usize::MAX),
+            Action::NextSection => {
+                self.switch_section(self.current_section.next(), &mut out);
+            }
+            Action::PrevSection => {
+                self.switch_section(self.current_section.prev(), &mut out);
+            }
+            Action::JumpToSection(s) => {
+                if self.current_section != s {
+                    self.switch_section(s, &mut out);
+                } else if self.drill.is_some() {
+                    // already on the section but drilled — pop back
+                    self.drill = None;
+                    self.drill_index = 0;
+                    out.dirty = true;
+                }
+            }
+            Action::CycleTab => {
+                let tabs = self.current_section.tabs();
+                if tabs.len() >= 2 {
+                    let cur = self.active_tab_index();
+                    let next = ((cur as usize + 1) % tabs.len()) as u8;
+                    self.tab_per_section.insert(self.current_section, next);
+                    out.refresh.left = true;
+                    out.refresh.trend = true;
+                    out.needs_refresh = true;
+                    out.dirty = true;
+                }
+            }
             Action::Drill => {
-                if !self.trend_open {
-                    self.focus = self.focus.right();
+                if self.drill.is_none() && self.current_section.supports_drill() {
+                    // The actual key/label is filled in by mod.rs after lookup;
+                    // here we just mark intent. mod.rs reads the focused row,
+                    // computes a Drill, and assigns it via `set_drill`.
+                    // For the purposes of ApplyOutcome we still mark refresh:
+                    // the drill view fetches scoped sessions.
+                    out.refresh.sessions = true;
+                    out.needs_refresh = true;
+                    // Mark dirty=false: drill itself isn't persisted, but we
+                    // want the next refresh cycle to run.
+                }
+            }
+            Action::PopDrill => {
+                if self.drill.is_some() {
+                    self.drill = None;
+                    self.drill_index = 0;
+                    self.focus = Focus::Main;
+                    out.dirty = true;
+                } else {
+                    self.focus = Focus::Sidebar;
                 }
             }
             Action::Pop => {
@@ -356,23 +492,14 @@ impl AppState {
                     self.detail_open = false;
                 } else if self.help_open {
                     self.help_open = false;
-                } else if self.trend_open {
-                    self.trend_open = false;
-                    self.focus = self.focus_before_trend;
+                } else if self.drill.is_some() {
+                    self.drill = None;
+                    self.drill_index = 0;
+                    self.focus = Focus::Main;
                     out.dirty = true;
-                } else {
-                    self.focus = self.focus.left();
+                } else if self.focus == Focus::Main {
+                    self.focus = Focus::Sidebar;
                 }
-            }
-            Action::CycleAxis => {
-                self.left_axis = self.left_axis.next();
-                self.left_index = 0;
-                self.selected.repo = None;
-                self.selected.session = None;
-                out.refresh.left = true;
-                out.refresh.sessions = true;
-                out.needs_refresh = true;
-                out.dirty = true;
             }
             Action::CycleSort => {
                 self.sort = self.sort.next();
@@ -385,21 +512,9 @@ impl AppState {
                 self.help_open = !self.help_open;
             }
             Action::ToggleDetail => {
-                if !self.trend_open && !self.help_open {
+                if !self.help_open {
                     self.detail_open = !self.detail_open;
                 }
-            }
-            Action::ToggleTrend => {
-                if self.trend_open {
-                    self.trend_open = false;
-                    self.focus = self.focus_before_trend;
-                } else {
-                    self.focus_before_trend = self.focus;
-                    self.trend_open = true;
-                    out.refresh.trend = true;
-                    out.needs_refresh = true;
-                }
-                out.dirty = true;
             }
             Action::SetWindow(w) => {
                 if self.time_window != w {
@@ -420,6 +535,9 @@ impl AppState {
             Action::SetTrendGranularity(g) => {
                 if self.trend_granularity != g {
                     self.trend_granularity = g;
+                    // Days section also buckets by granularity, so refresh
+                    // the left-table data too.
+                    out.refresh.left = true;
                     out.refresh.trend = true;
                     out.needs_refresh = true;
                     out.dirty = true;
@@ -444,28 +562,26 @@ impl AppState {
                 }
             }
             Action::FilterCommit => {
-                // Leave filter active; reduce-time filter applies visually.
                 self.filter.active = false;
             }
             Action::FilterCancel => {
                 self.filter.active = false;
                 self.filter.query.clear();
             }
-            Action::Yank => {
-                // event loop performs clipboard IO and sets flash.
-            }
-            Action::YankSummary => {
-                // event loop performs clipboard IO and sets flash.
-            }
+            Action::Yank => {}
+            Action::YankSummary => {}
             Action::ToggleExpand => {
                 self.expanded = !self.expanded;
                 out.refresh.left = true;
+                out.refresh.sessions = true;
                 out.needs_refresh = true;
                 out.dirty = true;
             }
         }
 
-        // Downstream refresh from selection movement.
+        // Selection movement triggers a downstream refresh: in main (without
+        // drill) it may rescope sessions; in the sidebar it changes the
+        // active section, handled by the section-change check below.
         match action {
             Action::MoveUp
             | Action::MoveDown
@@ -473,49 +589,85 @@ impl AppState {
             | Action::PageDown
             | Action::Top
             | Action::Bottom => {
-                match self.focus {
-                    PaneId::Left => {
-                        out.refresh.sessions = true;
-                        out.needs_refresh = true;
-                    }
-                    PaneId::Sessions => {}
+                if self.focus != Focus::Sidebar {
+                    out.refresh.sessions = true;
+                    out.needs_refresh = true;
                 }
                 out.dirty = true;
             }
             _ => {}
         }
 
+        // Catch-all: if any path changed the active section, force a full
+        // refresh. This covers sidebar j/k/gg/G/page nav that updates
+        // current_section directly via nudge_selection / set_selection.
+        if self.current_section != section_before {
+            out.refresh = RefreshMask::all();
+            out.needs_refresh = true;
+            out.dirty = true;
+        }
+
         out
     }
 
+    fn switch_section(&mut self, target: Section, out: &mut ApplyOutcome) {
+        if self.current_section == target {
+            return;
+        }
+        self.current_section = target;
+        self.sidebar_index = Section::ALL.iter().position(|s| *s == target).unwrap_or(0);
+        self.drill = None;
+        self.drill_index = 0;
+        self.focus = Focus::Main;
+        out.refresh = RefreshMask::all();
+        out.needs_refresh = true;
+        out.dirty = true;
+    }
+
     fn nudge_selection(&mut self, delta: isize) {
-        let idx = self.selection_ref_mut();
-        let new = (*idx as isize).saturating_add(delta).max(0) as usize;
-        *idx = new;
+        if self.focus == Focus::Sidebar {
+            let new = (self.sidebar_index as isize + delta).rem_euclid(Section::ALL.len() as isize)
+                as usize;
+            self.sidebar_index = new;
+            self.current_section = Section::ALL[new];
+            self.drill = None;
+            self.drill_index = 0;
+        } else {
+            let cur = self.current_index() as isize;
+            let new = cur.saturating_add(delta).max(0) as usize;
+            self.set_current_index(new);
+        }
     }
 
     fn set_selection(&mut self, idx: usize) {
-        *self.selection_ref_mut() = idx;
+        if self.focus == Focus::Sidebar {
+            let new = idx.min(Section::ALL.len() - 1);
+            self.sidebar_index = new;
+            self.current_section = Section::ALL[new];
+            self.drill = None;
+            self.drill_index = 0;
+        } else {
+            self.set_current_index(idx);
+        }
     }
 
-    fn selection_ref_mut(&mut self) -> &mut usize {
-        if self.trend_open {
-            return &mut self.trend_index;
-        }
-        match self.focus {
-            PaneId::Left => &mut self.left_index,
-            PaneId::Sessions => &mut self.sessions_index,
-        }
+    /// Push a drill view onto the main pane. Called by the event loop after
+    /// the focused row's key/label is resolved from the data cache.
+    pub fn set_drill(&mut self, drill: Drill) {
+        self.drill = Some(drill);
+        self.drill_index = 0;
+        self.focus = Focus::Main;
     }
 }
 
-/// On-disk schema. Kept intentionally small and tolerant.
+/// On-disk schema (v3). Tolerant to unknown / missing fields; any file with
+/// a `version` other than `STATE_VERSION` is silently dropped on load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default = "default_version")]
     version: u32,
     #[serde(default)]
-    left_axis: Option<LeftAxis>,
+    current_section: Option<Section>,
     #[serde(default)]
     time_window: Option<TimeWindow>,
     #[serde(default)]
@@ -525,9 +677,13 @@ struct PersistedState {
     #[serde(default)]
     trend_granularity: Option<TrendGranularity>,
     #[serde(default)]
-    selected: Option<SelectedKeys>,
+    tab_per_section: Option<BTreeMap<Section, u8>>,
+    #[serde(default)]
+    section_selection: Option<BTreeMap<Section, String>>,
     #[serde(default)]
     expanded: Option<bool>,
+    #[serde(default)]
+    seen_v3_intro: Option<bool>,
 }
 
 fn default_version() -> u32 {
@@ -545,8 +701,9 @@ pub fn load(path: &Path) -> AppState {
         return AppState::default();
     }
     let mut s = AppState::default();
-    if let Some(v) = p.left_axis {
-        s.left_axis = v;
+    if let Some(v) = p.current_section {
+        s.current_section = v;
+        s.sidebar_index = Section::ALL.iter().position(|x| *x == v).unwrap_or(0);
     }
     if let Some(v) = p.time_window {
         s.time_window = v;
@@ -560,11 +717,17 @@ pub fn load(path: &Path) -> AppState {
     if let Some(v) = p.trend_granularity {
         s.trend_granularity = v;
     }
-    if let Some(v) = p.selected {
-        s.selected = v;
+    if let Some(v) = p.tab_per_section {
+        s.tab_per_section = v;
+    }
+    if let Some(v) = p.section_selection {
+        s.section_selection = v;
     }
     if let Some(v) = p.expanded {
         s.expanded = v;
+    }
+    if let Some(v) = p.seen_v3_intro {
+        s.seen_v3_intro = v;
     }
     s
 }
@@ -572,13 +735,15 @@ pub fn load(path: &Path) -> AppState {
 pub fn save(path: &Path, s: &AppState) -> anyhow::Result<()> {
     let p = PersistedState {
         version: STATE_VERSION,
-        left_axis: Some(s.left_axis),
+        current_section: Some(s.current_section),
         time_window: Some(s.time_window),
         source_filter: Some(s.source_filter),
         sort: Some(s.sort),
         trend_granularity: Some(s.trend_granularity),
-        selected: Some(s.selected.clone()),
+        tab_per_section: Some(s.tab_per_section.clone()),
+        section_selection: Some(s.section_selection.clone()),
         expanded: Some(s.expanded),
+        seen_v3_intro: Some(s.seen_v3_intro),
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -596,31 +761,210 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn roundtrip_persists_fields() {
-        let dir = TempDir::new().unwrap();
-        let p = dir.path().join("ui_state.json");
-        let s = AppState {
-            left_axis: LeftAxis::Model,
-            time_window: TimeWindow::Today,
-            source_filter: SourceFilter::Claude,
-            trend_granularity: TrendGranularity::Weekly,
-            ..AppState::default()
-        };
-        save(&p, &s).unwrap();
-        let loaded = load(&p);
-        assert_eq!(loaded.left_axis, LeftAxis::Model);
-        assert_eq!(loaded.time_window, TimeWindow::Today);
-        assert_eq!(loaded.source_filter, SourceFilter::Claude);
-        assert_eq!(loaded.trend_granularity, TrendGranularity::Weekly);
+    fn section_next_wraps() {
+        assert_eq!(Section::Repos.next(), Section::Days);
+        assert_eq!(Section::Provider.next(), Section::Repos);
     }
 
     #[test]
-    fn unknown_version_falls_back_to_default() {
+    fn section_prev_wraps() {
+        assert_eq!(Section::Days.prev(), Section::Repos);
+        assert_eq!(Section::Repos.prev(), Section::Provider);
+    }
+
+    #[test]
+    fn repos_section_has_two_tabs() {
+        assert_eq!(Section::Repos.tabs(), &["Costs", "Provider"]);
+        assert!(Section::Days.tabs().is_empty());
+    }
+
+    #[test]
+    fn only_repos_supports_drill() {
+        assert!(Section::Repos.supports_drill());
+        assert!(!Section::Days.supports_drill());
+        assert!(!Section::Provider.supports_drill());
+    }
+
+    #[test]
+    fn next_section_action_changes_section_and_marks_dirty() {
+        let mut s = AppState::default();
+        let out = s.apply(Action::NextSection);
+        assert_eq!(s.current_section, Section::Days);
+        assert!(out.dirty);
+        assert!(out.needs_refresh);
+    }
+
+    #[test]
+    fn cycle_tab_advances_repos_tab() {
+        let mut s = AppState::default();
+        assert_eq!(s.active_tab_index(), 0);
+        let out = s.apply(Action::CycleTab);
+        assert_eq!(s.active_tab_index(), 1);
+        assert!(out.dirty);
+        // wraps
+        s.apply(Action::CycleTab);
+        assert_eq!(s.active_tab_index(), 0);
+    }
+
+    #[test]
+    fn cycle_tab_noop_for_single_lens_section() {
+        let mut s = AppState {
+            current_section: Section::Days,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::CycleTab);
+        assert!(!out.dirty);
+        assert_eq!(s.active_tab_index(), 0);
+    }
+
+    #[test]
+    fn drill_set_and_pop() {
+        let mut s = AppState::default();
+        s.set_drill(Drill {
+            section: Section::Repos,
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+        });
+        assert!(s.drill.is_some());
+        let out = s.apply(Action::PopDrill);
+        assert!(s.drill.is_none());
+        assert!(out.dirty);
+    }
+
+    #[test]
+    fn jump_to_provider_switches_section() {
+        let mut s = AppState::default();
+        let out = s.apply(Action::JumpToSection(Section::Provider));
+        assert_eq!(s.current_section, Section::Provider);
+        assert!(out.dirty);
+    }
+
+    #[test]
+    fn pop_cascades_drill_then_focus() {
+        let mut s = AppState::default();
+        s.set_drill(Drill {
+            section: Section::Repos,
+            key: "x".into(),
+            label: "x".into(),
+        });
+        s.apply(Action::Pop);
+        assert!(s.drill.is_none());
+        assert_eq!(s.focus, Focus::Main);
+        s.apply(Action::Pop);
+        assert_eq!(s.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn move_in_sidebar_changes_section() {
+        let mut s = AppState {
+            focus: Focus::Sidebar,
+            ..AppState::default()
+        };
+        s.apply(Action::MoveDown);
+        assert_eq!(s.current_section, Section::Days);
+        s.apply(Action::MoveUp);
+        assert_eq!(s.current_section, Section::Repos);
+    }
+
+    #[test]
+    fn sidebar_move_triggers_full_refresh() {
+        let mut s = AppState {
+            focus: Focus::Sidebar,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::MoveDown);
+        assert_eq!(s.current_section, Section::Days);
+        assert!(out.needs_refresh, "section change must trigger refresh");
+        assert!(out.refresh.left, "left/main pane data must refetch");
+        assert!(out.refresh.sessions);
+        assert!(out.refresh.trend);
+    }
+
+    #[test]
+    fn sidebar_bottom_jumps_and_refreshes() {
+        let mut s = AppState {
+            focus: Focus::Sidebar,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::Bottom);
+        assert_eq!(s.current_section, Section::Provider);
+        assert!(out.needs_refresh);
+        assert!(out.refresh.left);
+        assert!(out.refresh.trend);
+    }
+
+    #[test]
+    fn roundtrip_persists_fields() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("ui_state.json");
-        std::fs::write(&p, br#"{"version":999,"left_axis":"model"}"#).unwrap();
+        let mut s = AppState {
+            current_section: Section::Provider,
+            time_window: TimeWindow::Today,
+            source_filter: SourceFilter::Claude,
+            trend_granularity: TrendGranularity::Weekly,
+            seen_v3_intro: true,
+            ..AppState::default()
+        };
+        s.tab_per_section.insert(Section::Repos, 1);
+        s.section_selection
+            .insert(Section::Repos, "tokctl".to_owned());
+        save(&p, &s).unwrap();
         let loaded = load(&p);
-        assert_eq!(loaded.left_axis, AppState::default().left_axis);
+        assert_eq!(loaded.current_section, Section::Provider);
+        assert_eq!(loaded.time_window, TimeWindow::Today);
+        assert_eq!(loaded.source_filter, SourceFilter::Claude);
+        assert_eq!(loaded.trend_granularity, TrendGranularity::Weekly);
+        assert_eq!(loaded.tab_per_section.get(&Section::Repos), Some(&1u8));
+        assert_eq!(
+            loaded
+                .section_selection
+                .get(&Section::Repos)
+                .map(String::as_str),
+            Some("tokctl")
+        );
+        assert!(loaded.seen_v3_intro);
+    }
+
+    #[test]
+    fn load_accepts_legacy_trend_section_name() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("ui_state.json");
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"version":{},"current_section":"trend","trend_granularity":"daily"}}"#,
+                STATE_VERSION
+            ),
+        )
+        .unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.current_section, Section::Provider);
+        assert_eq!(loaded.trend_granularity, TrendGranularity::Daily);
+    }
+
+    #[test]
+    fn v2_file_resets_to_defaults() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("ui_state.json");
+        // Simulate an old v2 file shape.
+        std::fs::write(
+            &p,
+            br#"{"version":2,"left_axis":"model","time_window":"today"}"#,
+        )
+        .unwrap();
+        let loaded = load(&p);
+        let default = AppState::default();
+        assert_eq!(loaded.current_section, default.current_section);
+        assert_eq!(loaded.time_window, default.time_window);
+    }
+
+    #[test]
+    fn unknown_version_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("ui_state.json");
+        std::fs::write(&p, br#"{"version":999,"current_section":"trend"}"#).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.current_section, AppState::default().current_section);
     }
 
     #[test]
@@ -632,24 +976,28 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_axis_and_marks_dirty() {
+    fn detail_toggle_and_pop_preserve_section() {
         let mut s = AppState::default();
-        let out = s.apply(Action::CycleAxis);
-        assert_eq!(s.left_axis, LeftAxis::Day);
-        assert!(out.dirty);
-        assert!(out.needs_refresh);
-    }
-
-    #[test]
-    fn detail_toggle_and_pop_preserve_selection() {
-        let mut s = AppState {
-            left_index: 3,
-            ..AppState::default()
-        };
+        s.section_index.insert(Section::Repos, 3);
         s.apply(Action::ToggleDetail);
         assert!(s.detail_open);
         s.apply(Action::Pop);
         assert!(!s.detail_open);
-        assert_eq!(s.left_index, 3);
+        assert_eq!(s.section_index.get(&Section::Repos), Some(&3));
+    }
+
+    #[test]
+    fn drill_is_not_persisted() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("ui_state.json");
+        let mut s = AppState::default();
+        s.set_drill(Drill {
+            section: Section::Repos,
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+        });
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert!(loaded.drill.is_none());
     }
 }

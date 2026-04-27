@@ -1,6 +1,7 @@
 pub mod data;
 pub mod format;
 pub mod keys;
+pub mod shell;
 pub mod state;
 pub mod theme;
 pub mod view;
@@ -19,12 +20,12 @@ use std::time::{Duration, Instant};
 
 use crate::store::{open_store, store_path};
 
-pub use state::{AppState, LeftAxis, SourceFilter, TimeWindow};
+pub use state::{AppState, Focus, Section, SourceFilter, TimeWindow};
 
 /// Tick cadence for the footer clock / sparkline refresh.
 const TICK_MS: u64 = 33;
-/// Minimum width before we bail out of the three-pane layout.
-pub const MIN_WIDTH: u16 = 72;
+/// Minimum width before we bail out of the sidebar/main shell.
+pub const MIN_WIDTH: u16 = 80;
 
 #[derive(Debug)]
 pub enum Event {
@@ -87,7 +88,11 @@ pub fn run() -> Result<()> {
         .map(|p| p.join("ui_state.json"))
         .unwrap_or_else(|| std::path::PathBuf::from("ui_state.json"));
 
-    let state = state::load(&state_path);
+    let mut state = state::load(&state_path);
+    if !state.seen_v3_intro {
+        state.flash = Some("Tab cycles tabs · sections live in the sidebar".into());
+        state.seen_v3_intro = true;
+    }
 
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
@@ -105,6 +110,7 @@ fn event_loop(
     mut state: AppState,
     state_path: std::path::PathBuf,
 ) -> Result<()> {
+    let dirty_state_initial = state.flash.is_some();
     let (tx, rx) = mpsc::channel::<Event>();
 
     // Input thread.
@@ -130,7 +136,7 @@ fn event_loop(
     cache.refresh_all(&conn, &state);
 
     let mut last_save = Instant::now();
-    let mut dirty_state = false;
+    let mut dirty_state = dirty_state_initial;
     let mut last_g_press: Option<Instant> = None;
 
     loop {
@@ -148,9 +154,23 @@ fn event_loop(
                 let action = keys::map_key(&state, k, &mut last_g_press);
                 let is_yank = matches!(action, state::Action::Yank);
                 let is_yank_summary = matches!(action, state::Action::YankSummary);
+                let is_drill_push = matches!(action, state::Action::Drill)
+                    && state.drill.is_none()
+                    && state.current_section.supports_drill();
+                // Resolve the drill row BEFORE state.apply() so we can read the
+                // currently-focused row from the cache.
+                let drill_target = if is_drill_push {
+                    drill_row_for_current(&state, &cache)
+                } else {
+                    None
+                };
                 let outcome = state.apply(action);
                 if outcome.quit {
                     break;
+                }
+                if let Some(d) = drill_target {
+                    state.set_drill(d);
+                    dirty_state = true;
                 }
                 if outcome.needs_refresh {
                     cache.refresh_for(&conn, &state, outcome.refresh);
@@ -195,43 +215,43 @@ fn event_loop(
 }
 
 fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
-    use state::PaneId;
-    match state.focus {
-        PaneId::Left => cache
-            .left
-            .get(state.left_index.min(cache.left.len().saturating_sub(1)))
-            .map(|r| r.key.clone()),
-        PaneId::Sessions => cache
+    if state.drill.is_some() {
+        return cache
             .sessions
             .get(
                 state
-                    .sessions_index
+                    .drill_index
                     .min(cache.sessions.len().saturating_sub(1)),
             )
-            .map(|r| r.session_id.clone()),
+            .map(|r| r.session_id.clone());
+    }
+    match state.current_section {
+        Section::Provider => cache
+            .trend
+            .get(
+                state
+                    .current_index()
+                    .min(cache.trend.len().saturating_sub(1)),
+            )
+            .map(|r| r.bucket.clone()),
+        _ => cache
+            .left
+            .get(
+                state
+                    .current_index()
+                    .min(cache.left.len().saturating_sub(1)),
+            )
+            .map(|r| r.key.clone()),
     }
 }
 
 fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String> {
-    use state::PaneId;
-    match state.focus {
-        PaneId::Left => cache
-            .left
-            .get(state.left_index.min(cache.left.len().saturating_sub(1)))
-            .map(|r| {
-                format!(
-                    "{} · {} sessions · {} tokens · {}",
-                    r.label,
-                    r.sessions,
-                    r.total_tokens,
-                    crate::tui::format::fmt_cost(r.cost)
-                )
-            }),
-        PaneId::Sessions => cache
+    if state.drill.is_some() {
+        return cache
             .sessions
             .get(
                 state
-                    .sessions_index
+                    .drill_index
                     .min(cache.sessions.len().saturating_sub(1)),
             )
             .map(|r| {
@@ -243,8 +263,56 @@ fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String> {
                     r.total_tokens,
                     crate::tui::format::fmt_cost(r.cost)
                 )
+            });
+    }
+    match state.current_section {
+        Section::Provider => cache
+            .trend
+            .get(
+                state
+                    .current_index()
+                    .min(cache.trend.len().saturating_sub(1)),
+            )
+            .map(|r| {
+                format!(
+                    "{} · {} tokens · {}",
+                    r.bucket,
+                    r.total_tokens,
+                    crate::tui::format::fmt_cost(r.total_cost)
+                )
+            }),
+        _ => cache
+            .left
+            .get(
+                state
+                    .current_index()
+                    .min(cache.left.len().saturating_sub(1)),
+            )
+            .map(|r| {
+                format!(
+                    "{} · {} sessions · {} tokens · {}",
+                    r.label,
+                    r.sessions,
+                    r.total_tokens,
+                    crate::tui::format::fmt_cost(r.cost)
+                )
             }),
     }
+}
+
+/// Resolve the drill target from the focused row in the active section.
+/// Only meaningful for `Section::Repos` today.
+fn drill_row_for_current(state: &AppState, cache: &data::DataCache) -> Option<state::Drill> {
+    if !state.current_section.supports_drill() || cache.left.is_empty() {
+        return None;
+    }
+    let idx = state.current_index().min(cache.left.len() - 1);
+    let row = &cache.left[idx];
+    Some(state::Drill {
+        section: state.current_section,
+        key: row.key.clone(),
+        label: row.label.clone(),
+    })
 }
 
 #[cfg(feature = "clipboard")]
