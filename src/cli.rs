@@ -15,10 +15,6 @@ use crate::dates::{parse_since, parse_until};
 use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoverOpts};
 use crate::ingest::file_range::{ingest_claude_range, ingest_codex_range, ingest_cursor_range};
 use crate::ingest::run::{run_ingest, RunIngestOptions};
-use crate::legacy::in_memory::{
-    daily_in_memory, filter_by_date, filter_by_repo, monthly_in_memory, repo_in_memory,
-    resolve_repos, session_in_memory,
-};
 use crate::paths::{
     cursor_sync_cache_dir, default_claude_roots, default_codex_roots, default_cursor_roots,
     resolve_roots, ResolveInput,
@@ -26,6 +22,10 @@ use crate::paths::{
 use crate::pricing;
 use crate::render::{
     render_json, render_repo_json, render_repo_table, render_table, render_warnings,
+};
+use crate::reports::in_memory::{
+    daily_in_memory, filter_by_date, filter_by_repo, monthly_in_memory, repo_in_memory,
+    resolve_repos, session_in_memory,
 };
 use crate::store::queries::{
     daily_report, monthly_report, repo_report, resolve_repo_filter, session_report, QueryFilter,
