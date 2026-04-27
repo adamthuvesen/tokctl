@@ -76,32 +76,39 @@ tokctl ui
 
 Refreshes the SQLite cache from the default/env Claude, Codex, and Cursor roots, optionally refreshes Cursor from the network when credentials are configured, then launches the interactive view. **TTY only** — exits if stdout is not a terminal.
 
-Two panes: axis on the left (repo → day → model → session via `Tab`), sessions for the selection on the right. Press `?` for in-app help.
+Sidebar/main shell: a left **Sections** sidebar (Repos · Days · Models · Sessions · Provider) and a right **Main** pane that fills with the active section. Some sections (Repos) host **tabs** as lenses on the same data. Pressing `Enter` on a row drills in-place with a breadcrumb header; `Esc` / `←` pops back. Press `?` for in-app help. Minimum width: 80 columns.
 
 ```
-┌─ tokctl  2026-04-22 16:30  last 30 days · $84.12 · 1.24M tok ──────────────[?]─┐
-│  [ REPOS ]                             │  SESSIONS                             │
-│  ▸ tokctl                     $41.22   │  3m ago    claude  tokctl       $8.20 │
-│    cortex                     $18.40   │  2h ago    codex   my-project    $3.10│
-│    (no-repo)                  $ 9.03   │  yesterday cursor  usage.csv     $1.40│
-│  ▁▂▂▃▇▅▃▂▁▂▃▅▇▆▃  cost/day last 30d · window:month · source:all                │
-│  j/k move  ↵ drill  h/l pane  / filter  Tab axis  t trend  T/w/m/Y/a window    │
-└────────────────────────────────────────────────────────────────────────────────┘
+┌─ tokctl  2026-04-25 12:52  last month · $11442.57 · 5.37M tok ─────────[?]─┐
+│ ┌ Sections ┐  ┌─ Costs ─└────────┘─ Provider ─────────────────────────────┐ │
+│ │▌ Repos   │  │  name              tok          cost                    │ │
+│ │  Days    │  │  ▌ tokctl       1.2M         $4.20                       │ │
+│ │  Models  │  │   apps         850K          $2.10                       │ │
+│ │  Sessions│  │   (no-repo)    240K          $0.80                       │ │
+│ │ Provider │  │                                                          │ │
+│ └──────────┘  └──────────────────────────────────────────────────────────┘ │
+│ ▁▂▂▃▇▅▃▂▁▂▃▅▇▆▃  window:month  source:all  │  [j/k] move · [[/]] section · │
+│                                              [tab] tabs · [↵] drill · …    │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Keys | Action |
 | --- | --- |
-| `h` `l` / arrows | panes |
-| `j` `k` / arrows | move |
+| `j` `k` / arrows | move within focused area (sidebar OR main) |
+| `[` / `]` | previous / next section |
+| `h` / `←` | pop drill, then focus sidebar |
+| `l` / `→` | focus main |
+| `Enter` | drill (sidebar→main; main→push drill) |
+| `Esc` / `Backspace` | cancel filter, close overlay, pop drill |
 | `g` `g` / `G` | top / bottom |
 | `Ctrl-d` / `Ctrl-u` | half page |
-| `Enter` | drill |
-| `Esc` / `Backspace` | back / clear filter |
-| `/` | fuzzy filter |
-| `Tab` | cycle left axis |
+| `Tab` | cycle main-pane tabs |
+| `t` | jump to Provider section |
+| `d` `w` `m` `y` | time-bucket granularity (Provider or Days section) |
 | `s` | sort cycle |
-| `t` | trend overlay (`d`/`w`/`m`/`y` inside) |
-| `T` `w` `m` `z` `a` | window: today / week / month / year / all |
+| `e` | compact / expanded |
+| `/` | fuzzy filter |
+| `T` `W` `M` `z` `a` | window: today / week / month / year / all |
 | `1` `2` `3` `4` | source: all / claude / codex / cursor |
 | `r` | re-query cache (no ingest) |
 | `i` | row details |
