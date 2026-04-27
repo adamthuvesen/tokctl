@@ -58,9 +58,11 @@ pub fn map_key(state: &AppState, k: KeyEvent, last_g: &mut Option<Instant>) -> A
         KeyCode::Char('t') => Action::ToggleTrend,
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('s') => Action::CycleSort,
+        KeyCode::Char('i') => Action::ToggleDetail,
         KeyCode::Tab => Action::CycleAxis,
         KeyCode::Char('/') => Action::FilterOpen,
         KeyCode::Char('y') => Action::Yank,
+        KeyCode::Char('Y') => Action::YankSummary,
         KeyCode::Enter => Action::Drill,
         KeyCode::Esc | KeyCode::Backspace => Action::Pop,
         KeyCode::Char('G') => Action::Bottom,
@@ -71,12 +73,36 @@ pub fn map_key(state: &AppState, k: KeyEvent, last_g: &mut Option<Instant>) -> A
         KeyCode::Char('T') => Action::SetWindow(TimeWindow::Today),
         KeyCode::Char('w') => Action::SetWindow(TimeWindow::Week),
         KeyCode::Char('m') => Action::SetWindow(TimeWindow::Month),
-        // `Y` picks the year window because lowercase `y` is reserved for yank.
-        KeyCode::Char('Y') => Action::SetWindow(TimeWindow::Year),
+        KeyCode::Char('z') => Action::SetWindow(TimeWindow::Year),
         KeyCode::Char('a') => Action::SetWindow(TimeWindow::All),
         KeyCode::Char('1') => Action::SetSource(SourceFilter::All),
         KeyCode::Char('2') => Action::SetSource(SourceFilter::Claude),
         KeyCode::Char('3') => Action::SetSource(SourceFilter::Codex),
+        KeyCode::Char('4') => Action::SetSource(SourceFilter::Cursor),
         _ => Action::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn maps_detail_and_summary_copy() {
+        let state = AppState::default();
+        let mut last_g = None;
+        let detail = map_key(
+            &state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut last_g,
+        );
+        assert!(matches!(detail, Action::ToggleDetail));
+        let summary = map_key(
+            &state,
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            &mut last_g,
+        );
+        assert!(matches!(summary, Action::YankSummary));
     }
 }
