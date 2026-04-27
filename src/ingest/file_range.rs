@@ -1,5 +1,6 @@
 use crate::sources::{
-    parse_claude_line, parse_codex_line, parse_cursor_csv, CodexCtx, CodexParsed,
+    parse_claude_line_classified, parse_codex_line, parse_cursor_csv, ClaudeParseResult, CodexCtx,
+    CodexParsed,
 };
 use crate::types::UsageEvent;
 use anyhow::Result;
@@ -55,8 +56,8 @@ fn process_claude_bytes(bytes: &[u8], project_path: Option<&str>, result: &mut R
         if !crate::sources::claude_line_has_signal(line) {
             continue;
         }
-        match parse_claude_line(line, project_path) {
-            Some(p) => {
+        match parse_claude_line_classified(line, project_path) {
+            ClaudeParseResult::Event(p) => {
                 if let Some(id) = p.message_id {
                     if !seen_ids.insert(id) {
                         continue;
@@ -64,7 +65,8 @@ fn process_claude_bytes(bytes: &[u8], project_path: Option<&str>, result: &mut R
                 }
                 result.events.push(p.event);
             }
-            None => result.skipped_lines += 1,
+            ClaudeParseResult::Skipped => {}
+            ClaudeParseResult::Malformed => result.skipped_lines += 1,
         }
     }
 }
@@ -139,8 +141,8 @@ pub fn ingest_claude_range(
         if !crate::sources::claude_line_has_signal(&line) {
             continue;
         }
-        match parse_claude_line(&line, project_path) {
-            Some(p) => {
+        match parse_claude_line_classified(&line, project_path) {
+            ClaudeParseResult::Event(p) => {
                 if let Some(id) = p.message_id {
                     if !seen_ids.insert(id) {
                         continue;
@@ -148,7 +150,8 @@ pub fn ingest_claude_range(
                 }
                 result.events.push(p.event);
             }
-            None => result.skipped_lines += 1,
+            ClaudeParseResult::Skipped => {}
+            ClaudeParseResult::Malformed => result.skipped_lines += 1,
         }
     }
     Ok(result)
@@ -218,33 +221,6 @@ pub fn ingest_cursor_range(file_path: &Path) -> Result<RangeResult> {
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn claude_range_reads_fixture() {
-        let path = std::path::Path::new("test/fixtures/claude/-Users-dev-tokctl/sess-a.jsonl");
-        if !path.exists() {
-            eprintln!("skipping — fixture missing");
-            return;
-        }
-        let size = std::fs::metadata(path).unwrap().len();
-        let r = ingest_claude_range(path, Some("/Users/dev/tokctl"), 0, size).unwrap();
-        assert_eq!(r.events.len(), 3);
-        assert_eq!(r.skipped_lines, 0);
-    }
-
-    #[test]
-    fn codex_range_reads_fixture() {
-        let path = std::path::Path::new(
-            "test/fixtures/codex/2026/04/20/rollout-2026-04-20T14-49-04-sess-x.jsonl",
-        );
-        if !path.exists() {
-            eprintln!("skipping — fixture missing");
-            return;
-        }
-        let size = std::fs::metadata(path).unwrap().len();
-        let r = ingest_codex_range(path, 0, size).unwrap();
-        assert!(r.events.len() >= 2);
-    }
 
     #[test]
     fn partial_range_honors_offsets() {

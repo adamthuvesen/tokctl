@@ -7,6 +7,12 @@ pub struct ClaudeParsed {
     pub message_id: Option<String>,
 }
 
+pub enum ClaudeParseResult {
+    Event(ClaudeParsed),
+    Skipped,
+    Malformed,
+}
+
 /// Fast substring pre-filter. Lines missing either marker cannot carry usage.
 #[inline]
 pub fn claude_line_has_signal(line: &str) -> bool {
@@ -52,31 +58,43 @@ struct ClaudeUsage {
 }
 
 /// Parse a Claude JSONL line, returning the UsageEvent and optional message ID.
-pub fn parse_claude_line(line: &str, project_path: Option<&str>) -> Option<ClaudeParsed> {
+pub fn parse_claude_line_classified(line: &str, project_path: Option<&str>) -> ClaudeParseResult {
     if !claude_line_has_signal(line) {
-        return None;
+        return ClaudeParseResult::Skipped;
     }
-    let parsed: ClaudeLine = serde_json::from_str(line).ok()?;
+    let Ok(parsed) = serde_json::from_str::<ClaudeLine>(line) else {
+        return ClaudeParseResult::Malformed;
+    };
     if parsed.kind != "assistant" {
-        return None;
+        return ClaudeParseResult::Skipped;
     }
-    let message = parsed.message?;
-    let usage = message.usage?;
+    let Some(message) = parsed.message else {
+        return ClaudeParseResult::Skipped;
+    };
+    let Some(usage) = message.usage else {
+        return ClaudeParseResult::Skipped;
+    };
     let total = usage.input_tokens
         + usage.output_tokens
         + usage.cache_read_input_tokens
         + usage.cache_creation_input_tokens;
     if total == 0 {
-        return None;
+        return ClaudeParseResult::Skipped;
     }
-    let session_id = parsed.session_id?;
+    let Some(session_id) = parsed.session_id else {
+        return ClaudeParseResult::Malformed;
+    };
     if session_id.is_empty() {
-        return None;
+        return ClaudeParseResult::Malformed;
     }
-    let timestamp_str = parsed.timestamp?;
-    let timestamp: DateTime<Utc> = timestamp_str.parse().ok()?;
+    let Some(timestamp_str) = parsed.timestamp else {
+        return ClaudeParseResult::Malformed;
+    };
+    let Ok(timestamp) = timestamp_str.parse::<DateTime<Utc>>() else {
+        return ClaudeParseResult::Malformed;
+    };
 
-    Some(ClaudeParsed {
+    ClaudeParseResult::Event(ClaudeParsed {
         event: UsageEvent {
             source: Source::Claude,
             timestamp,
@@ -91,6 +109,13 @@ pub fn parse_claude_line(line: &str, project_path: Option<&str>) -> Option<Claud
         },
         message_id: message.id.map(str::to_owned),
     })
+}
+
+pub fn parse_claude_line(line: &str, project_path: Option<&str>) -> Option<ClaudeParsed> {
+    match parse_claude_line_classified(line, project_path) {
+        ClaudeParseResult::Event(parsed) => Some(parsed),
+        ClaudeParseResult::Skipped | ClaudeParseResult::Malformed => None,
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +149,10 @@ mod tests {
     #[test]
     fn zero_token_line_returns_none() {
         assert!(parse_claude_line(ZERO_LINE, None).is_none());
+        assert!(matches!(
+            parse_claude_line_classified(ZERO_LINE, None),
+            ClaudeParseResult::Skipped
+        ));
     }
 
     #[test]
@@ -134,6 +163,22 @@ mod tests {
     #[test]
     fn malformed_json_returns_none() {
         assert!(parse_claude_line("not valid json with usage and assistant", None).is_none());
+        assert!(matches!(
+            parse_claude_line_classified(
+                r#"not valid json with "type":"assistant" and "usage""#,
+                None
+            ),
+            ClaudeParseResult::Malformed
+        ));
+    }
+
+    #[test]
+    fn nested_assistant_progress_line_is_skipped() {
+        let line = r#"{"type":"progress","data":{"message":{"type":"assistant","message":{"usage":{"input_tokens":1}}}}}"#;
+        assert!(matches!(
+            parse_claude_line_classified(line, None),
+            ClaudeParseResult::Skipped
+        ));
     }
 
     #[test]

@@ -31,8 +31,9 @@ pub fn parse_cursor_csv(path: &Path) -> (Vec<UsageEvent>, usize) {
             continue;
         }
         match parse_row(&fields, indexes, &session_prefix, row_idx + 1) {
-            Some(event) => events.push(event),
-            None => skipped += 1,
+            CursorRowParse::Event(event) => events.push(event),
+            CursorRowParse::Skipped => {}
+            CursorRowParse::Malformed => skipped += 1,
         }
     }
     (events, skipped)
@@ -83,22 +84,47 @@ fn session_prefix(path: &Path) -> String {
     format!("{stem}-{}", &hash[..12])
 }
 
+enum CursorRowParse {
+    Event(UsageEvent),
+    Skipped,
+    Malformed,
+}
+
 fn parse_row(
     fields: &StringRecord,
     columns: CursorColumns,
     session_prefix: &str,
     row_idx: usize,
-) -> Option<UsageEvent> {
-    let model = get_field(fields, columns.model)?;
+) -> CursorRowParse {
+    let Some(model) = get_field(fields, columns.model) else {
+        return CursorRowParse::Malformed;
+    };
     if model.is_empty() {
-        return None;
+        return CursorRowParse::Skipped;
     }
-    let timestamp = parse_cursor_timestamp(get_field(fields, columns.date)?)?;
-    let input_with_cache_write = parse_u64(get_field(fields, columns.input_with_cache_write)?);
-    let input_without_cache_write =
-        parse_u64(get_field(fields, columns.input_without_cache_write)?);
-    let cache_read_tokens = parse_u64(get_field(fields, columns.cache_read)?);
-    let output_tokens = parse_u64(get_field(fields, columns.output_tokens)?);
+    let Some(timestamp_raw) = get_field(fields, columns.date) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(timestamp) = parse_cursor_timestamp(timestamp_raw) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(input_with_cache_write_raw) = get_field(fields, columns.input_with_cache_write) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(input_without_cache_write_raw) = get_field(fields, columns.input_without_cache_write)
+    else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(cache_read_raw) = get_field(fields, columns.cache_read) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(output_tokens_raw) = get_field(fields, columns.output_tokens) else {
+        return CursorRowParse::Malformed;
+    };
+    let input_with_cache_write = parse_u64(input_with_cache_write_raw);
+    let input_without_cache_write = parse_u64(input_without_cache_write_raw);
+    let cache_read_tokens = parse_u64(cache_read_raw);
+    let output_tokens = parse_u64(output_tokens_raw);
     let cache_write_tokens = input_with_cache_write.saturating_sub(input_without_cache_write);
     let explicit_cost_usd = columns
         .cost
@@ -122,10 +148,10 @@ fn parse_row(
         == 0
         && event.explicit_cost_usd.unwrap_or(0.0) == 0.0
     {
-        return None;
+        return CursorRowParse::Skipped;
     }
 
-    Some(event)
+    CursorRowParse::Event(event)
 }
 
 fn get_field(fields: &StringRecord, idx: usize) -> Option<&str> {
@@ -254,5 +280,22 @@ mod tests {
     fn included_cost_is_zero() {
         assert_eq!(parse_cost("Included"), Some(0.0));
         assert_eq!(parse_cost("-"), Some(0.0));
+    }
+
+    #[test]
+    fn zero_usage_rows_are_ignored_not_counted_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.csv");
+        std::fs::write(
+            &path,
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n\
+             2026-04-27T09:23:08.975Z,,gpt-5.5-medium,No,0,0,0,0,0,0.00\n",
+        )
+        .unwrap();
+
+        let (events, skipped) = parse_cursor_csv(&path);
+
+        assert!(events.is_empty());
+        assert_eq!(skipped, 0);
     }
 }
