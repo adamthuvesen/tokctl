@@ -87,6 +87,7 @@ pub fn parse_claude_line(line: &str, project_path: Option<&str>) -> Option<Claud
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_input_tokens,
             cache_write_tokens: usage.cache_creation_input_tokens,
+            explicit_cost_usd: None,
         },
         message_id: message.id.map(str::to_owned),
     })

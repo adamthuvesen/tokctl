@@ -80,8 +80,8 @@ struct TokenUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
-    #[serde(default)]
-    reasoning_output_tokens: u64,
+    #[serde(default, rename = "reasoning_output_tokens")]
+    _reasoning_output_tokens: u64,
     #[serde(default)]
     cached_input_tokens: u64,
 }
@@ -124,8 +124,7 @@ pub fn parse_codex_line(line: &str, ctx: &mut CodexCtx) -> Option<CodexParsed> {
             let Some(last) = info.last_token_usage else {
                 return Some(CodexParsed::Skipped);
             };
-            let total_output = last.output_tokens + last.reasoning_output_tokens;
-            if last.input_tokens + total_output + last.cached_input_tokens == 0 {
+            if last.input_tokens + last.output_tokens + last.cached_input_tokens == 0 {
                 return Some(CodexParsed::Skipped);
             }
             let Some(session_id) = ctx.session_id.clone() else {
@@ -155,9 +154,10 @@ pub fn parse_codex_line(line: &str, ctx: &mut CodexCtx) -> Option<CodexParsed> {
                 project_path: ctx.project_path.clone(),
                 model,
                 input_tokens: non_cached_input,
-                output_tokens: total_output,
+                output_tokens: last.output_tokens,
                 cache_read_tokens: last.cached_input_tokens,
                 cache_write_tokens: 0,
+                explicit_cost_usd: None,
             }))
         }
         _ => None,
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(ev.session_id, "sess-x");
         assert_eq!(ev.model, "gpt-5.4");
         assert_eq!(ev.input_tokens, 150); // 200 - 50 cached = non-cached input only
-        assert_eq!(ev.output_tokens, 70);
+        assert_eq!(ev.output_tokens, 60);
         assert_eq!(ev.cache_read_tokens, 50);
         assert_eq!(ev.cache_write_tokens, 0);
     }
@@ -246,5 +246,21 @@ mod tests {
             panic!("expected event");
         };
         assert_eq!(ev.input_tokens, 50);
+    }
+
+    #[test]
+    fn reasoning_tokens_are_not_added_to_output_twice() {
+        let line = r#"{"timestamp":"2026-04-22T10:59:50.068Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":22443,"cached_input_tokens":4480,"output_tokens":650,"reasoning_output_tokens":516,"total_tokens":23093}}}}"#;
+        let mut ctx = CodexCtx {
+            session_id: Some("s".into()),
+            current_model: Some("gpt-5.4".into()),
+            ..Default::default()
+        };
+        let Some(CodexParsed::Event(ev)) = parse_codex_line(line, &mut ctx) else {
+            panic!("expected event");
+        };
+        assert_eq!(ev.input_tokens, 17_963);
+        assert_eq!(ev.output_tokens, 650);
+        assert_eq!(ev.cache_read_tokens, 4_480);
     }
 }

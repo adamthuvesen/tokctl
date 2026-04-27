@@ -1,5 +1,9 @@
-use crate::discovery::{discover_claude, discover_codex, DiscoverOpts, DiscoveredFile};
-use crate::ingest::file_range::{ingest_claude_range, ingest_codex_range, RangeResult};
+use crate::discovery::{
+    discover_claude, discover_codex, discover_cursor, DiscoverOpts, DiscoveredFile,
+};
+use crate::ingest::file_range::{
+    ingest_claude_range, ingest_codex_range, ingest_cursor_range, RangeResult,
+};
 use crate::ingest::plan::{plan_ingest, IngestPlan, PlanInput};
 use crate::pricing::cost_of;
 use crate::repo::Resolver;
@@ -20,8 +24,10 @@ pub struct RunIngestOptions<'a> {
     pub conn: &'a mut Connection,
     pub claude_roots: Vec<PathBuf>,
     pub codex_roots: Vec<PathBuf>,
+    pub cursor_roots: Vec<PathBuf>,
     pub include_claude: bool,
     pub include_codex: bool,
+    pub include_cursor: bool,
     pub safety_window_ms: i64,
     pub now_ms: i64,
 }
@@ -92,6 +98,7 @@ fn parse_file(file: DiscoveredFile, from_offset: u64) -> Result<ParsedFile> {
             ingest_claude_range(&file.path, file.project.as_deref(), from_offset, file.size)?
         }
         Source::Codex => ingest_codex_range(&file.path, from_offset, file.size)?,
+        Source::Cursor => ingest_cursor_range(&file.path)?,
     };
     let RangeResult {
         events,
@@ -118,13 +125,33 @@ fn parse_file(file: DiscoveredFile, from_offset: u64) -> Result<ParsedFile> {
     })
 }
 
+fn included_sources(
+    include_claude: bool,
+    include_codex: bool,
+    include_cursor: bool,
+) -> HashSet<Source> {
+    let mut sources = HashSet::new();
+    if include_claude {
+        sources.insert(Source::Claude);
+    }
+    if include_codex {
+        sources.insert(Source::Codex);
+    }
+    if include_cursor {
+        sources.insert(Source::Cursor);
+    }
+    sources
+}
+
 pub fn run_ingest(opts: RunIngestOptions<'_>) -> Result<IngestStats> {
     let RunIngestOptions {
         conn,
         claude_roots,
         codex_roots,
+        cursor_roots,
         include_claude,
         include_codex,
+        include_cursor,
         safety_window_ms,
         now_ms,
     } = opts;
@@ -132,6 +159,12 @@ pub fn run_ingest(opts: RunIngestOptions<'_>) -> Result<IngestStats> {
     let now_ms = if now_ms > 0 { now_ms } else { system_now_ms() };
 
     let manifest = load_file_manifest(conn)?;
+    let sources = included_sources(include_claude, include_codex, include_cursor);
+    let planned_manifest: HashMap<PathBuf, FileManifestRow> = manifest
+        .iter()
+        .filter(|(_, row)| sources.contains(&row.source))
+        .map(|(path, row)| (path.clone(), row.clone()))
+        .collect();
 
     let discover_opts = DiscoverOpts {
         safety_window_ms,
@@ -153,15 +186,22 @@ pub fn run_ingest(opts: RunIngestOptions<'_>) -> Result<IngestStats> {
             all.unchanged_paths.insert(p);
         }
     }
+    if include_cursor {
+        let d = discover_cursor(&cursor_roots, &manifest, discover_opts);
+        all.files.extend(d.files);
+        for p in d.unchanged_paths {
+            all.unchanged_paths.insert(p);
+        }
+    }
 
     let plan = plan_ingest(PlanInput {
-        manifest: &manifest,
+        manifest: &planned_manifest,
         discovery: &all,
         safety_window_ms,
         now_ms,
     });
 
-    execute_plan(conn, plan, manifest)
+    execute_plan(conn, plan, planned_manifest)
 }
 
 /// Apply the repo resolver to a batch of event rows, returning the set of
@@ -356,11 +396,102 @@ fn execute_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::schema::DDL;
 
     #[test]
     fn local_day_month_formats() {
         let ts: DateTime<Utc> = "2026-04-18T09:00:05Z".parse().unwrap();
         assert_eq!(local_day(&ts).len(), 10);
         assert_eq!(local_month(&ts).len(), 7);
+    }
+
+    fn manifest_row(path: &str, source: Source) -> FileManifestRow {
+        FileManifestRow {
+            path: PathBuf::from(path),
+            source,
+            project: None,
+            size: 10,
+            mtime_ns: 1,
+            last_offset: 10,
+            n_events: 1,
+            session_id: Some(format!("{source}-session")),
+            model: Some("claude-sonnet-4-6".into()),
+        }
+    }
+
+    fn event_row(path: &str, source: Source) -> EventRow {
+        EventRow {
+            file_path: path.into(),
+            source,
+            ts: 1,
+            day: "2026-04-22".into(),
+            month: "2026-04".into(),
+            session_id: format!("{source}-session"),
+            project_path: None,
+            repo: None,
+            model: "claude-sonnet-4-6".into(),
+            input: 1,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn source_limited_ingest_only_purges_included_sources() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        let tx = conn.transaction().unwrap();
+        upsert_file_manifest(&tx, &manifest_row("/claude.jsonl", Source::Claude)).unwrap();
+        upsert_file_manifest(&tx, &manifest_row("/cursor.csv", Source::Cursor)).unwrap();
+        insert_events(
+            &tx,
+            &[
+                event_row("/claude.jsonl", Source::Claude),
+                event_row("/cursor.csv", Source::Cursor),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let cursor_root = tempfile::tempdir().unwrap();
+        run_ingest(RunIngestOptions {
+            conn: &mut conn,
+            claude_roots: Vec::new(),
+            codex_roots: Vec::new(),
+            cursor_roots: vec![cursor_root.path().to_path_buf()],
+            include_claude: false,
+            include_codex: false,
+            include_cursor: true,
+            safety_window_ms: 3_600_000,
+            now_ms: 1_777_000_000_000,
+        })
+        .unwrap();
+
+        let claude_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cursor_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE source = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claude_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claude_files, 1);
+        assert_eq!(claude_events, 1);
+        assert_eq!(cursor_files, 0);
     }
 }

@@ -2,7 +2,7 @@
 name = "tokctl"
 version = "0.1.0"
 edition = "2021"
-description = "Local-only CLI that reports token usage and cost across Claude and Codex."
+description = "Local-only CLI that reports token usage and cost across Claude, Codex, and Cursor."
 license = "MIT"
 repository = "https://github.com/adamthuvesen/tokctl"
 rust-version = "1.75"
@@ -27,6 +27,9 @@ ratatui = "0.28"
 crossterm = "0.28"
 nucleo-matcher = "0.3"
 arboard = { version = "3", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "0.10"
+csv = "1"
 
 [features]
 default = ["clipboard"]
