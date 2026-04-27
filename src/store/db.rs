@@ -78,12 +78,11 @@ pub fn open_store(db_path: &Path) -> Result<Connection> {
             conn.execute_batch(DDL)?;
         }
         Some(2) => {
-            // In-place migration from v2 → v3: add the `repo` column, create
-            // the `repos` table, and backfill by resolving each distinct
+            // Legacy v2 upgrade path: add the `repo` column, create the
+            // `repos` table, and backfill by resolving each distinct
             // `project_path` already in the cache. No JSONL re-parse needed.
-            migrate_v2_to_v3(&mut conn).with_context(|| {
-                "migrating cache from v2 to v3 failed; try running with --rebuild"
-            })?;
+            migrate_v2_to_v3(&mut conn)
+                .with_context(|| "migrating legacy v2 cache failed; try running with --rebuild")?;
         }
         Some(v) if v < SCHEMA_VERSION => {
             // Older (pre-v2) caches: drop and rebuild, the fallback we've
@@ -141,8 +140,7 @@ fn migrate_v2_to_v3(conn: &mut Connection) -> Result<()> {
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?
-        .filter_map(std::result::Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
     let mut resolver = Resolver::new();
@@ -309,7 +307,7 @@ mod tests {
         let conn = open_store(&db_path).unwrap();
 
         // schema_version bumped
-        assert_eq!(read_schema_version(&conn), Some(3));
+        assert_eq!(read_schema_version(&conn), Some(SCHEMA_VERSION));
         // events.repo backfilled for the resolvable row
         let repo_for_a: Option<String> = conn
             .query_row(

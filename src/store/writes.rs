@@ -1,7 +1,7 @@
 use crate::discovery::ManifestLike;
 use crate::types::Source;
 use anyhow::Result;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, types::Type, Connection, Transaction};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -58,7 +58,13 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
     let rows = stmt.query_map([], |row| {
         let path: String = row.get(0)?;
         let source_str: String = row.get(1)?;
-        let source = Source::from_str(&source_str).unwrap_or(Source::Claude);
+        let source = Source::from_str(&source_str).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        })?;
         Ok(FileManifestRow {
             path: PathBuf::from(&path),
             source,
