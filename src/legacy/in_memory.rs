@@ -146,10 +146,12 @@ pub fn session_in_memory(
                 .as_deref()
                 .map(|p| project_basename(p).to_owned());
         }
-        match row.latest_timestamp {
-            Some(t) if e.timestamp > t => row.latest_timestamp = Some(e.timestamp),
-            None => row.latest_timestamp = Some(e.timestamp),
-            _ => {}
+        // `or_insert_with` always seeds `latest_timestamp` with `Some(...)`,
+        // so we only need to bump it on a later event.
+        if let Some(t) = row.latest_timestamp {
+            if e.timestamp > t {
+                row.latest_timestamp = Some(e.timestamp);
+            }
         }
     }
     let mut rows: Vec<AggregateRow> = map.into_values().collect();

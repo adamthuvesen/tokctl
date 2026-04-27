@@ -32,7 +32,8 @@ pub struct RunIngestOptions<'a> {
     pub now_ms: i64,
 }
 
-/// Derive a local-time YYYY-MM-DD from an event timestamp (UTC DateTime).
+/// YYYY-MM-DD bucket key in the user's local timezone (matches what humans
+/// see in their session logs, not UTC).
 pub fn local_day(ts: &DateTime<Utc>) -> String {
     let local = ts.with_timezone(&Local);
     format!(
@@ -43,7 +44,7 @@ pub fn local_day(ts: &DateTime<Utc>) -> String {
     )
 }
 
-/// Derive a local-time YYYY-MM from an event timestamp (UTC DateTime).
+/// YYYY-MM bucket key in the user's local timezone.
 pub fn local_month(ts: &DateTime<Utc>) -> String {
     let local = ts.with_timezone(&Local);
     format!("{:04}-{:02}", local.year(), local.month())
@@ -336,7 +337,7 @@ fn execute_plan(
         tx.commit()?;
     }
 
-    for (mut parsed, _from_offset) in tail_parsed {
+    for (mut parsed, _) in tail_parsed {
         stats.files_tailed += 1;
         let n_events_added = parsed.rows.len() as u64;
         let prev_n = manifest

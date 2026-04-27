@@ -23,19 +23,16 @@ pub fn parse_cursor_csv(path: &Path) -> (Vec<UsageEvent>, usize) {
     let mut events = Vec::new();
     let mut skipped = 0usize;
     for (row_idx, record) in reader.records().enumerate() {
-        match record {
-            Ok(fields) => {
-                let is_empty = fields.iter().all(|field| field.trim().is_empty());
-                if is_empty {
-                    continue;
-                }
-                let Some(event) = parse_row(&fields, indexes, &session_prefix, row_idx + 1) else {
-                    skipped += 1;
-                    continue;
-                };
-                events.push(event);
-            }
-            Err(_) => skipped += 1,
+        let Ok(fields) = record else {
+            skipped += 1;
+            continue;
+        };
+        if fields.iter().all(|f| f.trim().is_empty()) {
+            continue;
+        }
+        match parse_row(&fields, indexes, &session_prefix, row_idx + 1) {
+            Some(event) => events.push(event),
+            None => skipped += 1,
         }
     }
     (events, skipped)

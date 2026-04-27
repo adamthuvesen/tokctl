@@ -59,22 +59,12 @@ fn build_params(f: &QueryFilter) -> Vec<Value> {
     if let Some(src) = f.source {
         out.push(Value::Text(src.as_str().to_owned()));
     }
-    out.push(match f.since_ms {
-        Some(v) => Value::Integer(v),
-        None => Value::Null,
-    });
-    out.push(match f.since_ms {
-        Some(v) => Value::Integer(v),
-        None => Value::Null,
-    });
-    out.push(match f.until_ms {
-        Some(v) => Value::Integer(v),
-        None => Value::Null,
-    });
-    out.push(match f.until_ms {
-        Some(v) => Value::Integer(v),
-        None => Value::Null,
-    });
+    let opt_int = |v: Option<i64>| v.map(Value::Integer).unwrap_or(Value::Null);
+    // time_clause() binds each of since/until twice (NULL-check, then compare).
+    out.push(opt_int(f.since_ms));
+    out.push(opt_int(f.since_ms));
+    out.push(opt_int(f.until_ms));
+    out.push(opt_int(f.until_ms));
     match &f.repo {
         None | Some(RepoFilterSpec::NoRepo) => {}
         Some(RepoFilterSpec::DisplayName(n)) => out.push(Value::Text(n.clone())),
@@ -319,17 +309,16 @@ pub fn resolve_repo_filter(conn: &Connection, name: &str) -> Result<RepoFilterSp
         .query_map([name], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    match keys.len() {
-        0 => Ok(RepoFilterSpec::DisplayName(name.to_owned())),
-        1 => Ok(RepoFilterSpec::DisplayName(name.to_owned())),
-        _ => anyhow::bail!(
+    if keys.len() > 1 {
+        anyhow::bail!(
             "repo name '{}' is ambiguous — matches {} repos: {}. \
              Pass a path prefix (e.g. /Users/you/dev/…) to disambiguate.",
             name,
             keys.len(),
             keys.join(", ")
-        ),
+        );
     }
+    Ok(RepoFilterSpec::DisplayName(name.to_owned()))
 }
 
 #[cfg(test)]

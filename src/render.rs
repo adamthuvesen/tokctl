@@ -5,7 +5,6 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
 pub fn fmt_num(n: u64) -> String {
-    // Thousands-separated, en-US style.
     let s = n.to_string();
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -19,7 +18,7 @@ pub fn fmt_num(n: u64) -> String {
 }
 
 fn fmt_cost(n: f64) -> String {
-    format!("${:.2}", n)
+    format!("${n:.2}")
 }
 
 fn fmt_timestamp(ts: chrono::DateTime<chrono::Utc>) -> String {
@@ -348,14 +347,12 @@ pub fn render_warnings(unknown_models: &HashSet<String>, skipped_lines: usize) -
             .collect::<Vec<_>>()
             .join(", ");
         out.push(format!(
-            "warning: no price for model(s): {} (cost treated as 0)",
-            joined
+            "warning: no price for model(s): {joined} (cost treated as 0)"
         ));
     }
     if skipped_lines > 0 {
         out.push(format!(
-            "warning: skipped {} malformed JSONL line(s)",
-            skipped_lines
+            "warning: skipped {skipped_lines} malformed JSONL line(s)"
         ));
     }
     out

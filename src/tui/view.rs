@@ -264,7 +264,7 @@ fn draw_main(
         let inner = draw_main_frame(
             frame,
             area,
-            &format!("{} › {}", section_title(drill.section), drill.label),
+            &format!("{} › {}", drill.section.title(), drill.label),
             &[],
             0,
             focused,
@@ -307,16 +307,6 @@ fn pad_top(area: Rect, n: u16) -> Rect {
     }
 }
 
-fn section_title(section: Section) -> String {
-    match section {
-        Section::Repos => "REPOS".into(),
-        Section::Days => "DAYS".into(),
-        Section::Models => "MODELS".into(),
-        Section::Sessions => "SESSIONS".into(),
-        Section::Provider => "PROVIDER".into(),
-    }
-}
-
 /// Title for the main pane border. For the Days section the title reflects
 /// the active granularity (DAYS / WEEKS / MONTHS / YEARS).
 fn main_pane_title(state: &AppState) -> String {
@@ -328,7 +318,7 @@ fn main_pane_title(state: &AppState) -> String {
             crate::tui::state::TrendGranularity::Yearly => "YEARS".into(),
         }
     } else {
-        section_title(state.current_section)
+        state.current_section.title().to_owned()
     }
 }
 
@@ -352,7 +342,7 @@ fn draw_drill(
     // Breadcrumb hint row.
     let drill = state.drill.as_ref().unwrap();
     let breadcrumb = Line::from(vec![
-        Span::styled(section_title(drill.section), palette.dim_text()),
+        Span::styled(drill.section.title(), palette.dim_text()),
         Span::styled(" › ", palette.dim_text()),
         Span::styled(
             drill.label.clone(),

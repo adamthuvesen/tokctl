@@ -416,9 +416,7 @@ impl AppState {
         match action {
             Action::Quit => out.quit = true,
             Action::None => {}
-            Action::DismissFlash => {
-                // already cleared above
-            }
+            Action::DismissFlash => {}
             Action::FocusSidebar => {
                 self.focus = Focus::Sidebar;
             }
@@ -460,16 +458,13 @@ impl AppState {
                 }
             }
             Action::Drill => {
+                // The actual key/label is filled in by mod.rs after it reads
+                // the focused row and calls `set_drill`. Here we only mark
+                // that the drill view will need scoped sessions. drill state
+                // itself isn't persisted, so dirty stays false.
                 if self.drill.is_none() && self.current_section.supports_drill() {
-                    // The actual key/label is filled in by mod.rs after lookup;
-                    // here we just mark intent. mod.rs reads the focused row,
-                    // computes a Drill, and assigns it via `set_drill`.
-                    // For the purposes of ApplyOutcome we still mark refresh:
-                    // the drill view fetches scoped sessions.
                     out.refresh.sessions = true;
                     out.needs_refresh = true;
-                    // Mark dirty=false: drill itself isn't persisted, but we
-                    // want the next refresh cycle to run.
                 }
             }
             Action::PopDrill => {

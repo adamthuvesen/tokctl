@@ -780,7 +780,6 @@ fn run_report_no_cache(group: GroupBy, args: ReportArgs) -> Result<()> {
     let filtered = filter_by_date(&events, since, until);
     let resolved = resolve_repos(&filtered);
 
-    // Resolve --repo against the in-memory resolved set.
     let repo_spec = args.repo.as_deref().map(resolve_repo_filter_in_memory);
 
     let mut unknown: HashSet<String> = HashSet::new();
@@ -978,7 +977,6 @@ fn emit_repo(rows: &[crate::store::queries::RepoAggregateRow], as_json: bool) {
     let _ = writeln!(lock, "{body}");
 }
 
-/// Thin wrapper so the process exits with the right code when Result is an Err.
 pub fn main_exit() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
