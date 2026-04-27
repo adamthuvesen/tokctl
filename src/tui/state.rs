@@ -912,7 +912,8 @@ mod tests {
             .insert(Section::Repos, "tokctl".to_owned());
         save(&p, &s).unwrap();
         let loaded = load(&p);
-        assert_eq!(loaded.current_section, Section::Provider);
+        // current_section is intentionally not restored — TUI always boots on Days.
+        assert_eq!(loaded.current_section, Section::Days);
         assert_eq!(loaded.time_window, TimeWindow::Today);
         assert_eq!(loaded.source_filter, SourceFilter::Claude);
         assert_eq!(loaded.trend_granularity, TrendGranularity::Weekly);
@@ -940,7 +941,9 @@ mod tests {
         )
         .unwrap();
         let loaded = load(&p);
-        assert_eq!(loaded.current_section, Section::Provider);
+        // The legacy "trend" alias must not break deserialization of sibling fields,
+        // even though current_section itself is no longer restored on load.
+        assert_eq!(loaded.current_section, Section::Days);
         assert_eq!(loaded.trend_granularity, TrendGranularity::Daily);
     }
 
