@@ -1,7 +1,10 @@
-use crate::sources::{parse_claude_line, parse_codex_line, CodexCtx, CodexParsed};
+use crate::sources::{
+    parse_claude_line, parse_codex_line, parse_cursor_csv, CodexCtx, CodexParsed,
+};
 use crate::types::UsageEvent;
 use anyhow::Result;
 use memmap2::Mmap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -11,8 +14,6 @@ pub struct RangeResult {
     pub events: Vec<UsageEvent>,
     /// Parsed assistant/usage lines we couldn't use (invalid JSON, etc.)
     pub skipped_lines: usize,
-    /// Message IDs we saw, so the caller can dedupe across tail reads.
-    pub message_ids: Vec<String>,
 }
 
 /// Below this byte count, stick with BufReader — mmap setup overhead dominates
@@ -39,6 +40,7 @@ fn map_file(file_path: &Path) -> Result<Mmap> {
 }
 
 fn process_claude_bytes(bytes: &[u8], project_path: Option<&str>, result: &mut RangeResult) {
+    let mut seen_ids: HashSet<String> = HashSet::new();
     for chunk in bytes.split(|&b| b == b'\n') {
         if chunk.is_empty() {
             continue;
@@ -56,7 +58,9 @@ fn process_claude_bytes(bytes: &[u8], project_path: Option<&str>, result: &mut R
         match parse_claude_line(line, project_path) {
             Some(p) => {
                 if let Some(id) = p.message_id {
-                    result.message_ids.push(id);
+                    if !seen_ids.insert(id) {
+                        continue;
+                    }
                 }
                 result.events.push(p.event);
             }
@@ -120,6 +124,7 @@ pub fn ingest_claude_range(
         f.seek(SeekFrom::Start(from_offset))?;
     }
     let reader = BufReader::new(f.take(len));
+    let mut seen_ids: HashSet<String> = HashSet::new();
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -137,7 +142,9 @@ pub fn ingest_claude_range(
         match parse_claude_line(&line, project_path) {
             Some(p) => {
                 if let Some(id) = p.message_id {
-                    result.message_ids.push(id);
+                    if !seen_ids.insert(id) {
+                        continue;
+                    }
                 }
                 result.events.push(p.event);
             }
@@ -199,6 +206,14 @@ pub fn ingest_codex_range(
     Ok(result)
 }
 
+pub fn ingest_cursor_range(file_path: &Path) -> Result<RangeResult> {
+    let (events, skipped_lines) = parse_cursor_csv(file_path);
+    Ok(RangeResult {
+        events,
+        skipped_lines,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,7 +228,7 @@ mod tests {
         }
         let size = std::fs::metadata(path).unwrap().len();
         let r = ingest_claude_range(path, Some("/Users/dev/tokctl"), 0, size).unwrap();
-        assert_eq!(r.events.len(), 4);
+        assert_eq!(r.events.len(), 3);
         assert_eq!(r.skipped_lines, 0);
     }
 
@@ -247,15 +262,37 @@ mod tests {
     }
 
     #[test]
+    fn claude_range_dedupes_repeated_message_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dup.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        let line = r#"{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"s","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}"#;
+        writeln!(f, "{}", line).unwrap();
+        writeln!(f, "{}", line).unwrap();
+        drop(f);
+
+        let size = std::fs::metadata(&p).unwrap().len();
+        let r = ingest_claude_range(&p, None, 0, size).unwrap();
+        assert_eq!(r.events.len(), 1);
+        let ev = &r.events[0];
+        assert_eq!(ev.input_tokens, 100);
+        assert_eq!(ev.output_tokens, 40);
+        assert_eq!(ev.cache_read_tokens, 500);
+        assert_eq!(ev.cache_write_tokens, 200);
+    }
+
+    #[test]
     fn mmap_path_and_buf_path_agree() {
         // Build a file slightly over the threshold so mmap kicks in, and a
         // copy under it — results must match.
         let dir = tempfile::tempdir().unwrap();
-        let line = r#"{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"s","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
 
         let small_path = dir.path().join("small.jsonl");
         let mut f = std::fs::File::create(&small_path).unwrap();
-        for _ in 0..5 {
+        for i in 0..5 {
+            let line = format!(
+                r#"{{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"s","message":{{"id":"m-{i}","model":"claude-sonnet-4-6","usage":{{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+            );
             writeln!(f, "{}", line).unwrap();
         }
         drop(f);
@@ -263,8 +300,13 @@ mod tests {
         let big_path = dir.path().join("big.jsonl");
         let mut f = std::fs::File::create(&big_path).unwrap();
         let target = MMAP_THRESHOLD + 1000;
+        let mut i = 0usize;
         while f.metadata().unwrap().len() < target {
+            let line = format!(
+                r#"{{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"s","message":{{"id":"m-{i}","model":"claude-sonnet-4-6","usage":{{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+            );
             writeln!(f, "{}", line).unwrap();
+            i += 1;
         }
         drop(f);
 

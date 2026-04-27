@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub enum Source {
     Claude,
     Codex,
+    Cursor,
 }
 
 impl Source {
@@ -14,6 +15,7 @@ impl Source {
         match self {
             Source::Claude => "claude",
             Source::Codex => "codex",
+            Source::Cursor => "cursor",
         }
     }
 }
@@ -30,6 +32,7 @@ impl std::str::FromStr for Source {
         match s {
             "claude" => Ok(Source::Claude),
             "codex" => Ok(Source::Codex),
+            "cursor" => Ok(Source::Cursor),
             other => Err(format!("unknown source: {other}")),
         }
     }
@@ -46,6 +49,7 @@ pub struct UsageEvent {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub explicit_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]

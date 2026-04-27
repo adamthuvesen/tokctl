@@ -195,6 +195,15 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     (
+        "gpt-5.5",
+        PriceEntry {
+            input: 5.0,
+            output: 30.0,
+            cache_read: 0.5,
+            cache_write: 0.0,
+        },
+    ),
+    (
         "o4-mini",
         PriceEntry {
             input: 1.1,
@@ -237,6 +246,12 @@ pub fn has_price(model: &str) -> bool {
 }
 
 pub fn cost_of(event: &UsageEvent, unknown: Option<&mut HashSet<String>>) -> f64 {
+    if let Some(cost) = event.explicit_cost_usd {
+        return cost;
+    }
+    if event.source == crate::types::Source::Cursor {
+        return 0.0;
+    }
     let Some(p) = lookup(&event.model) else {
         if let Some(set) = unknown {
             set.insert(event.model.clone());
@@ -267,6 +282,7 @@ mod tests {
             output_tokens: output,
             cache_read_tokens: cr,
             cache_write_tokens: cw,
+            explicit_cost_usd: None,
         }
     }
 
@@ -306,6 +322,25 @@ mod tests {
     fn has_price_works() {
         assert!(has_price("claude-opus-4-7"));
         assert!(has_price("claude-sonnet-4-6-20250101"));
+        assert!(has_price("gpt-5.5"));
         assert!(!has_price("gpt-99-ultra"));
+    }
+
+    #[test]
+    fn explicit_cost_wins() {
+        let mut e = event("auto", 10, 20, 30, 40);
+        e.explicit_cost_usd = Some(0.19);
+        let mut unknown = HashSet::new();
+        assert_eq!(cost_of(&e, Some(&mut unknown)), 0.19);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn cursor_unknown_models_do_not_warn() {
+        let mut e = event("composer-1", 10, 20, 30, 40);
+        e.source = Source::Cursor;
+        let mut unknown = HashSet::new();
+        assert_eq!(cost_of(&e, Some(&mut unknown)), 0.0);
+        assert!(unknown.is_empty());
     }
 }

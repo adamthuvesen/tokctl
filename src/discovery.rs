@@ -1,6 +1,7 @@
 use crate::types::Source;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -144,13 +145,7 @@ fn walk_with_short_circuit<M: ManifestLike>(
                 safety_threshold_ns,
                 out,
             );
-        } else if ft.is_file()
-            && path
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s == "jsonl")
-                .unwrap_or(false)
-        {
+        } else if ft.is_file() && matches_discovered_file(&path, source) {
             let Ok(fmd) = e.metadata() else { continue };
             out.files.push(DiscoveredFile {
                 path,
@@ -161,6 +156,36 @@ fn walk_with_short_circuit<M: ManifestLike>(
             });
         }
     }
+}
+
+fn matches_discovered_file(path: &Path, source: Source) -> bool {
+    match source {
+        Source::Claude | Source::Codex => path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == "jsonl"),
+        Source::Cursor => is_cursor_usage_csv(path),
+    }
+}
+
+fn is_cursor_usage_csv(path: &Path) -> bool {
+    if !path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("csv"))
+    {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut header = String::new();
+    if reader.read_line(&mut header).is_err() {
+        return false;
+    }
+    let lower = header.to_ascii_lowercase();
+    lower.contains("date") && lower.contains("model")
 }
 
 /// Discover Claude session files at `<root>/<project-slug>/<session>.jsonl`.
@@ -212,6 +237,28 @@ pub fn discover_codex<M: ManifestLike>(
         walk_with_short_circuit(
             root,
             Source::Codex,
+            None,
+            manifest,
+            &index,
+            threshold,
+            &mut out,
+        );
+    }
+    out
+}
+
+pub fn discover_cursor<M: ManifestLike>(
+    roots: &[PathBuf],
+    manifest: &HashMap<PathBuf, M>,
+    opts: DiscoverOpts,
+) -> Discovery {
+    let index = index_manifest_by_parent(manifest);
+    let threshold = opts.safety_threshold_ns();
+    let mut out = Discovery::default();
+    for root in roots {
+        walk_with_short_circuit(
+            root,
+            Source::Cursor,
             None,
             manifest,
             &index,
@@ -292,6 +339,33 @@ mod tests {
         );
         assert_eq!(d.files.len(), 1);
         assert_eq!(d.files[0].source, Source::Codex);
+        assert!(d.files[0].project.is_none());
+    }
+
+    #[test]
+    fn discover_cursor_finds_usage_csv_and_ignores_other_csvs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let deep = root.join("accounts").join("work");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            deep.join("usage.csv"),
+            b"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n",
+        )
+        .unwrap();
+        fs::write(deep.join("other.csv"), b"name,value\nfoo,1\n").unwrap();
+
+        let manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
+        let d = discover_cursor(
+            &[root.to_path_buf()],
+            &manifest,
+            DiscoverOpts {
+                safety_window_ms: 60_000,
+                now_ms: 0,
+            },
+        );
+        assert_eq!(d.files.len(), 1);
+        assert_eq!(d.files[0].source, Source::Cursor);
         assert!(d.files[0].project.is_none());
     }
 }

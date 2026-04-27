@@ -14,9 +14,20 @@ use ratatui::{
 
 use crate::tui::data::{DataCache, LeftRow, SessionRow, TrendRow};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
-use crate::tui::state::{AppState, PaneId};
+use crate::tui::shell::{draw_main_frame, draw_sidebar};
+use crate::tui::state::{AppState, Focus, Section, SourceFilter};
 use crate::tui::theme::Palette;
 use crate::tui::MIN_WIDTH;
+
+const BAR_WIDTH: usize = 20;
+const LEFT_NAME_WIDTH: u16 = 28;
+const SESSION_PROJECT_WIDTH: u16 = 28;
+const TREND_BUCKET_WIDTH: u16 = 20;
+const PROVIDER_COL_WIDTH: u16 = 10;
+const SIDEBAR_WIDTH: u16 = 22;
+const PANEL_BORDER: u16 = 2;
+// 1 top border + 1 top pad + 1 bottom border.
+const PANEL_CHROME_HEIGHT: u16 = 3;
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
     let palette = Palette::default();
@@ -34,33 +45,56 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
         return;
     }
 
+    let (panel_w, panel_h) = main_panel_dimensions(state, cache);
+
+    // Cap to available space; reserve 2 for header + 2 for footer.
+    let body_avail = area.height.saturating_sub(4);
+    let body_height = panel_h.min(body_avail).max(8);
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Min(8),
+            Constraint::Length(body_height),
+            Constraint::Min(0),
             Constraint::Length(2),
         ])
         .split(area);
 
     draw_header(frame, outer[0], state, cache, &palette);
 
-    if state.trend_open {
-        draw_trend_overlay(frame, outer[1], state, cache, &palette);
-    } else {
-        draw_panes(frame, outer[1], state, cache, &palette);
-    }
+    // Sidebar fixed; main hugs content; remainder is empty filler.
+    let main_avail = area.width.saturating_sub(SIDEBAR_WIDTH);
+    let main_width = panel_w.min(main_avail);
 
-    draw_footer(frame, outer[2], state, cache, &palette);
+    let body_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(SIDEBAR_WIDTH),
+            Constraint::Length(main_width),
+            Constraint::Min(0),
+        ])
+        .split(outer[1]);
+
+    draw_sidebar(frame, body_cols[0], state, &palette);
+    draw_main(frame, body_cols[1], state, cache, &palette);
+
+    draw_footer(frame, outer[3], state, cache, &palette);
 
     if state.help_open {
         draw_help(frame, area, &palette);
+    }
+
+    if state.detail_open {
+        draw_detail(frame, area, state, cache, &palette);
     }
 
     if state.filter.active {
         draw_filter_prompt(frame, area, state, &palette);
     }
 }
+
+// -- Header / context -------------------------------------------------------
 
 fn draw_header(
     frame: &mut Frame<'_>,
@@ -70,12 +104,10 @@ fn draw_header(
     palette: &Palette,
 ) {
     let clock = Local::now().format("%Y-%m-%d %H:%M").to_string();
-    let total_cost: f64 = cache.left.iter().map(|r| r.cost).sum();
-    let total_tokens: u64 = cache.sessions.iter().map(|r| r.total_tokens).sum();
-
-    let window = state.time_window.as_str();
-    let source = state.source_filter.as_str();
-    let axis = state.left_axis.chip();
+    let total_cost: f64 = cache.left.iter().map(|r| r.cost).sum::<f64>()
+        + cache.trend.iter().map(|r| r.total_cost).sum::<f64>();
+    let total_tokens: u64 = cache.sessions.iter().map(|r| r.total_tokens).sum::<u64>()
+        + cache.trend.iter().map(|r| r.total_tokens).sum::<u64>();
 
     let line1 = Line::from(vec![
         Span::styled("tokctl ", Style::default().add_modifier(Modifier::BOLD)),
@@ -84,7 +116,7 @@ fn draw_header(
         Span::styled(
             format!(
                 "last {} · {} · {} tok",
-                window,
+                state.time_window.as_str(),
                 fmt_cost(total_cost),
                 fmt_num(total_tokens),
             ),
@@ -93,78 +125,264 @@ fn draw_header(
         Span::raw("  "),
         Span::styled("[?]", palette.accent_text()),
     ]);
-    let line2 = Line::from(vec![
-        Span::styled(format!("axis:{axis} "), palette.dim_text()),
-        Span::styled(format!("source:{source} "), palette.dim_text()),
-    ]);
-    let p = Paragraph::new(vec![line1, line2]);
-    frame.render_widget(p, area);
+    let line2 = Line::from(Span::styled(
+        context_text(state, area.width.saturating_sub(1) as usize),
+        palette.dim_text(),
+    ));
+    frame.render_widget(Paragraph::new(vec![line1, line2]), area);
 }
 
-fn draw_panes(
+fn context_text(state: &AppState, width: usize) -> String {
+    let tab = match state.active_tab_label() {
+        Some(label) => format!(" · tab:{}", label.to_ascii_lowercase()),
+        None => String::new(),
+    };
+    let filter = if state.filter.query.is_empty() {
+        String::new()
+    } else {
+        format!(" · filter:{}", state.filter.query)
+    };
+    truncate_chars(
+        &format!(
+            "section:{}{tab} · window:{} · source:{} · sort:{}{filter}",
+            state.current_section.as_str(),
+            state.time_window.as_str(),
+            state.source_filter.as_str(),
+            state.sort.as_str(),
+        ),
+        width,
+    )
+}
+
+fn truncate_chars(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".into();
+    }
+    let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+// -- Main panel sizing ------------------------------------------------------
+
+/// Returns the (width, height) the main bordered panel "wants" given the
+/// currently active section and the data in the cache. The caller clamps
+/// these to the available terminal size.
+fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16, u16) {
+    let bar_w = BAR_WIDTH as u16 + 2;
+
+    // Drilled view always renders the sessions table with a 1-row breadcrumb.
+    if state.drill.is_some() {
+        let cells = [12, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
+        let rows = cache.sessions.len() as u16;
+        return chrome((table_width(&cells), 1 + 1 + rows.max(1)));
+    }
+
+    let tab = state.active_tab_index() as usize;
+    let (cols, content_h) = match state.current_section {
+        Section::Repos if tab == 0 => left_panel_size(state, cache),
+        Section::Days | Section::Models => left_panel_size(state, cache),
+        Section::Sessions => {
+            let cells = [12u16, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
+            let rows = cache.left.len() as u16;
+            (table_width(&cells), 1 + rows.max(1))
+        }
+        Section::Repos | Section::Provider => {
+            let n = active_provider_count(state, cache) as usize;
+            let mut cells: Vec<u16> = vec![TREND_BUCKET_WIDTH];
+            cells.extend(std::iter::repeat(PROVIDER_COL_WIDTH).take(n));
+            cells.extend([8u16, 10, bar_w]);
+            let rows = cache.trend.len() as u16;
+            // header + rows + separator + TOTAL
+            (table_width(&cells), 1 + rows.max(1) + 2)
+        }
+    };
+
+    chrome((cols, content_h))
+}
+
+fn left_panel_size(state: &AppState, cache: &DataCache) -> (u16, u16) {
+    let bar_w = BAR_WIDTH as u16 + 2;
+    let rows = cache.left.len() as u16;
+    let cells: &[u16] = if state.expanded {
+        &[LEFT_NAME_WIDTH, 5, 8, 10, bar_w]
+    } else {
+        &[LEFT_NAME_WIDTH, 8, 10, bar_w]
+    };
+    (table_width(cells), 1 + rows.max(1))
+}
+
+/// Sum of fixed column widths plus 1 col of spacing between each pair
+/// (matches ratatui's default `Table::column_spacing(1)`).
+fn table_width(cells: &[u16]) -> u16 {
+    let sum: u16 = cells.iter().copied().sum();
+    let gaps = cells.len().saturating_sub(1) as u16;
+    sum + gaps
+}
+
+fn chrome((w, h): (u16, u16)) -> (u16, u16) {
+    (w + PANEL_BORDER, h + PANEL_CHROME_HEIGHT)
+}
+
+fn active_provider_count(state: &AppState, cache: &DataCache) -> u16 {
+    let rows = &cache.trend;
+    let show_claude = rows.iter().any(|r| r.claude_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Codex | SourceFilter::Cursor
+        );
+    let show_codex = rows.iter().any(|r| r.codex_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Cursor
+        );
+    let show_cursor = rows.iter().any(|r| r.cursor_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Codex
+        );
+    show_claude as u16 + show_codex as u16 + show_cursor as u16
+}
+
+// -- Main pane dispatch -----------------------------------------------------
+
+fn draw_main(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
     cache: &DataCache,
     palette: &Palette,
 ) {
-    let ws = state.pane_widths;
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(ws[0]), Constraint::Percentage(ws[1])])
-        .split(area);
+    let focused = state.focus == Focus::Main;
 
-    let (left_rows, _scores_l) = apply_filter_left(&cache.left, state, PaneId::Left);
-    draw_left_pane(frame, cols[0], state, &left_rows, palette);
+    // Drilled view supersedes the section's normal renderer.
+    if let Some(drill) = &state.drill {
+        let inner = draw_main_frame(
+            frame,
+            area,
+            &format!("{} › {}", section_title(drill.section), drill.label),
+            &[],
+            0,
+            focused,
+            palette,
+        );
+        draw_drill(frame, pad_top(inner, 1), state, cache, palette);
+        return;
+    }
 
-    let (sess_rows, _scores_s) = apply_filter_sessions(&cache.sessions, state);
-    draw_sessions_pane(frame, cols[1], state, &sess_rows, palette);
+    let title = main_pane_title(state);
+    let tabs = state.current_section.tabs();
+    let active_tab = state.active_tab_index() as usize;
+    let inner = draw_main_frame(frame, area, &title, tabs, active_tab, focused, palette);
+    let padded = pad_top(inner, 1);
+
+    match state.current_section {
+        Section::Repos => match active_tab {
+            0 => draw_left_table(frame, padded, state, cache, palette),
+            _ => draw_trend_table(frame, padded, state, cache, palette),
+        },
+        Section::Days | Section::Models | Section::Sessions => {
+            draw_left_table(frame, padded, state, cache, palette);
+        }
+        Section::Provider => {
+            draw_trend_table(frame, padded, state, cache, palette);
+        }
+    }
 }
 
-fn pane_block<'a>(title: &'a str, active: bool, palette: &Palette) -> Block<'a> {
-    let border = if active {
-        palette.active_border()
-    } else {
-        palette.inactive_border()
-    };
-    let chip = if active {
-        format!("[ {title} ]")
-    } else {
-        format!(" {title} ")
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border)
-        .title(Span::styled(
-            chip,
-            if active {
-                palette.active_border()
-            } else {
-                palette.dim_text()
-            },
-        ))
+/// Inset the top of a rect by `n` rows for breathing space.
+fn pad_top(area: Rect, n: u16) -> Rect {
+    if area.height <= n {
+        return area;
+    }
+    Rect {
+        x: area.x,
+        y: area.y + n,
+        width: area.width,
+        height: area.height - n,
+    }
 }
 
-fn draw_left_pane(
+fn section_title(section: Section) -> String {
+    match section {
+        Section::Repos => "REPOS".into(),
+        Section::Days => "DAYS".into(),
+        Section::Models => "MODELS".into(),
+        Section::Sessions => "SESSIONS".into(),
+        Section::Provider => "PROVIDER".into(),
+    }
+}
+
+/// Title for the main pane border. For the Days section the title reflects
+/// the active granularity (DAYS / WEEKS / MONTHS / YEARS).
+fn main_pane_title(state: &AppState) -> String {
+    if state.current_section == Section::Days {
+        match state.trend_granularity {
+            crate::tui::state::TrendGranularity::Daily => "DAYS".into(),
+            crate::tui::state::TrendGranularity::Weekly => "WEEKS".into(),
+            crate::tui::state::TrendGranularity::Monthly => "MONTHS".into(),
+            crate::tui::state::TrendGranularity::Yearly => "YEARS".into(),
+        }
+    } else {
+        section_title(state.current_section)
+    }
+}
+
+// -- Drill renderer ---------------------------------------------------------
+
+fn draw_drill(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    rows: &[LeftRow],
+    cache: &DataCache,
     palette: &Palette,
 ) {
-    let active = state.focus == PaneId::Left;
-    let block = pane_block(state.left_axis.title(), active, palette);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    if area.height < 2 {
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
 
+    // Breadcrumb hint row.
+    let drill = state.drill.as_ref().unwrap();
+    let breadcrumb = Line::from(vec![
+        Span::styled(section_title(drill.section), palette.dim_text()),
+        Span::styled(" › ", palette.dim_text()),
+        Span::styled(
+            drill.label.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("[esc/← back]", palette.dim_text()),
+    ]);
+    frame.render_widget(Paragraph::new(breadcrumb), rows[0]);
+
+    draw_sessions_table(frame, rows[1], state, &cache.sessions, palette);
+}
+
+// -- Section: left-row table (Days, Models, Sessions, Repos Costs tab) ------------
+
+fn draw_left_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    cache: &DataCache,
+    palette: &Palette,
+) {
+    let (rows, _) = apply_filter_left(&cache.left, state);
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no rows in this window",
                 palette.dim_text(),
             ))),
-            inner,
+            area,
         );
         return;
     }
@@ -176,7 +394,43 @@ fn draw_left_pane(
         .fold(0f64, f64::max)
         .max(0.0001);
 
-    let selected = state.left_index.min(rows.len().saturating_sub(1));
+    let selected = state.current_index().min(rows.len().saturating_sub(1));
+    let active = state.focus == Focus::Main;
+
+    // For Sessions section we render a different (richer) layout.
+    if state.current_section == Section::Sessions {
+        // Reuse the sessions-row table by adapting LeftRow → SessionRow-ish.
+        let sess_rows: Vec<SessionRow> = rows
+            .iter()
+            .map(|r| SessionRow {
+                session_id: r.key.clone(),
+                source: crate::types::Source::Claude,
+                latest_ts: Utc::now(),
+                project: Some(r.label.clone()),
+                cost: r.cost,
+                total_tokens: r.total_tokens,
+            })
+            .collect();
+        draw_sessions_table(frame, area, state, &sess_rows, palette);
+        return;
+    }
+
+    if state.expanded {
+        draw_left_expanded(frame, area, selected, active, &rows, max_cost, palette);
+    } else {
+        draw_left_compact(frame, area, selected, active, &rows, max_cost, palette);
+    }
+}
+
+fn draw_left_compact(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    selected: usize,
+    active: bool,
+    rows: &[LeftRow],
+    max_cost: f64,
+    palette: &Palette,
+) {
     let table_rows: Vec<Row> = rows
         .iter()
         .enumerate()
@@ -189,11 +443,21 @@ fn draw_left_pane(
             } else {
                 Style::default().fg(palette.cost_color(r.cost / max_cost))
             };
+            let label_cell = label_cell(r.label.clone(), is_selected, palette);
+            let bar_cell = if r.is_no_repo {
+                Cell::from("")
+            } else {
+                Cell::from(render_bar(
+                    (r.cost / max_cost).clamp(0.0, 1.0),
+                    BAR_WIDTH,
+                    palette,
+                ))
+            };
             let mut row = Row::new(vec![
-                Cell::from(r.label.clone()),
-                Cell::from(fmt_num(r.sessions)),
-                Cell::from(fmt_tokens_short(r.total_tokens)),
-                Cell::from(fmt_cost(r.cost)).style(cost_style),
+                label_cell,
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -205,45 +469,130 @@ fn draw_left_pane(
     let table = Table::new(
         table_rows,
         [
-            Constraint::Percentage(60),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(9),
+            Constraint::Length(LEFT_NAME_WIDTH),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
         ],
     )
-    .header(Row::new(vec!["name", "sess", "tok", "cost"]).style(palette.dim_text()));
+    .header(
+        Row::new(vec!["name", "     tok", "      cost", "proportion"]).style(palette.dim_text()),
+    );
 
     frame.render_widget(table, inner);
 }
 
-fn draw_sessions_pane(
+fn draw_left_expanded(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    selected: usize,
+    active: bool,
+    rows: &[LeftRow],
+    max_cost: f64,
+    palette: &Palette,
+) {
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let is_selected = i == selected && active;
+            let cost_style = if is_selected {
+                palette.selected_row()
+            } else if r.is_no_repo {
+                palette.warn_text()
+            } else {
+                Style::default().fg(palette.cost_color(r.cost / max_cost))
+            };
+            let label_cell = label_cell(r.label.clone(), is_selected, palette);
+            let bar_cell = if r.is_no_repo {
+                Cell::from("")
+            } else {
+                Cell::from(render_bar(
+                    (r.cost / max_cost).clamp(0.0, 1.0),
+                    BAR_WIDTH,
+                    palette,
+                ))
+            };
+            let mut row = Row::new(vec![
+                label_cell,
+                Cell::from(format!("{:>5}", fmt_num(r.sessions))),
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
+            ]);
+            if is_selected {
+                row = row.style(palette.selected_row());
+            }
+            row
+        })
+        .collect();
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(LEFT_NAME_WIDTH),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "name",
+            " sess",
+            "     tok",
+            "      cost",
+            "proportion",
+        ])
+        .style(palette.dim_text()),
+    );
+
+    frame.render_widget(table, inner);
+}
+
+fn label_cell(label: String, is_selected: bool, palette: &Palette) -> Cell<'static> {
+    if is_selected {
+        Cell::from(Line::from(vec![
+            Span::styled("▌ ", palette.accent_text()),
+            Span::raw(label),
+        ]))
+    } else {
+        Cell::from(label)
+    }
+}
+
+// -- Sessions table ---------------------------------------------------------
+
+fn draw_sessions_table(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
     rows: &[SessionRow],
     palette: &Palette,
 ) {
-    let active = state.focus == PaneId::Sessions;
-    let block = pane_block("SESSIONS", active, palette);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no sessions in this scope",
                 palette.dim_text(),
             ))),
-            inner,
+            area,
         );
         return;
     }
 
-    let max_cost = rows.iter().map(|r| r.cost).fold(0f64, f64::max).max(0.0001);
+    let (filtered, _) = apply_filter_sessions(rows, state);
+    let max_cost = filtered
+        .iter()
+        .map(|r| r.cost)
+        .fold(0f64, f64::max)
+        .max(0.0001);
     let now = Utc::now();
-    let selected = state.sessions_index.min(rows.len().saturating_sub(1));
+    let selected = state.current_index().min(filtered.len().saturating_sub(1));
+    let active = state.focus == Focus::Main;
 
-    let table_rows: Vec<Row> = rows
+    let table_rows: Vec<Row> = filtered
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -258,16 +607,30 @@ fn draw_sessions_pane(
             } else {
                 Style::default().fg(palette.cost_color(r.cost / max_cost))
             };
+            let proj_label = r
+                .project
+                .clone()
+                .unwrap_or_else(|| r.session_id.chars().take(8).collect());
+            let proj_cell = if is_selected {
+                Cell::from(Line::from(vec![
+                    Span::styled("▌ ", palette.accent_text()),
+                    Span::raw(proj_label),
+                ]))
+            } else {
+                Cell::from(proj_label)
+            };
+            let bar_cell = Cell::from(render_bar(
+                (r.cost / max_cost).clamp(0.0, 1.0),
+                BAR_WIDTH,
+                palette,
+            ));
             let mut row = Row::new(vec![
                 Cell::from(relative_time(r.latest_ts, now)),
                 Cell::from(r.source.as_str().to_owned()).style(src_style),
-                Cell::from(
-                    r.project
-                        .clone()
-                        .unwrap_or_else(|| r.session_id.chars().take(8).collect()),
-                ),
-                Cell::from(fmt_tokens_short(r.total_tokens)),
-                Cell::from(fmt_cost(r.cost)).style(cost_style),
+                proj_cell,
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -281,15 +644,224 @@ fn draw_sessions_pane(
         [
             Constraint::Length(12),
             Constraint::Length(6),
-            Constraint::Percentage(40),
-            Constraint::Length(7),
-            Constraint::Length(9),
+            Constraint::Length(SESSION_PROJECT_WIDTH),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
         ],
     )
-    .header(Row::new(vec!["when", "src", "project", "tok", "cost"]).style(palette.dim_text()));
+    .header(
+        Row::new(vec![
+            "when",
+            "src",
+            "project",
+            "     tok",
+            "      cost",
+            "proportion",
+        ])
+        .style(palette.dim_text()),
+    );
 
-    frame.render_widget(table, inner);
+    frame.render_widget(table, area);
 }
+
+// -- Trend table ------------------------------------------------------------
+
+fn draw_trend_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    cache: &DataCache,
+    palette: &Palette,
+) {
+    let rows = &cache.trend;
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no data for this window",
+                palette.dim_text(),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let max_total: f64 = rows
+        .iter()
+        .map(|r| r.total_cost)
+        .fold(0f64, f64::max)
+        .max(0.0001);
+
+    let show_claude = rows.iter().any(|r| r.claude_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Codex | SourceFilter::Cursor
+        );
+    let show_codex = rows.iter().any(|r| r.codex_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Cursor
+        );
+    let show_cursor = rows.iter().any(|r| r.cursor_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Codex
+        );
+
+    let mut header_cells = vec![Cell::from(state.trend_granularity.bucket_header())];
+    if show_claude {
+        header_cells.push(Cell::from("claude"));
+    }
+    if show_codex {
+        header_cells.push(Cell::from("codex"));
+    }
+    if show_cursor {
+        header_cells.push(Cell::from("cursor"));
+    }
+    header_cells.push(Cell::from("tokens"));
+    header_cells.push(Cell::from("total"));
+    header_cells.push(Cell::from("proportion"));
+    let header = Row::new(header_cells).style(palette.dim_text());
+
+    let mut body: Vec<Row> = rows
+        .iter()
+        .map(|r| trend_row(r, max_total, show_claude, show_codex, show_cursor, palette))
+        .collect();
+
+    let (cc_sum, xc_sum, uc_sum, tok_sum, tot_sum): (f64, f64, f64, u64, f64) =
+        rows.iter().fold((0.0, 0.0, 0.0, 0u64, 0.0), |acc, r| {
+            (
+                acc.0 + r.claude_cost,
+                acc.1 + r.codex_cost,
+                acc.2 + r.cursor_cost,
+                acc.3 + r.total_tokens,
+                acc.4 + r.total_cost,
+            )
+        });
+
+    let sep_cells_count = 3 + show_claude as usize + show_codex as usize + show_cursor as usize;
+    let rule = "─".repeat(area.width.saturating_sub(2) as usize);
+    let mut sep_cells = vec![Cell::from(rule).style(palette.dim_text())];
+    for _ in 1..sep_cells_count {
+        sep_cells.push(Cell::from(""));
+    }
+    body.push(Row::new(sep_cells));
+
+    let mut total_cells =
+        vec![Cell::from("TOTAL").style(Style::default().add_modifier(Modifier::BOLD))];
+    if show_claude {
+        total_cells.push(Cell::from(fmt_cost(cc_sum)).style(palette.accent_text()));
+    }
+    if show_codex {
+        total_cells.push(Cell::from(fmt_cost(xc_sum)).style(palette.warn_text()));
+    }
+    if show_cursor {
+        total_cells.push(Cell::from(fmt_cost(uc_sum)).style(palette.info_text()));
+    }
+    total_cells
+        .push(Cell::from(format!("{:>8}", fmt_tokens_short(tok_sum))).style(palette.dim_text()));
+    total_cells.push(
+        Cell::from(format!("{:>10}", fmt_cost(tot_sum)))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    );
+    total_cells.push(Cell::from(""));
+    body.push(Row::new(total_cells));
+
+    let mut constraints = vec![Constraint::Length(20)];
+    if show_claude {
+        constraints.push(Constraint::Length(10));
+    }
+    if show_codex {
+        constraints.push(Constraint::Length(10));
+    }
+    if show_cursor {
+        constraints.push(Constraint::Length(10));
+    }
+    constraints.push(Constraint::Length(8));
+    constraints.push(Constraint::Length(10));
+    constraints.push(Constraint::Min(BAR_WIDTH as u16 + 2));
+
+    let table = Table::new(body, constraints).header(header);
+    frame.render_widget(table, area);
+}
+
+fn trend_row<'a>(
+    r: &'a TrendRow,
+    max_total: f64,
+    show_claude: bool,
+    show_codex: bool,
+    show_cursor: bool,
+    palette: &Palette,
+) -> Row<'a> {
+    let ratio = (r.total_cost / max_total).clamp(0.0, 1.0);
+    let bar = render_bar(ratio, BAR_WIDTH, palette);
+
+    let bucket_label = if r.is_current {
+        format!("▸{} (so far)", r.bucket)
+    } else {
+        format!("  {}", r.bucket)
+    };
+    let total_color = palette.cost_color(ratio);
+
+    let mut cells = vec![Cell::from(bucket_label)];
+
+    if show_claude {
+        cells.push(cost_cell_or_dash(
+            r.claude_cost,
+            palette.accent_text(),
+            palette.dim_text(),
+        ));
+    }
+    if show_codex {
+        cells.push(cost_cell_or_dash(
+            r.codex_cost,
+            palette.warn_text(),
+            palette.dim_text(),
+        ));
+    }
+    if show_cursor {
+        cells.push(cost_cell_or_dash(
+            r.cursor_cost,
+            palette.info_text(),
+            palette.dim_text(),
+        ));
+    }
+
+    cells.push(
+        Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))).style(palette.dim_text()),
+    );
+    cells.push(
+        Cell::from(format!("{:>10}", fmt_cost(r.total_cost)))
+            .style(Style::default().fg(total_color)),
+    );
+    cells.push(Cell::from(bar));
+
+    Row::new(cells)
+}
+
+fn cost_cell_or_dash(cost: f64, value_style: Style, dim_style: Style) -> Cell<'static> {
+    if cost < 0.001 {
+        Cell::from("—").style(dim_style)
+    } else {
+        Cell::from(format!("{:>10}", fmt_cost(cost))).style(value_style)
+    }
+}
+
+fn render_bar(ratio: f64, width: usize, palette: &Palette) -> Line<'static> {
+    let filled = (ratio * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    let mut spans = Vec::new();
+    if filled > 0 {
+        spans.push(Span::styled("█".repeat(filled), palette.bar_filled_style()));
+    }
+    if empty > 0 {
+        spans.push(Span::styled("░".repeat(empty), palette.bar_empty_style()));
+    }
+    Line::from(spans)
+}
+
+// -- Footer / sparkline -----------------------------------------------------
 
 fn draw_footer(
     frame: &mut Frame<'_>,
@@ -324,53 +896,217 @@ fn draw_footer(
         frame.render_widget(spark, rows[0]);
     }
 
-    let legend = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" window:{} ", state.time_window.as_str()),
             palette.accent_text(),
         ),
+        Span::raw(" "),
         Span::styled(
             format!(" source:{} ", state.source_filter.as_str()),
             palette.dim_text(),
         ),
         Span::raw("  "),
-        Span::styled(
-            "j/k move  ↵ drill  h/l pane  / filter  Tab axis  t trend  T/w/m/y/a window  s sort  q quit",
-            palette.dim_text(),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(legend), rows[1]);
+    ];
+
+    if let Some(flash) = &state.flash {
+        spans.push(Span::styled(format!("{flash}  "), palette.accent_text()));
+    }
+
+    spans.push(Span::styled("│  ", palette.dim_text()));
+
+    // Three semantic groups, separated by `│`. No brackets around keys.
+    let nav: &[(&str, &str)] = &[("j/k", "move"), ("[/]", "section")];
+    let mut view_group: Vec<(&str, &str)> = Vec::new();
+    if !state.current_section.tabs().is_empty() {
+        view_group.push(("tab", "tabs"));
+    }
+    if matches!(state.current_section, Section::Provider | Section::Days) {
+        view_group.push(("d/w/m/y", "bucket"));
+    }
+    if state.current_section.supports_drill() {
+        view_group.push(("↵", "drill"));
+    }
+    view_group.push(("/", "filter"));
+    let system: &[(&str, &str)] = &[("?", "help"), ("q", "quit")];
+
+    push_hint_group(&mut spans, nav, palette);
+    spans.push(Span::styled("  │  ", palette.dim_text()));
+    push_hint_group(&mut spans, &view_group, palette);
+    spans.push(Span::styled("  │  ", palette.dim_text()));
+    push_hint_group(&mut spans, system, palette);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
 }
+
+fn push_hint_group(spans: &mut Vec<Span<'static>>, hints: &[(&str, &str)], palette: &Palette) {
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        spans.push(Span::styled((*key).to_owned(), palette.accent_text()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled((*desc).to_owned(), palette.dim_text()));
+        if i + 1 < hints.len() {
+            spans.push(Span::styled("  •  ", palette.dim_text()));
+        }
+    }
+}
+
+// -- Help / detail / filter overlays ----------------------------------------
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(palette.accent_border())
+        .border_style(palette.active_border())
         .title(Span::styled(" HELP ", palette.active_border()));
-    let help_area = centered(area, 70, 20);
+    let help_area = centered(area, 72, 28);
     frame.render_widget(Clear, help_area);
     let inner = block.inner(help_area);
     frame.render_widget(block, help_area);
-    let lines = vec![
-        Line::from("  h/l  ←/→          move focus between panes"),
-        Line::from("  j/k  ↓/↑          move selection"),
-        Line::from("  g g / G            top / bottom"),
-        Line::from("  Ctrl-d / Ctrl-u    half page down / up"),
-        Line::from("  Enter              drill right"),
-        Line::from("  Esc / Backspace    cancel / pop"),
-        Line::from("  /                  fuzzy filter"),
-        Line::from("  Tab                cycle left-pane axis"),
-        Line::from("  s                  cycle sort"),
-        Line::from("  t                  trend overlay (d/w/m/y inside)"),
-        Line::from("  T w m y a          window: today / week / month / year / all"),
-        Line::from("  1 2 3              source: all / claude / codex"),
-        Line::from("  r                  refresh (no ingest)"),
-        Line::from("  y                  yank key to clipboard"),
-        Line::from("  ?                  toggle this help"),
-        Line::from("  q / Ctrl-c         quit"),
+
+    let section = |title: &'static str| -> Line<'static> {
+        Line::from(Span::styled(
+            title.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    };
+    let blank = Line::from("");
+    let hint = |key: &'static str, desc: &'static str| -> Line<'static> {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<10}", key), palette.accent_text()),
+            Span::styled("  ", palette.dim_text()),
+            Span::styled(desc, palette.dim_text()),
+        ])
+    };
+
+    let lines: Vec<Line> = vec![
+        section("Navigation"),
+        hint("j/k  ↓/↑", "move within focused area"),
+        hint("[ / ]", "previous / next section"),
+        hint("h  ←", "pop drill, then focus sidebar"),
+        hint("l  →", "focus main"),
+        hint("Enter", "drill (sidebar→main; main→push drill)"),
+        hint("Esc / ←", "cancel filter, close overlay, pop drill"),
+        hint("gg / G", "top / bottom"),
+        hint("Ctrl-d/u", "half page down / up"),
+        blank.clone(),
+        section("View"),
+        hint("Tab", "cycle main-pane tabs"),
+        hint("t", "jump to Provider section"),
+        hint("d/w/m/y", "bucket granularity (Provider / Days)"),
+        hint("e", "compact / expanded"),
+        hint("s", "cycle sort"),
+        hint("/", "fuzzy filter"),
+        hint("T W M z a", "window: today/week/month/year/all"),
+        hint("1 2 3 4", "source: all/claude/codex/cursor"),
+        hint("i", "row details"),
+        hint("r", "refresh (no ingest)"),
+        blank.clone(),
+        section("Copy / Export"),
+        hint("y", "yank row key"),
+        hint("Y", "yank row summary"),
+        blank.clone(),
+        hint("?", "toggle this help"),
+        hint("q / Ctrl-c", "quit"),
     ];
+
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    cache: &DataCache,
+    palette: &Palette,
+) {
+    let detail_area = centered(area, 76, 14);
+    frame.render_widget(Clear, detail_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(palette.active_border())
+        .title(Span::styled(
+            " DETAILS · esc/i to close ",
+            palette.active_border(),
+        ));
+    let inner = block.inner(detail_area);
+    frame.render_widget(block, detail_area);
+    let lines = detail_lines(state, cache)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
+    if state.drill.is_some() {
+        return cache
+            .sessions
+            .get(
+                state
+                    .drill_index
+                    .min(cache.sessions.len().saturating_sub(1)),
+            )
+            .map(|row| {
+                vec![
+                    format!("session: {}", row.session_id),
+                    format!("source: {}", row.source.as_str()),
+                    format!(
+                        "project: {}",
+                        row.project.clone().unwrap_or_else(|| "(unknown)".into())
+                    ),
+                    format!(
+                        "latest: {}",
+                        row.latest_ts
+                            .with_timezone(&Local)
+                            .format("%Y-%m-%d %H:%M:%S")
+                    ),
+                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!("cost: {}", fmt_cost(row.cost)),
+                    "copy: y key, Y summary".into(),
+                ]
+            })
+            .unwrap_or_else(|| vec!["no session selected".into()]);
+    }
+    match state.current_section {
+        Section::Provider => cache
+            .trend
+            .get(
+                state
+                    .current_index()
+                    .min(cache.trend.len().saturating_sub(1)),
+            )
+            .map(|row| {
+                vec![
+                    format!("bucket: {}", row.bucket),
+                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!("total: {}", fmt_cost(row.total_cost)),
+                    format!("claude: {}", fmt_cost(row.claude_cost)),
+                    format!("codex: {}", fmt_cost(row.codex_cost)),
+                    format!("cursor: {}", fmt_cost(row.cursor_cost)),
+                ]
+            })
+            .unwrap_or_else(|| vec!["no row selected".into()]),
+        _ => cache
+            .left
+            .get(
+                state
+                    .current_index()
+                    .min(cache.left.len().saturating_sub(1)),
+            )
+            .map(|row| {
+                vec![
+                    format!("name: {}", row.label),
+                    format!("key: {}", row.key),
+                    format!("sessions: {}", fmt_num(row.sessions)),
+                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!("cost: {}", fmt_cost(row.cost)),
+                    "copy: y key, Y summary".into(),
+                ]
+            })
+            .unwrap_or_else(|| vec!["no row selected".into()]),
+    }
 }
 
 fn draw_filter_prompt(frame: &mut Frame<'_>, area: Rect, state: &AppState, palette: &Palette) {
@@ -389,12 +1125,6 @@ fn draw_filter_prompt(frame: &mut Frame<'_>, area: Rect, state: &AppState, palet
     frame.render_widget(Paragraph::new(line), row);
 }
 
-impl Palette {
-    fn accent_border(&self) -> Style {
-        self.active_border()
-    }
-}
-
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
     let h = height.min(area.height.saturating_sub(2));
@@ -406,179 +1136,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn draw_trend_overlay(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &AppState,
-    cache: &DataCache,
-    palette: &Palette,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(palette.active_border())
-        .title(Span::styled(
-            format!(
-                " TREND · {} · source:{} · [t/esc to close] ",
-                state.trend_granularity.as_str(),
-                state.source_filter.as_str()
-            ),
-            palette.active_border(),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+// -- Filtering --------------------------------------------------------------
 
-    let rows = &cache.trend;
-    if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no data for this window",
-                palette.dim_text(),
-            ))),
-            inner,
-        );
-        return;
-    }
-
-    let max_total: f64 = rows
-        .iter()
-        .map(|r| r.total_cost)
-        .fold(0f64, f64::max)
-        .max(0.0001);
-    let bar_cols: usize = (inner.width as usize).saturating_sub(60).clamp(6, 24);
-
-    let header = Row::new(vec![
-        state.trend_granularity.bucket_header(),
-        "claude",
-        "codex",
-        "tokens",
-        "total",
-        "proportion",
-    ])
-    .style(palette.dim_text());
-
-    let mut body: Vec<Row> = rows
-        .iter()
-        .map(|r| trend_row(r, max_total, bar_cols, state, palette))
-        .collect();
-
-    // Separator + TOTAL row.
-    let (cc_sum, xc_sum, tok_sum, tot_sum): (f64, f64, u64, f64) =
-        rows.iter().fold((0.0, 0.0, 0u64, 0.0), |acc, r| {
-            (
-                acc.0 + r.claude_cost,
-                acc.1 + r.codex_cost,
-                acc.2 + r.total_tokens,
-                acc.3 + r.total_cost,
-            )
-        });
-    let rule = "─".repeat(inner.width.saturating_sub(2) as usize);
-    body.push(Row::new(vec![
-        Cell::from(rule.clone()).style(palette.dim_text()),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-    ]));
-    let claude_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Codex) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(cc_sum)).style(palette.accent_text())
-    };
-    let codex_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Claude) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(xc_sum)).style(palette.warn_text())
-    };
-    body.push(Row::new(vec![
-        Cell::from("TOTAL").style(Style::default().add_modifier(Modifier::BOLD)),
-        claude_cell,
-        codex_cell,
-        Cell::from(fmt_num(tok_sum)).style(palette.dim_text()),
-        Cell::from(fmt_cost(tot_sum)).style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from(""),
-    ]));
-
-    let table = Table::new(
-        body,
-        [
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Min(bar_cols as u16),
-        ],
-    )
-    .header(header);
-    frame.render_widget(table, inner);
-}
-
-fn trend_row<'a>(
-    r: &'a TrendRow,
-    max_total: f64,
-    bar_cols: usize,
-    state: &AppState,
-    palette: &Palette,
-) -> Row<'a> {
-    let ratio = (r.total_cost / max_total).clamp(0.0, 1.0);
-    let bar = proportional_bar(ratio, bar_cols);
-    let bucket_label = if r.is_current {
-        format!("▸{} (so far)", r.bucket)
-    } else {
-        format!("  {}", r.bucket)
-    };
-    let total_color = palette.cost_color(ratio);
-
-    let claude_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Codex) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(r.claude_cost)).style(palette.accent_text())
-    };
-    let codex_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Claude) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(r.codex_cost)).style(palette.warn_text())
-    };
-
-    Row::new(vec![
-        Cell::from(bucket_label),
-        claude_cell,
-        codex_cell,
-        Cell::from(fmt_tokens_short(r.total_tokens)).style(palette.dim_text()),
-        Cell::from(fmt_cost(r.total_cost)).style(Style::default().fg(total_color)),
-        Cell::from(bar),
-    ])
-}
-
-fn proportional_bar(ratio: f64, width: usize) -> String {
-    // ▁▂▃▄▅▆▇█
-    let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let filled = (ratio * width as f64).round() as usize;
-    let filled = filled.min(width);
-    let mut s = String::with_capacity(width);
-    for i in 0..width {
-        if i < filled {
-            // Scale the block's height to ratio for the final cell, keep full elsewhere.
-            let idx = if i + 1 == filled {
-                let frac = (ratio * width as f64) - filled as f64 + 1.0;
-                ((frac * 7.0).round() as usize).min(7)
-            } else {
-                7
-            };
-            s.push(blocks[idx]);
-        } else {
-            s.push(' ');
-        }
-    }
-    s
-}
-
-/// Apply the current fuzzy filter to the left pane's rows, returning the
-/// surviving rows and their scores (for debug / tie-break inspection).
-fn apply_filter_left(rows: &[LeftRow], state: &AppState, pane: PaneId) -> (Vec<LeftRow>, Vec<u32>) {
-    if !should_filter(state, pane) {
+fn apply_filter_left(rows: &[LeftRow], state: &AppState) -> (Vec<LeftRow>, Vec<u32>) {
+    if !should_filter(state) {
         return (rows.to_vec(), Vec::new());
     }
     let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
@@ -601,7 +1162,7 @@ fn apply_filter_left(rows: &[LeftRow], state: &AppState, pane: PaneId) -> (Vec<L
 }
 
 fn apply_filter_sessions(rows: &[SessionRow], state: &AppState) -> (Vec<SessionRow>, Vec<u32>) {
-    if !should_filter(state, PaneId::Sessions) {
+    if !should_filter(state) {
         return (rows.to_vec(), Vec::new());
     }
     let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
@@ -624,6 +1185,108 @@ fn apply_filter_sessions(rows: &[SessionRow], state: &AppState) -> (Vec<SessionR
     (rows, scores)
 }
 
-fn should_filter(state: &AppState, pane: PaneId) -> bool {
-    !state.filter.query.is_empty() && state.focus == pane
+fn should_filter(state: &AppState) -> bool {
+    !state.filter.query.is_empty() && state.focus == Focus::Main
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::data::{CacheStatus, DataCache};
+    use crate::tui::state::{Sort, SourceFilter, TimeWindow};
+
+    fn cache() -> DataCache {
+        DataCache {
+            left: vec![LeftRow {
+                label: "tokctl".into(),
+                key: "/dev/tokctl".into(),
+                sessions: 2,
+                total_tokens: 1234,
+                cost: 4.2,
+                is_no_repo: false,
+            }],
+            sessions: vec![SessionRow {
+                session_id: "session-abcdef".into(),
+                source: crate::types::Source::Claude,
+                latest_ts: Utc::now(),
+                project: Some("tokctl".into()),
+                cost: 1.2,
+                total_tokens: 500,
+            }],
+            status: CacheStatus {
+                cache_path: "/tmp/cache.db".into(),
+                event_count: 7,
+                freshness: "fresh 1m".into(),
+                last_query: Utc::now(),
+            },
+            ..DataCache::default()
+        }
+    }
+
+    #[test]
+    fn context_includes_section_and_filters() {
+        let state = AppState {
+            current_section: Section::Provider,
+            source_filter: SourceFilter::Cursor,
+            time_window: TimeWindow::Month,
+            sort: Sort::RecentDesc,
+            ..AppState::default()
+        };
+        let text = context_text(&state, 200);
+        assert!(text.contains("section:provider"));
+        assert!(text.contains("source:cursor"));
+        assert!(text.contains("sort:recent"));
+    }
+
+    #[test]
+    fn context_includes_tab_when_present() {
+        let mut state = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        state.tab_per_section.insert(Section::Repos, 1);
+        let text = context_text(&state, 200);
+        assert!(text.contains("tab:provider"));
+    }
+
+    #[test]
+    fn context_truncates_to_width() {
+        let text = context_text(&AppState::default(), 10);
+        assert!(text.chars().count() <= 10);
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn detail_lines_for_drilled_view_show_session_id() {
+        let mut state = AppState::default();
+        state.set_drill(crate::tui::state::Drill {
+            section: Section::Repos,
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+        });
+        let lines = detail_lines(&state, &cache());
+        assert!(lines
+            .iter()
+            .any(|line: &String| line.contains("session-abcdef")));
+    }
+
+    #[test]
+    fn render_bar_fills_correctly() {
+        let p = Palette::default();
+        let bar = render_bar(1.0, 20, &p);
+        let text: String = bar.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "█".repeat(20));
+
+        let bar = render_bar(0.0, 20, &p);
+        let text: String = bar.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "░".repeat(20));
+    }
+
+    #[test]
+    fn render_bar_spans_total_width() {
+        let p = Palette::default();
+        let bar = render_bar(0.5, BAR_WIDTH, &p);
+        let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, BAR_WIDTH);
+    }
 }

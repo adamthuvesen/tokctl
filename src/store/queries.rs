@@ -2,7 +2,11 @@ use crate::repo::project_basename;
 use crate::types::{AggregateRow, Source, SourceLabel};
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{params_from_iter, types::Value, Connection};
+use rusqlite::{
+    params_from_iter,
+    types::{Type, Value},
+    Connection,
+};
 use std::str::FromStr;
 
 /// Sentinel string used in SQL to represent the "(no-repo)" bucket when
@@ -92,6 +96,16 @@ fn source_label(f: &QueryFilter) -> SourceLabel {
     }
 }
 
+fn parse_source_column(raw: String, col: usize) -> rusqlite::Result<Source> {
+    Source::from_str(&raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            col,
+            Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        )
+    })
+}
+
 pub fn daily_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<AggregateRow>> {
     let sql = format!(
         r#"SELECT
@@ -156,7 +170,7 @@ fn run_bucket_query(
             cost_usd: row.get(6)?,
         })
     })?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<AggregateRow>> {
@@ -187,7 +201,7 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         let session_id: String = row.get(0)?;
         let src_str: String = row.get(1)?;
-        let source = Source::from_str(&src_str).unwrap_or(Source::Codex);
+        let source = parse_source_column(src_str, 1)?;
         let repo_display: Option<String> = row.get(2)?;
         let project_path: Option<String> = row.get(3)?;
         let latest_ms: i64 = row.get(4)?;
@@ -216,7 +230,7 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
             cost_usd: row.get(10)?,
         })
     })?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Row shape for the repo-grouped report.
@@ -247,7 +261,7 @@ pub fn repo_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<RepoAgg
              COALESCE(e.repo, '{no_repo}') AS key,
              COALESCE(r.display_name, '{no_repo_name}') AS display_name,
              r.origin_url,
-             COUNT(DISTINCT e.session_id) AS sessions,
+             COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
              SUM(e.input)       AS input_tokens,
              SUM(e.output)      AS output_tokens,
              SUM(e.cache_read)  AS cache_read_tokens,
@@ -281,7 +295,7 @@ pub fn repo_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<RepoAgg
             cost_usd: row.get(9)?,
         })
     })?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Resolve a user-supplied repo name (`--repo <name>` or `tokctl repo <name>`)
@@ -303,8 +317,7 @@ pub fn resolve_repo_filter(conn: &Connection, name: &str) -> Result<RepoFilterSp
     let mut stmt = conn.prepare("SELECT key FROM repos WHERE display_name = ?1")?;
     let keys: Vec<String> = stmt
         .query_map([name], |row| row.get::<_, String>(0))?
-        .filter_map(std::result::Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     match keys.len() {
         0 => Ok(RepoFilterSpec::DisplayName(name.to_owned())),
@@ -411,6 +424,35 @@ mod tests {
         let rows = repo_report(&conn, QueryFilter::default()).unwrap();
         let alpha = rows.iter().find(|r| r.display_name == "alpha").unwrap();
         assert_eq!(alpha.sessions, 1); // two events, same session
+    }
+
+    #[test]
+    fn repo_report_counts_source_session_pairs() {
+        let mut conn = fresh_conn();
+        let tx = conn.transaction().unwrap();
+        upsert_repo(
+            &tx,
+            &RepoRow {
+                key: "/u/dev/alpha".into(),
+                display_name: "alpha".into(),
+                origin_url: None,
+                first_seen: 1,
+            },
+        )
+        .unwrap();
+        insert_events(
+            &tx,
+            &[
+                evt(1, "same", Some("/u/dev/alpha"), 100, 1.00, Source::Claude),
+                evt(2, "same", Some("/u/dev/alpha"), 100, 1.00, Source::Codex),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = repo_report(&conn, QueryFilter::default()).unwrap();
+        let alpha = rows.iter().find(|r| r.display_name == "alpha").unwrap();
+        assert_eq!(alpha.sessions, 2);
     }
 
     #[test]

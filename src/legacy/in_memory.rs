@@ -185,7 +185,7 @@ pub fn repo_in_memory(
     struct Bucket {
         display_name: String,
         origin_url: Option<String>,
-        sessions: HashSet<String>,
+        sessions: HashSet<(Source, String)>,
         input: u64,
         output: u64,
         cache_read: u64,
@@ -208,7 +208,7 @@ pub fn repo_in_memory(
             b.display_name = id.display_name.clone();
             b.origin_url = id.origin_url.clone();
         }
-        b.sessions.insert(e.session_id.clone());
+        b.sessions.insert((e.source, e.session_id.clone()));
         b.input += e.input_tokens;
         b.output += e.output_tokens;
         b.cache_read += e.cache_read_tokens;
@@ -255,6 +255,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            explicit_cost_usd: None,
         }
     }
 
@@ -338,6 +339,23 @@ mod tests {
         let rows = repo_in_memory(&resolved, &None, &mut unknown);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_no_repo());
+        assert_eq!(rows[0].sessions, 2);
+    }
+
+    #[test]
+    fn repo_in_memory_counts_source_session_pairs() {
+        let a = event(
+            Source::Claude,
+            "same",
+            "claude-sonnet-4-6",
+            "2026-04-18T09:00:00Z",
+            10,
+        );
+        let b = event(Source::Codex, "same", "gpt-5.4", "2026-04-18T10:00:00Z", 20);
+        let resolved = resolve_repos(&[a, b]);
+        let mut unknown = HashSet::new();
+        let rows = repo_in_memory(&resolved, &None, &mut unknown);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sessions, 2);
     }
 }
