@@ -219,6 +219,9 @@ pub struct AppState {
     pub filter: FilterState,
     pub pane_widths: [u16; 2],
     pub flash: Option<String>,
+    /// Whether the left pane shows expanded columns (sessions + tokens + cost).
+    /// Default false = compact (tokens + cost only).
+    pub expanded: bool,
 }
 
 impl Default for AppState {
@@ -241,6 +244,7 @@ impl Default for AppState {
             filter: FilterState::default(),
             pane_widths: [50, 50],
             flash: None,
+            expanded: false,
         }
     }
 }
@@ -305,6 +309,7 @@ pub enum Action {
     FilterCancel,
     Yank,
     YankSummary,
+    ToggleExpand,
     None,
 }
 
@@ -452,6 +457,12 @@ impl AppState {
             Action::YankSummary => {
                 // event loop performs clipboard IO and sets flash.
             }
+            Action::ToggleExpand => {
+                self.expanded = !self.expanded;
+                out.refresh.left = true;
+                out.needs_refresh = true;
+                out.dirty = true;
+            }
         }
 
         // Downstream refresh from selection movement.
@@ -515,6 +526,8 @@ struct PersistedState {
     trend_granularity: Option<TrendGranularity>,
     #[serde(default)]
     selected: Option<SelectedKeys>,
+    #[serde(default)]
+    expanded: Option<bool>,
 }
 
 fn default_version() -> u32 {
@@ -550,6 +563,9 @@ pub fn load(path: &Path) -> AppState {
     if let Some(v) = p.selected {
         s.selected = v;
     }
+    if let Some(v) = p.expanded {
+        s.expanded = v;
+    }
     s
 }
 
@@ -562,6 +578,7 @@ pub fn save(path: &Path, s: &AppState) -> anyhow::Result<()> {
         sort: Some(s.sort),
         trend_granularity: Some(s.trend_granularity),
         selected: Some(s.selected.clone()),
+        expanded: Some(s.expanded),
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();

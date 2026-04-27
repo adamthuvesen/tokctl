@@ -14,9 +14,11 @@ use ratatui::{
 
 use crate::tui::data::{DataCache, LeftRow, SessionRow, TrendRow};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
-use crate::tui::state::{AppState, PaneId};
+use crate::tui::state::{AppState, PaneId, SourceFilter};
 use crate::tui::theme::Palette;
 use crate::tui::MIN_WIDTH;
+
+const BAR_WIDTH: usize = 20;
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
     let palette = Palette::default();
@@ -181,11 +183,20 @@ fn draw_panes(
     draw_sessions_pane(frame, cols[1], state, &sess_rows, palette);
 }
 
+/// Build the pane block. Active pane = Thick border in accent; inactive = Rounded in border_inactive.
 fn pane_block<'a>(title: &'a str, active: bool, palette: &Palette) -> Block<'a> {
-    let border = if active {
-        palette.active_border()
+    let (border_style, border_type, title_style) = if active {
+        (
+            palette.active_border(),
+            BorderType::Thick,
+            palette.active_border(),
+        )
     } else {
-        palette.inactive_border()
+        (
+            palette.inactive_border(),
+            BorderType::Rounded,
+            palette.dim_text(),
+        )
     };
     let chip = if active {
         format!("[ {title} ]")
@@ -194,16 +205,9 @@ fn pane_block<'a>(title: &'a str, active: bool, palette: &Palette) -> Block<'a> 
     };
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border)
-        .title(Span::styled(
-            chip,
-            if active {
-                palette.active_border()
-            } else {
-                palette.dim_text()
-            },
-        ))
+        .border_type(border_type)
+        .border_style(border_style)
+        .title(Span::styled(chip, title_style))
 }
 
 fn draw_left_pane(
@@ -237,6 +241,24 @@ fn draw_left_pane(
         .max(0.0001);
 
     let selected = state.left_index.min(rows.len().saturating_sub(1));
+
+    if state.expanded {
+        draw_left_expanded(frame, inner, selected, active, rows, max_cost, palette);
+    } else {
+        draw_left_compact(frame, inner, selected, active, rows, max_cost, palette);
+    }
+}
+
+/// Compact layout: name | tokens | cost  (default, lower density)
+fn draw_left_compact(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    selected: usize,
+    active: bool,
+    rows: &[LeftRow],
+    max_cost: f64,
+    palette: &Palette,
+) {
     let table_rows: Vec<Row> = rows
         .iter()
         .enumerate()
@@ -249,11 +271,11 @@ fn draw_left_pane(
             } else {
                 Style::default().fg(palette.cost_color(r.cost / max_cost))
             };
+            let label_cell = label_cell(r.label.clone(), is_selected, palette);
             let mut row = Row::new(vec![
-                Cell::from(r.label.clone()),
-                Cell::from(fmt_num(r.sessions)),
-                Cell::from(fmt_tokens_short(r.total_tokens)),
-                Cell::from(fmt_cost(r.cost)).style(cost_style),
+                label_cell,
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -265,15 +287,82 @@ fn draw_left_pane(
     let table = Table::new(
         table_rows,
         [
-            Constraint::Percentage(60),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(9),
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(10),
         ],
     )
-    .header(Row::new(vec!["name", "sess", "tok", "cost"]).style(palette.dim_text()));
+    .header(
+        Row::new(vec!["name", "     tok", "      cost"])
+            .style(palette.dim_text()),
+    );
 
     frame.render_widget(table, inner);
+}
+
+/// Expanded layout: name | sessions | tokens | cost
+fn draw_left_expanded(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    selected: usize,
+    active: bool,
+    rows: &[LeftRow],
+    max_cost: f64,
+    palette: &Palette,
+) {
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let is_selected = i == selected && active;
+            let cost_style = if is_selected {
+                palette.selected_row()
+            } else if r.is_no_repo {
+                palette.warn_text()
+            } else {
+                Style::default().fg(palette.cost_color(r.cost / max_cost))
+            };
+            let label_cell = label_cell(r.label.clone(), is_selected, palette);
+            let mut row = Row::new(vec![
+                label_cell,
+                Cell::from(format!("{:>5}", fmt_num(r.sessions))),
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+            ]);
+            if is_selected {
+                row = row.style(palette.selected_row());
+            }
+            row
+        })
+        .collect();
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Min(16),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(10),
+        ],
+    )
+    .header(
+        Row::new(vec!["name", " sess", "     tok", "      cost"])
+            .style(palette.dim_text()),
+    );
+
+    frame.render_widget(table, inner);
+}
+
+/// Build a label cell with an accent ▌ gutter mark when the row is selected.
+fn label_cell(label: String, is_selected: bool, palette: &Palette) -> Cell<'static> {
+    if is_selected {
+        Cell::from(Line::from(vec![
+            Span::styled("▌ ", palette.accent_text()),
+            Span::raw(label),
+        ]))
+    } else {
+        Cell::from(label)
+    }
 }
 
 fn draw_sessions_pane(
@@ -318,16 +407,24 @@ fn draw_sessions_pane(
             } else {
                 Style::default().fg(palette.cost_color(r.cost / max_cost))
             };
+            let proj_label = r
+                .project
+                .clone()
+                .unwrap_or_else(|| r.session_id.chars().take(8).collect());
+            let proj_cell = if is_selected {
+                Cell::from(Line::from(vec![
+                    Span::styled("▌ ", palette.accent_text()),
+                    Span::raw(proj_label),
+                ]))
+            } else {
+                Cell::from(proj_label)
+            };
             let mut row = Row::new(vec![
                 Cell::from(relative_time(r.latest_ts, now)),
                 Cell::from(r.source.as_str().to_owned()).style(src_style),
-                Cell::from(
-                    r.project
-                        .clone()
-                        .unwrap_or_else(|| r.session_id.chars().take(8).collect()),
-                ),
-                Cell::from(fmt_tokens_short(r.total_tokens)),
-                Cell::from(fmt_cost(r.cost)).style(cost_style),
+                proj_cell,
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -341,12 +438,15 @@ fn draw_sessions_pane(
         [
             Constraint::Length(12),
             Constraint::Length(6),
-            Constraint::Percentage(40),
-            Constraint::Length(7),
-            Constraint::Length(9),
+            Constraint::Min(12),
+            Constraint::Length(8),
+            Constraint::Length(10),
         ],
     )
-    .header(Row::new(vec!["when", "src", "project", "tok", "cost"]).style(palette.dim_text()));
+    .header(
+        Row::new(vec!["when", "src", "project", "     tok", "      cost"])
+            .style(palette.dim_text()),
+    );
 
     frame.render_widget(table, inner);
 }
@@ -363,6 +463,7 @@ fn draw_footer(
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
+    // Row 0: sparkline
     if cache.sparkline.iter().copied().fold(0f64, f64::max) <= 0.0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -384,7 +485,8 @@ fn draw_footer(
         frame.render_widget(spark, rows[0]);
     }
 
-    let legend = Line::from(vec![
+    // Row 1: status chips + separator + 6 key hints
+    let mut spans = vec![
         Span::styled(
             format!(" window:{} ", state.time_window.as_str()),
             palette.accent_text(),
@@ -394,67 +496,88 @@ fn draw_footer(
             palette.dim_text(),
         ),
         Span::raw("  "),
-        Span::styled(
-            state
-                .flash
-                .as_ref()
-                .map(|flash| format!("{flash}  "))
-                .unwrap_or_default(),
-            palette.accent_text(),
-        ),
-        Span::styled(status_text(cache), palette.dim_text()),
-        Span::raw("  "),
-        Span::styled(
-            "j/k move  ↵ drill  h/l pane  / filter  Tab axis  t trend  T/w/m/z/a window  i detail  y/Y copy  q quit",
-            palette.dim_text(),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(legend), rows[1]);
-}
+    ];
 
-fn status_text(cache: &DataCache) -> String {
-    let cache_name = std::path::Path::new(&cache.status.cache_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cache.db");
-    format!(
-        "{} · {} events · {} · queried {}",
-        cache_name,
-        fmt_num(cache.status.event_count),
-        cache.status.freshness,
-        relative_time(cache.status.last_query, Utc::now())
-    )
+    if let Some(flash) = &state.flash {
+        spans.push(Span::styled(format!("{flash}  "), palette.accent_text()));
+    }
+
+    spans.push(Span::styled("│  ", palette.dim_text()));
+
+    let hints: &[(&str, &str)] = &[
+        ("j/k", "move"),
+        ("←↵", "drill"),
+        ("h/l", "pane"),
+        ("/", "filter"),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+    for (idx, (key, desc)) in hints.iter().enumerate() {
+        spans.push(Span::styled(format!("[{key}]"), palette.accent_text()));
+        spans.push(Span::styled(format!(" {desc}"), palette.dim_text()));
+        if idx + 1 < hints.len() {
+            spans.push(Span::styled("  ·  ", palette.dim_text()));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(palette.accent_border())
+        .border_style(palette.active_border())
         .title(Span::styled(" HELP ", palette.active_border()));
-    let help_area = centered(area, 70, 20);
+    let help_area = centered(area, 72, 26);
     frame.render_widget(Clear, help_area);
     let inner = block.inner(help_area);
     frame.render_widget(block, help_area);
-    let lines = vec![
-        Line::from("  h/l  ←/→          move focus between panes"),
-        Line::from("  j/k  ↓/↑          move selection"),
-        Line::from("  g g / G            top / bottom"),
-        Line::from("  Ctrl-d / Ctrl-u    half page down / up"),
-        Line::from("  Enter              drill right"),
-        Line::from("  Esc / Backspace    cancel / pop"),
-        Line::from("  /                  fuzzy filter"),
-        Line::from("  Tab                cycle left-pane axis"),
-        Line::from("  s                  cycle sort"),
-        Line::from("  t                  trend overlay (d/w/m/y inside)"),
-        Line::from("  T w m z a          window: today / week / month / year / all"),
-        Line::from("  i                  row details"),
-        Line::from("  1 2 3 4            source: all / claude / codex / cursor"),
-        Line::from("  r                  refresh (no ingest)"),
-        Line::from("  y / Y              yank key / summary to clipboard"),
-        Line::from("  ?                  toggle this help"),
-        Line::from("  q / Ctrl-c         quit"),
+
+    let section = |title: &'static str| -> Line<'static> {
+        Line::from(Span::styled(
+            title.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    };
+    let blank = Line::from("");
+    let hint = |key: &'static str, desc: &'static str| -> Line<'static> {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<10}", key), palette.accent_text()),
+            Span::styled("  ", palette.dim_text()),
+            Span::styled(desc, palette.dim_text()),
+        ])
+    };
+
+    let lines: Vec<Line> = vec![
+        section("Navigation"),
+        hint("h/l  ←/→", "move focus between panes"),
+        hint("j/k  ↓/↑", "move selection"),
+        hint("gg / G", "top / bottom"),
+        hint("Ctrl-d/u", "half page down / up"),
+        hint("Enter", "drill right"),
+        hint("Esc / ←", "cancel / pop"),
+        blank.clone(),
+        section("View"),
+        hint("/", "fuzzy filter"),
+        hint("Tab", "cycle left-pane axis"),
+        hint("e", "toggle compact / expanded"),
+        hint("s", "cycle sort"),
+        hint("t", "trend overlay (d/w/m/y inside)"),
+        hint("T w m z a", "window: today/week/month/year/all"),
+        hint("1 2 3 4", "source: all/claude/codex/cursor"),
+        hint("i", "row details"),
+        hint("r", "refresh (no ingest)"),
+        blank.clone(),
+        section("Copy / Export"),
+        hint("y", "yank row key to clipboard"),
+        hint("Y", "yank row summary to clipboard"),
+        blank.clone(),
+        hint("?", "toggle this help"),
+        hint("q / Ctrl-c", "quit"),
     ];
+
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -546,12 +669,6 @@ fn draw_filter_prompt(frame: &mut Frame<'_>, area: Rect, state: &AppState, palet
     frame.render_widget(Paragraph::new(line), row);
 }
 
-impl Palette {
-    fn accent_border(&self) -> Style {
-        self.active_border()
-    }
-}
-
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
     let h = height.min(area.height.saturating_sub(2));
@@ -602,22 +719,46 @@ fn draw_trend_overlay(
         .map(|r| r.total_cost)
         .fold(0f64, f64::max)
         .max(0.0001);
-    let bar_cols: usize = (inner.width as usize).saturating_sub(60).clamp(6, 24);
 
-    let header = Row::new(vec![
-        state.trend_granularity.bucket_header(),
-        "claude",
-        "codex",
-        "cursor",
-        "tokens",
-        "total",
-        "proportion",
-    ])
-    .style(palette.dim_text());
+    // Determine which source columns have any non-zero data AND are not filtered out.
+    let show_claude = rows.iter().any(|r| r.claude_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Codex | SourceFilter::Cursor
+        );
+    let show_codex = rows.iter().any(|r| r.codex_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Cursor
+        );
+    let show_cursor = rows.iter().any(|r| r.cursor_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Codex
+        );
 
+    // Build header cells dynamically.
+    let mut header_cells = vec![Cell::from(state.trend_granularity.bucket_header())];
+    if show_claude {
+        header_cells.push(Cell::from("claude"));
+    }
+    if show_codex {
+        header_cells.push(Cell::from("codex"));
+    }
+    if show_cursor {
+        header_cells.push(Cell::from("cursor"));
+    }
+    header_cells.push(Cell::from("tokens"));
+    header_cells.push(Cell::from("total"));
+    header_cells.push(Cell::from("proportion"));
+    let header = Row::new(header_cells).style(palette.dim_text());
+
+    // Build body rows.
     let mut body: Vec<Row> = rows
         .iter()
-        .map(|r| trend_row(r, max_total, bar_cols, state, palette))
+        .map(|r| {
+            trend_row(r, max_total, show_claude, show_codex, show_cursor, state, palette)
+        })
         .collect();
 
     // Separator + TOTAL row.
@@ -631,75 +772,68 @@ fn draw_trend_overlay(
                 acc.4 + r.total_cost,
             )
         });
-    let rule = "─".repeat(inner.width.saturating_sub(2) as usize);
-    body.push(Row::new(vec![
-        Cell::from(rule.clone()).style(palette.dim_text()),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(""),
-    ]));
-    let claude_cell = if matches!(
-        state.source_filter,
-        crate::tui::state::SourceFilter::Codex | crate::tui::state::SourceFilter::Cursor
-    ) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(cc_sum)).style(palette.accent_text())
-    };
-    let codex_cell = if matches!(
-        state.source_filter,
-        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Cursor
-    ) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(xc_sum)).style(palette.warn_text())
-    };
-    let cursor_cell = if matches!(
-        state.source_filter,
-        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Codex
-    ) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(uc_sum)).style(palette.info_text())
-    };
-    body.push(Row::new(vec![
-        Cell::from("TOTAL").style(Style::default().add_modifier(Modifier::BOLD)),
-        claude_cell,
-        codex_cell,
-        cursor_cell,
-        Cell::from(fmt_num(tok_sum)).style(palette.dim_text()),
-        Cell::from(fmt_cost(tot_sum)).style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from(""),
-    ]));
 
-    let table = Table::new(
-        body,
-        [
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Min(bar_cols as u16),
-        ],
-    )
-    .header(header);
+    let sep_cells_count = 3
+        + show_claude as usize
+        + show_codex as usize
+        + show_cursor as usize;
+    let rule = "─".repeat(inner.width.saturating_sub(2) as usize);
+    let mut sep_cells = vec![
+        Cell::from(rule).style(palette.dim_text()),
+    ];
+    for _ in 1..sep_cells_count {
+        sep_cells.push(Cell::from(""));
+    }
+    body.push(Row::new(sep_cells));
+
+    let mut total_cells = vec![
+        Cell::from("TOTAL").style(Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if show_claude {
+        total_cells.push(Cell::from(fmt_cost(cc_sum)).style(palette.accent_text()));
+    }
+    if show_codex {
+        total_cells.push(Cell::from(fmt_cost(xc_sum)).style(palette.warn_text()));
+    }
+    if show_cursor {
+        total_cells.push(Cell::from(fmt_cost(uc_sum)).style(palette.info_text()));
+    }
+    total_cells.push(Cell::from(format!("{:>8}", fmt_tokens_short(tok_sum))).style(palette.dim_text()));
+    total_cells.push(Cell::from(format!("{:>10}", fmt_cost(tot_sum))).style(Style::default().add_modifier(Modifier::BOLD)));
+    total_cells.push(Cell::from(""));
+    body.push(Row::new(total_cells));
+
+    // Build constraints dynamically based on visible source columns.
+    let mut constraints = vec![Constraint::Length(20)]; // bucket label
+    if show_claude {
+        constraints.push(Constraint::Length(10));
+    }
+    if show_codex {
+        constraints.push(Constraint::Length(10));
+    }
+    if show_cursor {
+        constraints.push(Constraint::Length(10));
+    }
+    constraints.push(Constraint::Length(8));  // tokens
+    constraints.push(Constraint::Length(10)); // total
+    constraints.push(Constraint::Min(BAR_WIDTH as u16 + 2)); // proportion
+
+    let table = Table::new(body, constraints).header(header);
     frame.render_widget(table, inner);
 }
 
 fn trend_row<'a>(
     r: &'a TrendRow,
     max_total: f64,
-    bar_cols: usize,
-    state: &AppState,
+    show_claude: bool,
+    show_codex: bool,
+    show_cursor: bool,
+    _state: &AppState,
     palette: &Palette,
 ) -> Row<'a> {
     let ratio = (r.total_cost / max_total).clamp(0.0, 1.0);
-    let bar = proportional_bar(ratio, bar_cols);
+    let bar = render_bar(ratio, BAR_WIDTH, palette);
+
     let bucket_label = if r.is_current {
         format!("▸{} (so far)", r.bucket)
     } else {
@@ -707,67 +841,60 @@ fn trend_row<'a>(
     };
     let total_color = palette.cost_color(ratio);
 
-    let claude_cell = if matches!(
-        state.source_filter,
-        crate::tui::state::SourceFilter::Codex | crate::tui::state::SourceFilter::Cursor
-    ) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(r.claude_cost)).style(palette.accent_text())
-    };
-    let codex_cell = if matches!(
-        state.source_filter,
-        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Cursor
-    ) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(r.codex_cost)).style(palette.warn_text())
-    };
-    let cursor_cell = if matches!(
-        state.source_filter,
-        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Codex
-    ) {
-        Cell::from("—").style(palette.dim_text())
-    } else {
-        Cell::from(fmt_cost(r.cursor_cost)).style(palette.info_text())
-    };
+    let mut cells = vec![Cell::from(bucket_label)];
 
-    Row::new(vec![
-        Cell::from(bucket_label),
-        claude_cell,
-        codex_cell,
-        cursor_cell,
-        Cell::from(fmt_tokens_short(r.total_tokens)).style(palette.dim_text()),
-        Cell::from(fmt_cost(r.total_cost)).style(Style::default().fg(total_color)),
-        Cell::from(bar),
-    ])
+    if show_claude {
+        cells.push(cost_cell_or_dash(r.claude_cost, palette.accent_text(), palette.dim_text()));
+    }
+    if show_codex {
+        cells.push(cost_cell_or_dash(r.codex_cost, palette.warn_text(), palette.dim_text()));
+    }
+    if show_cursor {
+        cells.push(cost_cell_or_dash(r.cursor_cost, palette.info_text(), palette.dim_text()));
+    }
+
+    cells.push(
+        Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))).style(palette.dim_text()),
+    );
+    cells.push(
+        Cell::from(format!("{:>10}", fmt_cost(r.total_cost)))
+            .style(Style::default().fg(total_color)),
+    );
+    cells.push(Cell::from(bar));
+
+    Row::new(cells)
 }
 
-fn proportional_bar(ratio: f64, width: usize) -> String {
-    // ▁▂▃▄▅▆▇█
-    let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Return a dim `—` cell for zero cost, otherwise a styled cost cell.
+fn cost_cell_or_dash(cost: f64, value_style: Style, dim_style: Style) -> Cell<'static> {
+    if cost < 0.001 {
+        Cell::from("—").style(dim_style)
+    } else {
+        Cell::from(format!("{:>10}", fmt_cost(cost))).style(value_style)
+    }
+}
+
+/// Render a two-tone proportion bar: violet filled + zinc empty, fixed width.
+fn render_bar(ratio: f64, width: usize, palette: &Palette) -> Line<'static> {
     let filled = (ratio * width as f64).round() as usize;
     let filled = filled.min(width);
-    let mut s = String::with_capacity(width);
-    for i in 0..width {
-        if i < filled {
-            // Scale the block's height to ratio for the final cell, keep full elsewhere.
-            let idx = if i + 1 == filled {
-                let frac = (ratio * width as f64) - filled as f64 + 1.0;
-                ((frac * 7.0).round() as usize).min(7)
-            } else {
-                7
-            };
-            s.push(blocks[idx]);
-        } else {
-            s.push(' ');
-        }
+    let empty = width - filled;
+    let mut spans = Vec::new();
+    if filled > 0 {
+        spans.push(Span::styled(
+            "█".repeat(filled),
+            palette.bar_filled_style(),
+        ));
     }
-    s
+    if empty > 0 {
+        spans.push(Span::styled(
+            "░".repeat(empty),
+            palette.bar_empty_style(),
+        ));
+    }
+    Line::from(spans)
 }
 
-/// Apply the current fuzzy filter to the left pane's rows, returning the
-/// surviving rows and their scores (for debug / tie-break inspection).
 fn apply_filter_left(rows: &[LeftRow], state: &AppState, pane: PaneId) -> (Vec<LeftRow>, Vec<u32>) {
     if !should_filter(state, pane) {
         return (rows.to_vec(), Vec::new());
@@ -818,6 +945,7 @@ fn apply_filter_sessions(rows: &[SessionRow], state: &AppState) -> (Vec<SessionR
 fn should_filter(state: &AppState, pane: PaneId) -> bool {
     !state.filter.query.is_empty() && state.focus == pane
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -875,13 +1003,6 @@ mod tests {
     }
 
     #[test]
-    fn status_text_reports_cache_and_events() {
-        let text = status_text(&cache());
-        assert!(text.contains("cache.db"));
-        assert!(text.contains("7 events"));
-    }
-
-    #[test]
     fn detail_lines_include_session_identity() {
         let state = AppState {
             focus: PaneId::Sessions,
@@ -889,5 +1010,28 @@ mod tests {
         };
         let lines = detail_lines(&state, &cache());
         assert!(lines.iter().any(|line| line.contains("session-abcdef")));
+    }
+
+    #[test]
+    fn render_bar_fills_correctly() {
+        let p = Palette::default();
+        // ratio 1.0 → all filled
+        let bar = render_bar(1.0, 20, &p);
+        let text: String = bar.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "█".repeat(20));
+
+        // ratio 0.0 → all empty
+        let bar = render_bar(0.0, 20, &p);
+        let text: String = bar.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "░".repeat(20));
+    }
+
+    #[test]
+    fn render_bar_spans_total_width() {
+        let p = Palette::default();
+        // half-filled bar should have total width == BAR_WIDTH
+        let bar = render_bar(0.5, BAR_WIDTH, &p);
+        let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, BAR_WIDTH);
     }
 }
