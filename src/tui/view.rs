@@ -20,6 +20,14 @@ use crate::tui::theme::Palette;
 use crate::tui::MIN_WIDTH;
 
 const BAR_WIDTH: usize = 20;
+const LEFT_NAME_WIDTH: u16 = 28;
+const SESSION_PROJECT_WIDTH: u16 = 28;
+const TREND_BUCKET_WIDTH: u16 = 20;
+const PROVIDER_COL_WIDTH: u16 = 10;
+const SIDEBAR_WIDTH: u16 = 22;
+const PANEL_BORDER: u16 = 2;
+// 1 top border + 1 top pad + 1 bottom border.
+const PANEL_CHROME_HEIGHT: u16 = 3;
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
     let palette = Palette::default();
@@ -37,26 +45,41 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
         return;
     }
 
+    let (panel_w, panel_h) = main_panel_dimensions(state, cache);
+
+    // Cap to available space; reserve 2 for header + 2 for footer.
+    let body_avail = area.height.saturating_sub(4);
+    let body_height = panel_h.min(body_avail).max(8);
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Min(8),
+            Constraint::Length(body_height),
+            Constraint::Min(0),
             Constraint::Length(2),
         ])
         .split(area);
 
     draw_header(frame, outer[0], state, cache, &palette);
 
+    // Sidebar fixed; main hugs content; remainder is empty filler.
+    let main_avail = area.width.saturating_sub(SIDEBAR_WIDTH);
+    let main_width = panel_w.min(main_avail);
+
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(22), Constraint::Percentage(78)])
+        .constraints([
+            Constraint::Length(SIDEBAR_WIDTH),
+            Constraint::Length(main_width),
+            Constraint::Min(0),
+        ])
         .split(outer[1]);
 
     draw_sidebar(frame, body_cols[0], state, &palette);
     draw_main(frame, body_cols[1], state, cache, &palette);
 
-    draw_footer(frame, outer[2], state, cache, &palette);
+    draw_footer(frame, outer[3], state, cache, &palette);
 
     if state.help_open {
         draw_help(frame, area, &palette);
@@ -142,6 +165,87 @@ fn truncate_chars(value: &str, width: usize) -> String {
     let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+// -- Main panel sizing ------------------------------------------------------
+
+/// Returns the (width, height) the main bordered panel "wants" given the
+/// currently active section and the data in the cache. The caller clamps
+/// these to the available terminal size.
+fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16, u16) {
+    let bar_w = BAR_WIDTH as u16 + 2;
+
+    // Drilled view always renders the sessions table with a 1-row breadcrumb.
+    if state.drill.is_some() {
+        let cells = [12, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
+        let rows = cache.sessions.len() as u16;
+        return chrome((table_width(&cells), 1 + 1 + rows.max(1)));
+    }
+
+    let tab = state.active_tab_index() as usize;
+    let (cols, content_h) = match state.current_section {
+        Section::Repos if tab == 0 => left_panel_size(state, cache),
+        Section::Days | Section::Models => left_panel_size(state, cache),
+        Section::Sessions => {
+            let cells = [12u16, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
+            let rows = cache.left.len() as u16;
+            (table_width(&cells), 1 + rows.max(1))
+        }
+        Section::Repos | Section::Provider => {
+            let n = active_provider_count(state, cache) as usize;
+            let mut cells: Vec<u16> = vec![TREND_BUCKET_WIDTH];
+            cells.extend(std::iter::repeat(PROVIDER_COL_WIDTH).take(n));
+            cells.extend([8u16, 10, bar_w]);
+            let rows = cache.trend.len() as u16;
+            // header + rows + separator + TOTAL
+            (table_width(&cells), 1 + rows.max(1) + 2)
+        }
+    };
+
+    chrome((cols, content_h))
+}
+
+fn left_panel_size(state: &AppState, cache: &DataCache) -> (u16, u16) {
+    let bar_w = BAR_WIDTH as u16 + 2;
+    let rows = cache.left.len() as u16;
+    let cells: &[u16] = if state.expanded {
+        &[LEFT_NAME_WIDTH, 5, 8, 10, bar_w]
+    } else {
+        &[LEFT_NAME_WIDTH, 8, 10, bar_w]
+    };
+    (table_width(cells), 1 + rows.max(1))
+}
+
+/// Sum of fixed column widths plus 1 col of spacing between each pair
+/// (matches ratatui's default `Table::column_spacing(1)`).
+fn table_width(cells: &[u16]) -> u16 {
+    let sum: u16 = cells.iter().copied().sum();
+    let gaps = cells.len().saturating_sub(1) as u16;
+    sum + gaps
+}
+
+fn chrome((w, h): (u16, u16)) -> (u16, u16) {
+    (w + PANEL_BORDER, h + PANEL_CHROME_HEIGHT)
+}
+
+fn active_provider_count(state: &AppState, cache: &DataCache) -> u16 {
+    let rows = &cache.trend;
+    let show_claude = rows.iter().any(|r| r.claude_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Codex | SourceFilter::Cursor
+        );
+    let show_codex = rows.iter().any(|r| r.codex_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Cursor
+        );
+    let show_cursor = rows.iter().any(|r| r.cursor_cost > 0.001)
+        && !matches!(
+            state.source_filter,
+            SourceFilter::Claude | SourceFilter::Codex
+        );
+    show_claude as u16 + show_codex as u16 + show_cursor as u16
 }
 
 // -- Main pane dispatch -----------------------------------------------------
@@ -262,7 +366,7 @@ fn draw_drill(
     draw_sessions_table(frame, rows[1], state, &cache.sessions, palette);
 }
 
-// -- Section: left-row table (Repos/Days/Models/Sessions) -------------------
+// -- Section: left-row table (Days, Models, Sessions, Repos Costs tab) ------------
 
 fn draw_left_table(
     frame: &mut Frame<'_>,
@@ -340,10 +444,20 @@ fn draw_left_compact(
                 Style::default().fg(palette.cost_color(r.cost / max_cost))
             };
             let label_cell = label_cell(r.label.clone(), is_selected, palette);
+            let bar_cell = if r.is_no_repo {
+                Cell::from("")
+            } else {
+                Cell::from(render_bar(
+                    (r.cost / max_cost).clamp(0.0, 1.0),
+                    BAR_WIDTH,
+                    palette,
+                ))
+            };
             let mut row = Row::new(vec![
                 label_cell,
                 Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
                 Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -355,12 +469,15 @@ fn draw_left_compact(
     let table = Table::new(
         table_rows,
         [
-            Constraint::Min(20),
+            Constraint::Length(LEFT_NAME_WIDTH),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
         ],
     )
-    .header(Row::new(vec!["name", "     tok", "      cost"]).style(palette.dim_text()));
+    .header(
+        Row::new(vec!["name", "     tok", "      cost", "proportion"]).style(palette.dim_text()),
+    );
 
     frame.render_widget(table, inner);
 }
@@ -387,11 +504,21 @@ fn draw_left_expanded(
                 Style::default().fg(palette.cost_color(r.cost / max_cost))
             };
             let label_cell = label_cell(r.label.clone(), is_selected, palette);
+            let bar_cell = if r.is_no_repo {
+                Cell::from("")
+            } else {
+                Cell::from(render_bar(
+                    (r.cost / max_cost).clamp(0.0, 1.0),
+                    BAR_WIDTH,
+                    palette,
+                ))
+            };
             let mut row = Row::new(vec![
                 label_cell,
                 Cell::from(format!("{:>5}", fmt_num(r.sessions))),
                 Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
                 Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -403,13 +530,23 @@ fn draw_left_expanded(
     let table = Table::new(
         table_rows,
         [
-            Constraint::Min(16),
+            Constraint::Length(LEFT_NAME_WIDTH),
             Constraint::Length(5),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
         ],
     )
-    .header(Row::new(vec!["name", " sess", "     tok", "      cost"]).style(palette.dim_text()));
+    .header(
+        Row::new(vec![
+            "name",
+            " sess",
+            "     tok",
+            "      cost",
+            "proportion",
+        ])
+        .style(palette.dim_text()),
+    );
 
     frame.render_widget(table, inner);
 }
@@ -482,12 +619,18 @@ fn draw_sessions_table(
             } else {
                 Cell::from(proj_label)
             };
+            let bar_cell = Cell::from(render_bar(
+                (r.cost / max_cost).clamp(0.0, 1.0),
+                BAR_WIDTH,
+                palette,
+            ));
             let mut row = Row::new(vec![
                 Cell::from(relative_time(r.latest_ts, now)),
                 Cell::from(r.source.as_str().to_owned()).style(src_style),
                 proj_cell,
                 Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
                 Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
             ]);
             if is_selected {
                 row = row.style(palette.selected_row());
@@ -501,14 +644,22 @@ fn draw_sessions_table(
         [
             Constraint::Length(12),
             Constraint::Length(6),
-            Constraint::Min(12),
+            Constraint::Length(SESSION_PROJECT_WIDTH),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
         ],
     )
     .header(
-        Row::new(vec!["when", "src", "project", "     tok", "      cost"])
-            .style(palette.dim_text()),
+        Row::new(vec![
+            "when",
+            "src",
+            "project",
+            "     tok",
+            "      cost",
+            "proportion",
+        ])
+        .style(palette.dim_text()),
     );
 
     frame.render_widget(table, area);

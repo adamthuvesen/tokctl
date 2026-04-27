@@ -76,16 +76,16 @@ tokctl ui
 
 Refreshes the SQLite cache from the default/env Claude, Codex, and Cursor roots, optionally refreshes Cursor from the network when credentials are configured, then launches the interactive view. **TTY only** — exits if stdout is not a terminal.
 
-Sidebar/main shell: a left **Sections** sidebar (Repos · Days · Models · Sessions · Provider) and a right **Main** pane that fills with the active section. Some sections (Repos) host **tabs** as lenses on the same data. Pressing `Enter` on a row drills in-place with a breadcrumb header; `Esc` / `←` pops back. Press `?` for in-app help. Minimum width: 80 columns.
+Sidebar/main shell: a left **Sections** sidebar (Days · Models · Provider · Repos · Sessions) and a right **Main** pane that fills with the active section. Some sections (Repos) host **tabs** as lenses on the same data. Pressing `Enter` on a row drills in-place with a breadcrumb header; `Esc` / `←` pops back. Press `?` for in-app help. Minimum width: 80 columns.
 
 ```
 ┌─ tokctl  2026-04-25 12:52  last month · $11442.57 · 5.37M tok ─────────[?]─┐
 │ ┌ Sections ┐  ┌─ Costs ─└────────┘─ Provider ─────────────────────────────┐ │
-│ │▌ Repos   │  │  name              tok          cost                    │ │
-│ │  Days    │  │  ▌ tokctl       1.2M         $4.20                       │ │
-│ │  Models  │  │   apps         850K          $2.10                       │ │
-│ │  Sessions│  │   (no-repo)    240K          $0.80                       │ │
-│ │ Provider │  │                                                          │ │
+│ │▌ Days    │  │  name              tok          cost                    │ │
+│ │  Models  │  │  ▌ tokctl       1.2M         $4.20                       │ │
+│ │ Provider │  │   apps         850K          $2.10                       │ │
+│ │  Repos   │  │   (no-repo)    240K          $0.80                       │ │
+│ │ Sessions │  │                                                          │ │
 │ └──────────┘  └──────────────────────────────────────────────────────────┘ │
 │ ▁▂▂▃▇▅▃▂▁▂▃▅▇▆▃  window:month  source:all  │  [j/k] move · [[/]] section · │
 │                                              [tab] tabs · [↵] drill · …    │

@@ -37,6 +37,8 @@ pub struct SessionRow {
     pub total_tokens: u64,
 }
 
+/// One time bucket with per-source (Claude / Codex / Cursor) costs. Used for the **Provider** section
+/// and Repos **Provider** tab; bucket size (d/w/m/y) comes from `AppState::trend_granularity`, shared with **Days**.
 #[derive(Debug, Clone)]
 pub struct TrendRow {
     pub bucket: String,
@@ -72,6 +74,7 @@ pub struct DataCache {
     pub left: Vec<LeftRow>,
     pub sessions: Vec<SessionRow>,
     pub sparkline: Vec<f64>,
+    /// Time-bucketed per-source rows; see [`TrendRow`] (field name = time-series slice, not the UI label).
     pub trend: Vec<TrendRow>,
     pub status: CacheStatus,
 }
@@ -536,7 +539,9 @@ pub fn load_sparkline(conn: &Connection, days: u32) -> Result<Vec<f64>> {
     Ok(pairs.into_iter().map(|(_, c)| c).collect())
 }
 
-/// Trend data: one query grouping by `(day, source)`; cost is split per source in Rust.
+/// Loads the provider-style time-bucket table: one SQL pass grouped by day and source, then
+/// split into per-source columns in Rust. Serves the Provider section and Repos Provider tab; bucket
+/// size follows `state.trend_granularity` (shared with the Days section).
 pub fn load_trend(
     conn: &Connection,
     state: &AppState,
