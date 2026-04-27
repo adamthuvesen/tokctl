@@ -147,6 +147,7 @@ fn event_loop(
             Event::Input(CtEvent::Key(k)) if k.kind == KeyEventKind::Press => {
                 let action = keys::map_key(&state, k, &mut last_g_press);
                 let is_yank = matches!(action, state::Action::Yank);
+                let is_yank_summary = matches!(action, state::Action::YankSummary);
                 let outcome = state.apply(action);
                 if outcome.quit {
                     break;
@@ -160,7 +161,21 @@ fn event_loop(
                 if is_yank {
                     let key = yank_key(&state, &cache);
                     if let Some(k) = key {
-                        copy_to_clipboard(&k);
+                        state.flash = Some(if copy_to_clipboard(&k) {
+                            "copied key".into()
+                        } else {
+                            "clipboard unavailable".into()
+                        });
+                    }
+                }
+                if is_yank_summary {
+                    let summary = yank_summary(&state, &cache);
+                    if let Some(summary) = summary {
+                        state.flash = Some(if copy_to_clipboard(&summary) {
+                            "copied summary".into()
+                        } else {
+                            "clipboard unavailable".into()
+                        });
                     }
                 }
             }
@@ -197,12 +212,49 @@ fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
     }
 }
 
-#[cfg(feature = "clipboard")]
-fn copy_to_clipboard(s: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(s.to_owned());
+fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String> {
+    use state::PaneId;
+    match state.focus {
+        PaneId::Left => cache
+            .left
+            .get(state.left_index.min(cache.left.len().saturating_sub(1)))
+            .map(|r| {
+                format!(
+                    "{} · {} sessions · {} tokens · {}",
+                    r.label,
+                    r.sessions,
+                    r.total_tokens,
+                    crate::tui::format::fmt_cost(r.cost)
+                )
+            }),
+        PaneId::Sessions => cache
+            .sessions
+            .get(
+                state
+                    .sessions_index
+                    .min(cache.sessions.len().saturating_sub(1)),
+            )
+            .map(|r| {
+                format!(
+                    "{}:{} · {} · {} tokens · {}",
+                    r.source.as_str(),
+                    r.session_id,
+                    r.project.clone().unwrap_or_else(|| "(unknown)".into()),
+                    r.total_tokens,
+                    crate::tui::format::fmt_cost(r.cost)
+                )
+            }),
     }
 }
 
+#[cfg(feature = "clipboard")]
+fn copy_to_clipboard(s: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(s.to_owned()))
+        .is_ok()
+}
+
 #[cfg(not(feature = "clipboard"))]
-fn copy_to_clipboard(_: &str) {}
+fn copy_to_clipboard(_: &str) -> bool {
+    false
+}

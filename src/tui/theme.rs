@@ -7,6 +7,7 @@ pub struct Palette {
     pub accent: Color,
     pub dim: Color,
     pub warn: Color,
+    pub info: Color,
     pub cost_low: Color,
     pub cost_mid: Color,
     pub cost_high: Color,
@@ -20,6 +21,7 @@ impl Default for Palette {
             accent: Color::Rgb(0x7c, 0x3a, 0xed),   // violet-600
             dim: Color::Rgb(0x6b, 0x72, 0x80),      // slate-500
             warn: Color::Rgb(0xd9, 0x77, 0x06),     // amber-600
+            info: Color::Rgb(0x08, 0x91, 0xb2),     // cyan-600
             cost_low: Color::Rgb(0x15, 0x80, 0x3d), // green-700
             cost_mid: Color::Rgb(0xca, 0x8a, 0x04), // yellow-600
             cost_high: Color::Rgb(0xdc, 0x26, 0x26), // red-600
@@ -50,6 +52,9 @@ impl Palette {
     }
     pub fn warn_text(&self) -> Style {
         Style::default().fg(self.warn)
+    }
+    pub fn info_text(&self) -> Style {
+        Style::default().fg(self.info)
     }
 
     /// Interpolate the cost gradient. `ratio` is clamped to `[0, 1]`.

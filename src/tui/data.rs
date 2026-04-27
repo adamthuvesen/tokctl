@@ -1,12 +1,16 @@
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
-use rusqlite::{params_from_iter, types::Value, Connection};
+use rusqlite::{
+    params_from_iter,
+    types::{Type, Value},
+    Connection,
+};
 
 use crate::repo::project_basename;
 use crate::store::queries::{
     repo_report, session_report, QueryFilter, RepoAggregateRow, RepoFilterSpec,
 };
-use crate::tui::state::{AppState, LeftAxis, SourceFilter, TrendGranularity};
+use crate::tui::state::{AppState, LeftAxis, Sort, SourceFilter, TrendGranularity};
 use crate::types::{AggregateRow, Source};
 use std::str::FromStr;
 
@@ -38,9 +42,29 @@ pub struct TrendRow {
     pub bucket: String,
     pub claude_cost: f64,
     pub codex_cost: f64,
+    pub cursor_cost: f64,
     pub total_tokens: u64,
     pub total_cost: f64,
     pub is_current: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheStatus {
+    pub cache_path: String,
+    pub event_count: u64,
+    pub freshness: String,
+    pub last_query: DateTime<Utc>,
+}
+
+impl Default for CacheStatus {
+    fn default() -> Self {
+        Self {
+            cache_path: crate::store::store_path().display().to_string(),
+            event_count: 0,
+            freshness: "unknown".into(),
+            last_query: Utc::now(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -49,6 +73,7 @@ pub struct DataCache {
     pub sessions: Vec<SessionRow>,
     pub sparkline: Vec<f64>,
     pub trend: Vec<TrendRow>,
+    pub status: CacheStatus,
 }
 
 impl DataCache {
@@ -64,27 +89,18 @@ impl DataCache {
     ) {
         let now = Utc::now();
         let filter = base_filter(state, now);
+        self.status = load_cache_status(conn, now).unwrap_or_else(|_| CacheStatus::default());
 
         if mask.left {
             self.left = load_left_axis(conn, state.left_axis, filter.clone()).unwrap_or_default();
-            // Repo axis: pin (no-repo) to bottom and sort by cost desc.
-            if state.left_axis == LeftAxis::Repo {
-                self.left
-                    .sort_by(|a, b| match (a.is_no_repo, b.is_no_repo) {
-                        (true, false) => std::cmp::Ordering::Greater,
-                        (false, true) => std::cmp::Ordering::Less,
-                        _ => b
-                            .cost
-                            .partial_cmp(&a.cost)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    });
-            }
+            sort_left_rows(&mut self.left, state.left_axis, state.sort);
         }
         if mask.sessions {
             let sel_key = left_selected_key(state, &self.left);
             self.sessions =
                 load_sessions_for(conn, state.left_axis, sel_key.as_deref(), filter.clone())
                     .unwrap_or_default();
+            sort_session_rows(&mut self.sessions, state.sort);
         }
         if mask.sparkline {
             self.sparkline = load_sparkline(conn, 30).unwrap_or_default();
@@ -95,6 +111,86 @@ impl DataCache {
     }
 }
 
+pub fn load_cache_status(conn: &Connection, now: DateTime<Utc>) -> Result<CacheStatus> {
+    let event_count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+    let max_mtime_ns: Option<i64> =
+        conn.query_row("SELECT MAX(mtime_ns) FROM files", [], |row| row.get(0))?;
+    let freshness = max_mtime_ns
+        .and_then(|ns| chrono::DateTime::from_timestamp(ns / 1_000_000_000, 0))
+        .map(|dt| relative_freshness(dt, now))
+        .unwrap_or_else(|| "no indexed files".to_owned());
+    Ok(CacheStatus {
+        cache_path: crate::store::store_path().display().to_string(),
+        event_count: event_count.max(0) as u64,
+        freshness,
+        last_query: now,
+    })
+}
+
+fn relative_freshness(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let delta = now.signed_duration_since(ts).num_seconds().max(0);
+    if delta < 60 {
+        "fresh <1m".into()
+    } else if delta < 3_600 {
+        format!("fresh {}m", delta / 60)
+    } else if delta < 86_400 {
+        format!("fresh {}h", delta / 3_600)
+    } else {
+        format!("fresh {}d", delta / 86_400)
+    }
+}
+
+fn sort_left_rows(rows: &mut [LeftRow], axis: LeftAxis, sort: Sort) {
+    rows.sort_by(|a, b| {
+        let ordering = match sort {
+            Sort::CostDesc => b
+                .cost
+                .partial_cmp(&a.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            Sort::CostAsc => a
+                .cost
+                .partial_cmp(&b.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            Sort::RecentDesc => {
+                if axis == LeftAxis::Day {
+                    b.key.cmp(&a.key)
+                } else {
+                    b.cost
+                        .partial_cmp(&a.cost)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+            }
+            Sort::AlphaAsc => a.label.cmp(&b.label),
+        };
+        match (axis == LeftAxis::Repo, a.is_no_repo, b.is_no_repo) {
+            (true, true, false) => std::cmp::Ordering::Greater,
+            (true, false, true) => std::cmp::Ordering::Less,
+            _ => ordering.then_with(|| a.label.cmp(&b.label)),
+        }
+    });
+}
+
+fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
+    rows.sort_by(|a, b| match sort {
+        Sort::CostDesc => b
+            .cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.latest_ts.cmp(&a.latest_ts)),
+        Sort::CostAsc => a
+            .cost
+            .partial_cmp(&b.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.latest_ts.cmp(&a.latest_ts)),
+        Sort::RecentDesc => b.latest_ts.cmp(&a.latest_ts),
+        Sort::AlphaAsc => a
+            .project
+            .as_deref()
+            .unwrap_or(&a.session_id)
+            .cmp(b.project.as_deref().unwrap_or(&b.session_id)),
+    });
+}
+
 fn base_filter(state: &AppState, now: DateTime<Utc>) -> QueryFilter {
     QueryFilter {
         source: state.source_filter.as_source(),
@@ -102,6 +198,16 @@ fn base_filter(state: &AppState, now: DateTime<Utc>) -> QueryFilter {
         until_ms: None,
         repo: None,
     }
+}
+
+fn parse_source_column(raw: String, col: usize) -> rusqlite::Result<Source> {
+    Source::from_str(&raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            col,
+            Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        )
+    })
 }
 
 fn left_selected_key(state: &AppState, left: &[LeftRow]) -> Option<String> {
@@ -154,7 +260,7 @@ pub fn load_left_axis(
 fn load_days(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
     let sql = format!(
         r#"SELECT e.day AS day,
-                  COUNT(DISTINCT e.session_id) AS sessions,
+                  COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
                   SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
              FROM events e
@@ -194,14 +300,14 @@ fn load_days(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             is_no_repo: false,
         })
     })?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
     // Reuse the same WHERE shape daily_report uses, grouped by model.
     let sql = format!(
         r#"SELECT e.model AS model,
-                  COUNT(DISTINCT e.session_id) AS sessions,
+                  COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
                   SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
              FROM events e
@@ -242,7 +348,7 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             is_no_repo: false,
         })
     })?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn load_sessions_for(
@@ -349,7 +455,7 @@ fn load_sessions_by_model(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         let src_str: String = row.get(1)?;
-        let source = Source::from_str(&src_str).unwrap_or(Source::Codex);
+        let source = parse_source_column(src_str, 1)?;
         let repo_display: Option<String> = row.get(2)?;
         let project_path: Option<String> = row.get(3)?;
         let ms: i64 = row.get(4)?;
@@ -371,7 +477,7 @@ fn load_sessions_by_model(
             cost: row.get(6)?,
         })
     })?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn day_bounds(day: &str) -> (i64, i64) {
@@ -395,7 +501,7 @@ pub fn load_sparkline(conn: &Connection, days: u32) -> Result<Vec<f64>> {
     let rows = stmt.query_map([days as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
     })?;
-    let mut pairs: Vec<(String, f64)> = rows.filter_map(std::result::Result::ok).collect();
+    let mut pairs: Vec<(String, f64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     pairs.reverse();
     Ok(pairs.into_iter().map(|(_, c)| c).collect())
 }
@@ -425,23 +531,27 @@ pub fn load_trend(
         ))
     })?;
 
-    let mut days: std::collections::BTreeMap<String, (f64, f64, u64, f64)> = Default::default();
-    for row in rows.filter_map(std::result::Result::ok) {
-        let (day, src_str, cost, tokens) = row;
-        let source = Source::from_str(&src_str).unwrap_or(Source::Codex);
+    let mut days: std::collections::BTreeMap<String, (f64, f64, f64, u64, f64)> =
+        Default::default();
+    for row in rows {
+        let (day, src_str, cost, tokens) = row?;
+        let source = parse_source_column(src_str, 1)?;
         let include_split = match state.source_filter {
             SourceFilter::All => true,
             SourceFilter::Claude => source == Source::Claude,
             SourceFilter::Codex => source == Source::Codex,
+            SourceFilter::Cursor => source == Source::Cursor,
         };
-        let entry = days.entry(day).or_insert((0.0, 0.0, 0, 0.0));
-        entry.2 += tokens;
-        entry.3 += cost;
-        if include_split {
-            match source {
-                Source::Claude => entry.0 += cost,
-                Source::Codex => entry.1 += cost,
-            }
+        if !include_split {
+            continue;
+        }
+        let entry = days.entry(day).or_insert((0.0, 0.0, 0.0, 0, 0.0));
+        entry.3 += tokens;
+        entry.4 += cost;
+        match source {
+            Source::Claude => entry.0 += cost,
+            Source::Codex => entry.1 += cost,
+            Source::Cursor => entry.2 += cost,
         }
     }
 
@@ -474,18 +584,20 @@ pub fn load_trend(
     };
 
     let mut buckets: std::collections::BTreeMap<String, TrendRow> = Default::default();
-    for (day, (cc, xc, tok, total)) in days {
+    for (day, (cc, xc, uc, tok, total)) in days {
         if let Some((label, is_cur)) = bucket_of(&day) {
             let entry = buckets.entry(label.clone()).or_insert(TrendRow {
                 bucket: label,
                 claude_cost: 0.0,
                 codex_cost: 0.0,
+                cursor_cost: 0.0,
                 total_tokens: 0,
                 total_cost: 0.0,
                 is_current: false,
             });
             entry.claude_cost += cc;
             entry.codex_cost += xc;
+            entry.cursor_cost += uc;
             entry.total_tokens += tok;
             entry.total_cost += total;
             entry.is_current = entry.is_current || is_cur;
@@ -519,6 +631,80 @@ mod tests {
             total_tokens: 0,
         };
         assert_eq!(r.session_id.chars().take(8).collect::<String>(), "abcdefgh");
+    }
+
+    #[test]
+    fn sort_changes_loaded_rows() {
+        let mut left = vec![
+            LeftRow {
+                label: "beta".into(),
+                key: "beta".into(),
+                sessions: 1,
+                total_tokens: 0,
+                cost: 2.0,
+                is_no_repo: false,
+            },
+            LeftRow {
+                label: "alpha".into(),
+                key: "alpha".into(),
+                sessions: 1,
+                total_tokens: 0,
+                cost: 1.0,
+                is_no_repo: false,
+            },
+        ];
+        sort_left_rows(&mut left, LeftAxis::Repo, Sort::AlphaAsc);
+        assert_eq!(left[0].label, "alpha");
+
+        let mut sessions = vec![
+            SessionRow {
+                session_id: "old".into(),
+                source: Source::Claude,
+                latest_ts: "2026-04-18T09:00:00Z".parse().unwrap(),
+                project: Some("old".into()),
+                cost: 10.0,
+                total_tokens: 0,
+            },
+            SessionRow {
+                session_id: "new".into(),
+                source: Source::Claude,
+                latest_ts: "2026-04-19T09:00:00Z".parse().unwrap(),
+                project: Some("new".into()),
+                cost: 1.0,
+                total_tokens: 0,
+            },
+        ];
+        sort_session_rows(&mut sessions, Sort::RecentDesc);
+        assert_eq!(sessions[0].session_id, "new");
+    }
+
+    #[test]
+    fn cache_status_reports_event_count() {
+        let mut conn = mk_conn();
+        let tx = conn.transaction().unwrap();
+        insert_events(
+            &tx,
+            &[EventRow {
+                file_path: "/x".into(),
+                source: Source::Claude,
+                ts: 1,
+                day: "2026-04-22".into(),
+                month: "2026-04".into(),
+                session_id: "s".into(),
+                project_path: None,
+                repo: None,
+                model: "claude-sonnet-4-6".into(),
+                input: 1,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cost_usd: 0.0,
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let status = load_cache_status(&conn, Utc::now()).unwrap();
+        assert_eq!(status.event_count, 1);
     }
 
     fn mk_conn() -> Connection {
@@ -592,6 +778,7 @@ mod tests {
             .expect("nov bucket");
         assert!((nov.claude_cost - 1.0).abs() < 1e-9);
         assert!((nov.codex_cost - 2.0).abs() < 1e-9);
+        assert_eq!(nov.cursor_cost, 0.0);
         let dec = rows
             .iter()
             .find(|r| r.bucket.contains("12"))
@@ -634,6 +821,9 @@ mod tests {
         let nov = &rows[0];
         assert!((nov.claude_cost - 1.0).abs() < 1e-9);
         assert_eq!(nov.codex_cost, 0.0);
+        assert_eq!(nov.cursor_cost, 0.0);
+        assert!((nov.total_cost - 1.0).abs() < 1e-9);
+        assert_eq!(nov.total_tokens, 20);
     }
 
     #[test]

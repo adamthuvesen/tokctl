@@ -86,6 +86,7 @@ pub enum SourceFilter {
     All,
     Claude,
     Codex,
+    Cursor,
 }
 
 impl SourceFilter {
@@ -94,6 +95,7 @@ impl SourceFilter {
             SourceFilter::All => "all",
             SourceFilter::Claude => "claude",
             SourceFilter::Codex => "codex",
+            SourceFilter::Cursor => "cursor",
         }
     }
     pub fn as_source(self) -> Option<crate::types::Source> {
@@ -101,6 +103,7 @@ impl SourceFilter {
             SourceFilter::All => None,
             SourceFilter::Claude => Some(crate::types::Source::Claude),
             SourceFilter::Codex => Some(crate::types::Source::Codex),
+            SourceFilter::Cursor => Some(crate::types::Source::Cursor),
         }
     }
 }
@@ -121,6 +124,15 @@ impl Sort {
             Sort::CostAsc => Sort::RecentDesc,
             Sort::RecentDesc => Sort::AlphaAsc,
             Sort::AlphaAsc => Sort::CostDesc,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sort::CostDesc => "cost↓",
+            Sort::CostAsc => "cost↑",
+            Sort::RecentDesc => "recent↓",
+            Sort::AlphaAsc => "alpha↑",
         }
     }
 }
@@ -195,6 +207,7 @@ pub struct AppState {
     pub trend_granularity: TrendGranularity,
     pub trend_open: bool,
     pub help_open: bool,
+    pub detail_open: bool,
     pub focus: PaneId,
     /// Persisted pre-trend focus so Esc/t restores exactly.
     pub focus_before_trend: PaneId,
@@ -218,6 +231,7 @@ impl Default for AppState {
             trend_granularity: TrendGranularity::Monthly,
             trend_open: false,
             help_open: false,
+            detail_open: false,
             focus: PaneId::Left,
             focus_before_trend: PaneId::Left,
             selected: SelectedKeys::default(),
@@ -278,6 +292,7 @@ pub enum Action {
     CycleAxis,
     CycleSort,
     ToggleHelp,
+    ToggleDetail,
     ToggleTrend,
     SetWindow(TimeWindow),
     SetSource(SourceFilter),
@@ -289,6 +304,7 @@ pub enum Action {
     FilterCommit,
     FilterCancel,
     Yank,
+    YankSummary,
     None,
 }
 
@@ -331,6 +347,8 @@ impl AppState {
                 if self.filter.active {
                     self.filter.active = false;
                     self.filter.query.clear();
+                } else if self.detail_open {
+                    self.detail_open = false;
                 } else if self.help_open {
                     self.help_open = false;
                 } else if self.trend_open {
@@ -360,6 +378,11 @@ impl AppState {
             }
             Action::ToggleHelp => {
                 self.help_open = !self.help_open;
+            }
+            Action::ToggleDetail => {
+                if !self.trend_open && !self.help_open {
+                    self.detail_open = !self.detail_open;
+                }
             }
             Action::ToggleTrend => {
                 if self.trend_open {
@@ -424,7 +447,10 @@ impl AppState {
                 self.filter.query.clear();
             }
             Action::Yank => {
-                self.flash = Some("yanked".into());
+                // event loop performs clipboard IO and sets flash.
+            }
+            Action::YankSummary => {
+                // event loop performs clipboard IO and sets flash.
             }
         }
 
@@ -595,5 +621,18 @@ mod tests {
         assert_eq!(s.left_axis, LeftAxis::Day);
         assert!(out.dirty);
         assert!(out.needs_refresh);
+    }
+
+    #[test]
+    fn detail_toggle_and_pop_preserve_selection() {
+        let mut s = AppState {
+            left_index: 3,
+            ..AppState::default()
+        };
+        s.apply(Action::ToggleDetail);
+        assert!(s.detail_open);
+        s.apply(Action::Pop);
+        assert!(!s.detail_open);
+        assert_eq!(s.left_index, 3);
     }
 }

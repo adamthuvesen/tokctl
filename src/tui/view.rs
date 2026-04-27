@@ -57,6 +57,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
         draw_help(frame, area, &palette);
     }
 
+    if state.detail_open {
+        draw_detail(frame, area, state, cache, &palette);
+    }
+
     if state.filter.active {
         draw_filter_prompt(frame, area, state, &palette);
     }
@@ -74,9 +78,6 @@ fn draw_header(
     let total_tokens: u64 = cache.sessions.iter().map(|r| r.total_tokens).sum();
 
     let window = state.time_window.as_str();
-    let source = state.source_filter.as_str();
-    let axis = state.left_axis.chip();
-
     let line1 = Line::from(vec![
         Span::styled("tokctl ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(clock, palette.dim_text()),
@@ -93,12 +94,71 @@ fn draw_header(
         Span::raw("  "),
         Span::styled("[?]", palette.accent_text()),
     ]);
-    let line2 = Line::from(vec![
-        Span::styled(format!("axis:{axis} "), palette.dim_text()),
-        Span::styled(format!("source:{source} "), palette.dim_text()),
-    ]);
+    let line2 = Line::from(Span::styled(
+        context_text(state, cache, area.width.saturating_sub(1) as usize),
+        palette.dim_text(),
+    ));
     let p = Paragraph::new(vec![line1, line2]);
     frame.render_widget(p, area);
+}
+
+fn context_text(state: &AppState, cache: &DataCache, width: usize) -> String {
+    let selection = selected_context(state, cache);
+    let filter = if state.filter.query.is_empty() {
+        String::new()
+    } else {
+        format!(" filter:{}", state.filter.query)
+    };
+    truncate_chars(
+        &format!(
+            "axis:{} · {} · window:{} · source:{} · sort:{}{}",
+            state.left_axis.chip(),
+            selection,
+            state.time_window.as_str(),
+            state.source_filter.as_str(),
+            state.sort.as_str(),
+            filter
+        ),
+        width,
+    )
+}
+
+fn selected_context(state: &AppState, cache: &DataCache) -> String {
+    let left = cache
+        .left
+        .get(state.left_index.min(cache.left.len().saturating_sub(1)))
+        .map(|row| row.label.as_str())
+        .unwrap_or("none");
+    let session = cache
+        .sessions
+        .get(
+            state
+                .sessions_index
+                .min(cache.sessions.len().saturating_sub(1)),
+        )
+        .map(|row| {
+            row.project
+                .as_deref()
+                .map(str::to_owned)
+                .unwrap_or_else(|| row.session_id.chars().take(8).collect())
+        });
+    match session {
+        Some(session) => format!("{left} > {session}"),
+        None => left.to_owned(),
+    }
+}
+
+fn truncate_chars(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".into();
+    }
+    let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn draw_panes(
@@ -335,11 +395,35 @@ fn draw_footer(
         ),
         Span::raw("  "),
         Span::styled(
-            "j/k move  ↵ drill  h/l pane  / filter  Tab axis  t trend  T/w/m/y/a window  s sort  q quit",
+            state
+                .flash
+                .as_ref()
+                .map(|flash| format!("{flash}  "))
+                .unwrap_or_default(),
+            palette.accent_text(),
+        ),
+        Span::styled(status_text(cache), palette.dim_text()),
+        Span::raw("  "),
+        Span::styled(
+            "j/k move  ↵ drill  h/l pane  / filter  Tab axis  t trend  T/w/m/z/a window  i detail  y/Y copy  q quit",
             palette.dim_text(),
         ),
     ]);
     frame.render_widget(Paragraph::new(legend), rows[1]);
+}
+
+fn status_text(cache: &DataCache) -> String {
+    let cache_name = std::path::Path::new(&cache.status.cache_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache.db");
+    format!(
+        "{} · {} events · {} · queried {}",
+        cache_name,
+        fmt_num(cache.status.event_count),
+        cache.status.freshness,
+        relative_time(cache.status.last_query, Utc::now())
+    )
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
@@ -363,14 +447,87 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
         Line::from("  Tab                cycle left-pane axis"),
         Line::from("  s                  cycle sort"),
         Line::from("  t                  trend overlay (d/w/m/y inside)"),
-        Line::from("  T w m y a          window: today / week / month / year / all"),
-        Line::from("  1 2 3              source: all / claude / codex"),
+        Line::from("  T w m z a          window: today / week / month / year / all"),
+        Line::from("  i                  row details"),
+        Line::from("  1 2 3 4            source: all / claude / codex / cursor"),
         Line::from("  r                  refresh (no ingest)"),
-        Line::from("  y                  yank key to clipboard"),
+        Line::from("  y / Y              yank key / summary to clipboard"),
         Line::from("  ?                  toggle this help"),
         Line::from("  q / Ctrl-c         quit"),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    cache: &DataCache,
+    palette: &Palette,
+) {
+    let detail_area = centered(area, 76, 14);
+    frame.render_widget(Clear, detail_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(palette.active_border())
+        .title(Span::styled(
+            " DETAILS · esc/i to close ",
+            palette.active_border(),
+        ));
+    let inner = block.inner(detail_area);
+    frame.render_widget(block, detail_area);
+    let lines = detail_lines(state, cache)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
+    match state.focus {
+        PaneId::Left => cache
+            .left
+            .get(state.left_index.min(cache.left.len().saturating_sub(1)))
+            .map(|row| {
+                vec![
+                    format!("name: {}", row.label),
+                    format!("key: {}", row.key),
+                    format!("sessions: {}", fmt_num(row.sessions)),
+                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!("cost: {}", fmt_cost(row.cost)),
+                    "copy: y key, Y summary".into(),
+                ]
+            })
+            .unwrap_or_else(|| vec!["no row selected".into()]),
+        PaneId::Sessions => cache
+            .sessions
+            .get(
+                state
+                    .sessions_index
+                    .min(cache.sessions.len().saturating_sub(1)),
+            )
+            .map(|row| {
+                vec![
+                    format!("session: {}", row.session_id),
+                    format!("source: {}", row.source.as_str()),
+                    format!(
+                        "project: {}",
+                        row.project.clone().unwrap_or_else(|| "(unknown)".into())
+                    ),
+                    format!(
+                        "latest: {}",
+                        row.latest_ts
+                            .with_timezone(&Local)
+                            .format("%Y-%m-%d %H:%M:%S")
+                    ),
+                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!("cost: {}", fmt_cost(row.cost)),
+                    "copy: y key, Y summary".into(),
+                ]
+            })
+            .unwrap_or_else(|| vec!["no session selected".into()]),
+    }
 }
 
 fn draw_filter_prompt(frame: &mut Frame<'_>, area: Rect, state: &AppState, palette: &Palette) {
@@ -451,6 +608,7 @@ fn draw_trend_overlay(
         state.trend_granularity.bucket_header(),
         "claude",
         "codex",
+        "cursor",
         "tokens",
         "total",
         "proportion",
@@ -463,13 +621,14 @@ fn draw_trend_overlay(
         .collect();
 
     // Separator + TOTAL row.
-    let (cc_sum, xc_sum, tok_sum, tot_sum): (f64, f64, u64, f64) =
-        rows.iter().fold((0.0, 0.0, 0u64, 0.0), |acc, r| {
+    let (cc_sum, xc_sum, uc_sum, tok_sum, tot_sum): (f64, f64, f64, u64, f64) =
+        rows.iter().fold((0.0, 0.0, 0.0, 0u64, 0.0), |acc, r| {
             (
                 acc.0 + r.claude_cost,
                 acc.1 + r.codex_cost,
-                acc.2 + r.total_tokens,
-                acc.3 + r.total_cost,
+                acc.2 + r.cursor_cost,
+                acc.3 + r.total_tokens,
+                acc.4 + r.total_cost,
             )
         });
     let rule = "─".repeat(inner.width.saturating_sub(2) as usize);
@@ -480,21 +639,37 @@ fn draw_trend_overlay(
         Cell::from(""),
         Cell::from(""),
         Cell::from(""),
+        Cell::from(""),
     ]));
-    let claude_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Codex) {
+    let claude_cell = if matches!(
+        state.source_filter,
+        crate::tui::state::SourceFilter::Codex | crate::tui::state::SourceFilter::Cursor
+    ) {
         Cell::from("—").style(palette.dim_text())
     } else {
         Cell::from(fmt_cost(cc_sum)).style(palette.accent_text())
     };
-    let codex_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Claude) {
+    let codex_cell = if matches!(
+        state.source_filter,
+        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Cursor
+    ) {
         Cell::from("—").style(palette.dim_text())
     } else {
         Cell::from(fmt_cost(xc_sum)).style(palette.warn_text())
+    };
+    let cursor_cell = if matches!(
+        state.source_filter,
+        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Codex
+    ) {
+        Cell::from("—").style(palette.dim_text())
+    } else {
+        Cell::from(fmt_cost(uc_sum)).style(palette.info_text())
     };
     body.push(Row::new(vec![
         Cell::from("TOTAL").style(Style::default().add_modifier(Modifier::BOLD)),
         claude_cell,
         codex_cell,
+        cursor_cell,
         Cell::from(fmt_num(tok_sum)).style(palette.dim_text()),
         Cell::from(fmt_cost(tot_sum)).style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from(""),
@@ -504,6 +679,7 @@ fn draw_trend_overlay(
         body,
         [
             Constraint::Length(14),
+            Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(10),
@@ -531,21 +707,36 @@ fn trend_row<'a>(
     };
     let total_color = palette.cost_color(ratio);
 
-    let claude_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Codex) {
+    let claude_cell = if matches!(
+        state.source_filter,
+        crate::tui::state::SourceFilter::Codex | crate::tui::state::SourceFilter::Cursor
+    ) {
         Cell::from("—").style(palette.dim_text())
     } else {
         Cell::from(fmt_cost(r.claude_cost)).style(palette.accent_text())
     };
-    let codex_cell = if matches!(state.source_filter, crate::tui::state::SourceFilter::Claude) {
+    let codex_cell = if matches!(
+        state.source_filter,
+        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Cursor
+    ) {
         Cell::from("—").style(palette.dim_text())
     } else {
         Cell::from(fmt_cost(r.codex_cost)).style(palette.warn_text())
+    };
+    let cursor_cell = if matches!(
+        state.source_filter,
+        crate::tui::state::SourceFilter::Claude | crate::tui::state::SourceFilter::Codex
+    ) {
+        Cell::from("—").style(palette.dim_text())
+    } else {
+        Cell::from(fmt_cost(r.cursor_cost)).style(palette.info_text())
     };
 
     Row::new(vec![
         Cell::from(bucket_label),
         claude_cell,
         codex_cell,
+        cursor_cell,
         Cell::from(fmt_tokens_short(r.total_tokens)).style(palette.dim_text()),
         Cell::from(fmt_cost(r.total_cost)).style(Style::default().fg(total_color)),
         Cell::from(bar),
@@ -626,4 +817,77 @@ fn apply_filter_sessions(rows: &[SessionRow], state: &AppState) -> (Vec<SessionR
 
 fn should_filter(state: &AppState, pane: PaneId) -> bool {
     !state.filter.query.is_empty() && state.focus == pane
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::data::{CacheStatus, DataCache};
+    use crate::tui::state::{Sort, SourceFilter, TimeWindow};
+
+    fn cache() -> DataCache {
+        DataCache {
+            left: vec![LeftRow {
+                label: "tokctl".into(),
+                key: "/dev/tokctl".into(),
+                sessions: 2,
+                total_tokens: 1234,
+                cost: 4.2,
+                is_no_repo: false,
+            }],
+            sessions: vec![SessionRow {
+                session_id: "session-abcdef".into(),
+                source: crate::types::Source::Claude,
+                latest_ts: Utc::now(),
+                project: Some("tokctl".into()),
+                cost: 1.2,
+                total_tokens: 500,
+            }],
+            status: CacheStatus {
+                cache_path: "/tmp/cache.db".into(),
+                event_count: 7,
+                freshness: "fresh 1m".into(),
+                last_query: Utc::now(),
+            },
+            ..DataCache::default()
+        }
+    }
+
+    #[test]
+    fn context_includes_filters_and_breadcrumb() {
+        let state = AppState {
+            source_filter: SourceFilter::Cursor,
+            time_window: TimeWindow::Month,
+            sort: Sort::RecentDesc,
+            ..AppState::default()
+        };
+        let text = context_text(&state, &cache(), 120);
+        assert!(text.contains("source:cursor"));
+        assert!(text.contains("sort:recent"));
+        assert!(text.contains("tokctl > tokctl"));
+    }
+
+    #[test]
+    fn context_truncates_to_width() {
+        let text = context_text(&AppState::default(), &cache(), 10);
+        assert!(text.chars().count() <= 10);
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn status_text_reports_cache_and_events() {
+        let text = status_text(&cache());
+        assert!(text.contains("cache.db"));
+        assert!(text.contains("7 events"));
+    }
+
+    #[test]
+    fn detail_lines_include_session_identity() {
+        let state = AppState {
+            focus: PaneId::Sessions,
+            ..AppState::default()
+        };
+        let lines = detail_lines(&state, &cache());
+        assert!(lines.iter().any(|line| line.contains("session-abcdef")));
+    }
 }
