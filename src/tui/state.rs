@@ -18,12 +18,13 @@ pub enum Section {
 }
 
 impl Section {
+    /// Sidebar top-to-bottom order.
     pub const ALL: [Section; 5] = [
-        Section::Repos,
         Section::Days,
         Section::Models,
-        Section::Sessions,
         Section::Provider,
+        Section::Repos,
+        Section::Sessions,
     ];
 
     pub fn next(self) -> Self {
@@ -262,12 +263,9 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        let sidebar_index = Section::ALL
-            .iter()
-            .position(|s| *s == Section::Repos)
-            .unwrap_or(0);
+        let sidebar_index = 0;
         Self {
-            current_section: Section::Repos,
+            current_section: Section::Days,
             time_window: TimeWindow::Month,
             source_filter: SourceFilter::All,
             sort: Sort::CostDesc,
@@ -701,10 +699,7 @@ pub fn load(path: &Path) -> AppState {
         return AppState::default();
     }
     let mut s = AppState::default();
-    if let Some(v) = p.current_section {
-        s.current_section = v;
-        s.sidebar_index = Section::ALL.iter().position(|x| *x == v).unwrap_or(0);
-    }
+    // Always start on Days regardless of persisted section.
     if let Some(v) = p.time_window {
         s.time_window = v;
     }
@@ -762,13 +757,13 @@ mod tests {
 
     #[test]
     fn section_next_wraps() {
-        assert_eq!(Section::Repos.next(), Section::Days);
+        assert_eq!(Section::Sessions.next(), Section::Days);
         assert_eq!(Section::Provider.next(), Section::Repos);
     }
 
     #[test]
     fn section_prev_wraps() {
-        assert_eq!(Section::Days.prev(), Section::Repos);
+        assert_eq!(Section::Days.prev(), Section::Sessions);
         assert_eq!(Section::Repos.prev(), Section::Provider);
     }
 
@@ -789,14 +784,21 @@ mod tests {
     fn next_section_action_changes_section_and_marks_dirty() {
         let mut s = AppState::default();
         let out = s.apply(Action::NextSection);
-        assert_eq!(s.current_section, Section::Days);
+        assert_eq!(s.current_section, Section::Models);
         assert!(out.dirty);
         assert!(out.needs_refresh);
     }
 
     #[test]
     fn cycle_tab_advances_repos_tab() {
-        let mut s = AppState::default();
+        let mut s = AppState {
+            current_section: Section::Repos,
+            sidebar_index: Section::ALL
+                .iter()
+                .position(|s| *s == Section::Repos)
+                .unwrap_or(0),
+            ..AppState::default()
+        };
         assert_eq!(s.active_tab_index(), 0);
         let out = s.apply(Action::CycleTab);
         assert_eq!(s.active_tab_index(), 1);
@@ -861,9 +863,9 @@ mod tests {
             ..AppState::default()
         };
         s.apply(Action::MoveDown);
-        assert_eq!(s.current_section, Section::Days);
+        assert_eq!(s.current_section, Section::Models);
         s.apply(Action::MoveUp);
-        assert_eq!(s.current_section, Section::Repos);
+        assert_eq!(s.current_section, Section::Days);
     }
 
     #[test]
@@ -873,7 +875,7 @@ mod tests {
             ..AppState::default()
         };
         let out = s.apply(Action::MoveDown);
-        assert_eq!(s.current_section, Section::Days);
+        assert_eq!(s.current_section, Section::Models);
         assert!(out.needs_refresh, "section change must trigger refresh");
         assert!(out.refresh.left, "left/main pane data must refetch");
         assert!(out.refresh.sessions);
@@ -887,7 +889,7 @@ mod tests {
             ..AppState::default()
         };
         let out = s.apply(Action::Bottom);
-        assert_eq!(s.current_section, Section::Provider);
+        assert_eq!(s.current_section, Section::Sessions);
         assert!(out.needs_refresh);
         assert!(out.refresh.left);
         assert!(out.refresh.trend);
