@@ -145,7 +145,7 @@ fn run_bucket_query(
     label: SourceLabel,
 ) -> Result<Vec<AggregateRow>> {
     let params = build_params(filter);
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         Ok(AggregateRow {
             key: row.get(0)?,
@@ -187,7 +187,7 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
         repo = repo_clause(&filter),
     );
     let params = build_params(&filter);
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         let session_id: String = row.get(0)?;
         let src_str: String = row.get(1)?;
@@ -270,7 +270,7 @@ pub fn repo_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<RepoAgg
         repo = repo_clause(&filter),
     );
     let params = build_params(&filter);
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         Ok(RepoAggregateRow {
             key: row.get(0)?,
@@ -304,7 +304,7 @@ pub fn resolve_repo_filter(conn: &Connection, name: &str) -> Result<RepoFilterSp
         return Ok(RepoFilterSpec::KeyPrefix(name.to_owned()));
     }
 
-    let mut stmt = conn.prepare("SELECT key FROM repos WHERE display_name = ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT key FROM repos WHERE display_name = ?1")?;
     let keys: Vec<String> = stmt
         .query_map([name], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
