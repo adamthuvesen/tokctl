@@ -8,14 +8,16 @@ use ratatui::{
     style::{Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState,
+    },
     Frame,
 };
 
-use crate::tui::data::{DataCache, LeftRow, SessionRow, TrendRow};
+use crate::tui::data::{DataCache, EventRow, LeftRow, SessionRow, TrendRow};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
 use crate::tui::shell::{draw_main_frame, draw_sidebar};
-use crate::tui::state::{AppState, Focus, Section, SourceFilter};
+use crate::tui::state::{AppState, DrillKind, Focus, Section, SourceFilter};
 use crate::tui::theme::Palette;
 use crate::tui::MIN_WIDTH;
 
@@ -49,7 +51,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
 
     // Cap to available space; reserve 2 for header + 2 for footer.
     let body_avail = area.height.saturating_sub(4);
-    let body_height = panel_h.min(body_avail).max(8);
+    // Sidebar needs 3 header rows + (n_sections - 1) * 2 + 1 per item = 12 rows
+    // to show all sections without truncation. Panel content may be shorter.
+    let sidebar_min_h = 3 + (Section::ALL.len() as u16 - 1) * 2 + 1;
+    let body_height = panel_h.min(body_avail).max(sidebar_min_h);
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -175,10 +180,19 @@ fn truncate_chars(value: &str, width: usize) -> String {
 fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16, u16) {
     let bar_w = BAR_WIDTH as u16 + 2;
 
-    // Drilled view always renders the sessions table with a 1-row breadcrumb.
-    if state.drill.is_some() {
-        let cells = [12, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
-        let rows = cache.sessions.len() as u16;
+    // Drilled view always renders with a 1-row breadcrumb; pick columns
+    // based on which kind of drill is on top of the stack.
+    if let Some(d) = state.deepest_drill() {
+        let cells: Vec<u16> = match d.kind {
+            DrillKind::Sessions { .. } => {
+                vec![12, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w]
+            }
+            DrillKind::Events { .. } => events_column_widths(bar_w),
+        };
+        let rows = match d.kind {
+            DrillKind::Sessions { .. } => cache.sessions.len() as u16,
+            DrillKind::Events { .. } => cache.events.len() as u16,
+        };
         return chrome((table_width(&cells), 1 + 1 + rows.max(1)));
     }
 
@@ -203,6 +217,13 @@ fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16, u16) {
     };
 
     chrome((cols, content_h))
+}
+
+/// Column widths used by the per-turn events table. Mirrors the order in
+/// `draw_events_table` so the panel can size itself consistently.
+fn events_column_widths(bar_w: u16) -> Vec<u16> {
+    // when · model · in · out · cache_r · cache_w · cost · proportion
+    vec![10, 16, 7, 7, 9, 9, 10, bar_w]
 }
 
 fn left_panel_size(state: &AppState, cache: &DataCache) -> (u16, u16) {
@@ -259,17 +280,11 @@ fn draw_main(
 ) {
     let focused = state.focus == Focus::Main;
 
-    // Drilled view supersedes the section's normal renderer.
-    if let Some(drill) = &state.drill {
-        let inner = draw_main_frame(
-            frame,
-            area,
-            &format!("{} › {}", drill.section.title(), drill.label),
-            &[],
-            0,
-            focused,
-            palette,
-        );
+    // Drilled view supersedes the section's normal renderer. Title is the
+    // cumulative breadcrumb across every level on the stack.
+    if state.drill_active() {
+        let title = breadcrumb_title(state);
+        let inner = draw_main_frame(frame, area, &title, &[], 0, focused, palette);
         draw_drill(frame, pad_top(inner, 1), state, cache, palette);
         return;
     }
@@ -322,7 +337,20 @@ fn main_pane_title(state: &AppState) -> String {
     }
 }
 
-// -- Drill renderer ---------------------------------------------------------
+// -- Breadcrumb / drill renderer --------------------------------------------
+
+/// Build the cumulative breadcrumb title for the bordered panel:
+/// `SECTION › label_1 [› label_2]`. Labels are kept short by the caller
+/// (session ids are pre-truncated to ~8 chars). Long repo/day labels still
+/// fit in practice; we don't ellipsize here, the panel border will clip.
+fn breadcrumb_title(state: &AppState) -> String {
+    let mut out = state.current_section.title().to_owned();
+    for d in &state.drill_stack {
+        out.push_str(" › ");
+        out.push_str(&d.label);
+    }
+    out
+}
 
 fn draw_drill(
     frame: &mut Frame<'_>,
@@ -339,21 +367,35 @@ fn draw_drill(
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
-    // Breadcrumb hint row.
-    let drill = state.drill.as_ref().unwrap();
-    let breadcrumb = Line::from(vec![
-        Span::styled(drill.section.title(), palette.dim_text()),
-        Span::styled(" › ", palette.dim_text()),
-        Span::styled(
-            drill.label.clone(),
+    // Breadcrumb hint row inside the panel — drives the eye to the back
+    // affordance even when the title is long.
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        state.current_section.title(),
+        palette.dim_text(),
+    )];
+    for d in &state.drill_stack {
+        spans.push(Span::styled(" › ", palette.dim_text()));
+        spans.push(Span::styled(
+            d.label.clone(),
             Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled("[esc/← back]", palette.dim_text()),
-    ]);
-    frame.render_widget(Paragraph::new(breadcrumb), rows[0]);
+        ));
+    }
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled("[esc/← back]", palette.dim_text()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
-    draw_sessions_table(frame, rows[1], state, &cache.sessions, palette);
+    match state
+        .deepest_drill()
+        .map(|d| d.kind)
+        .expect("drill_active true => deepest_drill some")
+    {
+        DrillKind::Sessions { .. } => {
+            draw_sessions_table(frame, rows[1], state, &cache.sessions, palette);
+        }
+        DrillKind::Events { .. } => {
+            draw_events_table(frame, rows[1], state, &cache.events, palette);
+        }
+    }
 }
 
 // -- Section: left-row table (Days, Models, Sessions, Repos Costs tab) ------------
@@ -389,13 +431,15 @@ fn draw_left_table(
 
     // For Sessions section we render a different (richer) layout.
     if state.current_section == Section::Sessions {
-        // Reuse the sessions-row table by adapting LeftRow → SessionRow-ish.
+        // Adapt LeftRow → SessionRow using the real ts/source threaded
+        // through from session_report (latest_ts/source on LeftRow).
+        let now_fallback = Utc::now();
         let sess_rows: Vec<SessionRow> = rows
             .iter()
             .map(|r| SessionRow {
                 session_id: r.key.clone(),
-                source: crate::types::Source::Claude,
-                latest_ts: Utc::now(),
+                source: r.source.unwrap_or(crate::types::Source::Claude),
+                latest_ts: r.latest_ts.unwrap_or(now_fallback),
                 project: Some(r.label.clone()),
                 cost: r.cost,
                 total_tokens: r.total_tokens,
@@ -469,7 +513,9 @@ fn draw_left_compact(
         Row::new(vec!["name", "     tok", "      cost", "proportion"]).style(palette.dim_text()),
     );
 
-    frame.render_widget(table, inner);
+    let mut ts = TableState::default();
+    ts.select(Some(selected));
+    frame.render_stateful_widget(table, inner, &mut ts);
 }
 
 fn draw_left_expanded(
@@ -538,7 +584,9 @@ fn draw_left_expanded(
         .style(palette.dim_text()),
     );
 
-    frame.render_widget(table, inner);
+    let mut ts = TableState::default();
+    ts.select(Some(selected));
+    frame.render_stateful_widget(table, inner, &mut ts);
 }
 
 fn label_cell(label: String, is_selected: bool, palette: &Palette) -> Cell<'static> {
@@ -652,7 +700,122 @@ fn draw_sessions_table(
         .style(palette.dim_text()),
     );
 
-    frame.render_widget(table, area);
+    let mut ts = TableState::default();
+    ts.select(Some(selected));
+    frame.render_stateful_widget(table, area, &mut ts);
+}
+
+// -- Events table (deepest drill) -------------------------------------------
+
+fn draw_events_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    rows: &[EventRow],
+    palette: &Palette,
+) {
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no events in this scope",
+                palette.dim_text(),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let max_cost = rows.iter().map(|r| r.cost).fold(0f64, f64::max).max(0.0001);
+    let selected = state.current_index().min(rows.len().saturating_sub(1));
+    let active = state.focus == Focus::Main;
+
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let is_selected = i == selected && active;
+            let cost_style = if is_selected {
+                palette.selected_row()
+            } else {
+                Style::default().fg(palette.cost_color(r.cost / max_cost))
+            };
+            let when = r.ts.with_timezone(&Local).format("%H:%M:%S").to_string();
+            let when_cell = if is_selected {
+                Cell::from(Line::from(vec![
+                    Span::styled("▌ ", palette.accent_text()),
+                    Span::raw(when),
+                ]))
+            } else {
+                Cell::from(when)
+            };
+            let bar_cell = Cell::from(render_bar(
+                (r.cost / max_cost).clamp(0.0, 1.0),
+                BAR_WIDTH,
+                palette,
+            ));
+            let mut row = Row::new(vec![
+                when_cell,
+                Cell::from(short_model(&r.model)),
+                Cell::from(format!("{:>7}", fmt_tokens_short(r.input))),
+                Cell::from(format!("{:>7}", fmt_tokens_short(r.output))),
+                Cell::from(format!("{:>9}", fmt_tokens_short(r.cache_read))),
+                Cell::from(format!("{:>9}", fmt_tokens_short(r.cache_write))),
+                Cell::from(format!("{:>10}", fmt_cost(r.cost))).style(cost_style),
+                bar_cell,
+            ]);
+            if is_selected {
+                row = row.style(palette.selected_row());
+            }
+            row
+        })
+        .collect();
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Min(BAR_WIDTH as u16 + 2),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "when",
+            "model",
+            "     in",
+            "    out",
+            "  cache_r",
+            "  cache_w",
+            "      cost",
+            "proportion",
+        ])
+        .style(palette.dim_text()),
+    );
+
+    // Stateful render so the viewport scrolls to keep the cursor visible
+    // when the session has more turns than fit on screen.
+    let mut ts = TableState::default();
+    ts.select(Some(selected));
+    frame.render_stateful_widget(table, area, &mut ts);
+}
+
+/// Trim a model identifier to fit the events table's narrow `model` column.
+/// Common forms (`claude-sonnet-4-6`, `gpt-5.4`) already fit; very long
+/// custom IDs get tail-truncated with an ellipsis.
+fn short_model(model: &str) -> String {
+    const W: usize = 16;
+    let count = model.chars().count();
+    if count <= W {
+        return model.to_owned();
+    }
+    let mut s: String = model.chars().take(W - 1).collect();
+    s.push('…');
+    s
 }
 
 // -- Trend table ------------------------------------------------------------
@@ -908,16 +1071,26 @@ fn draw_footer(
     // Three semantic groups, separated by `│`. No brackets around keys.
     let nav: &[(&str, &str)] = &[("j/k", "move"), ("[/]", "section")];
     let mut view_group: Vec<(&str, &str)> = Vec::new();
-    if !state.current_section.tabs().is_empty() {
+    let in_events_drill = matches!(
+        state.deepest_drill().map(|d| d.kind),
+        Some(DrillKind::Events { .. })
+    );
+    if !state.current_section.tabs().is_empty() && !state.drill_active() {
         view_group.push(("tab", "tabs"));
     }
-    if matches!(state.current_section, Section::Provider | Section::Days) {
+    if matches!(state.current_section, Section::Provider | Section::Days) && !state.drill_active() {
         view_group.push(("d/w/m/y", "bucket"));
     }
-    if state.current_section.supports_drill() {
+    if in_events_drill {
+        view_group.push(("s", "sort"));
+        view_group.push(("i", "detail"));
+        view_group.push(("y/Y", "yank"));
+    } else if state.can_push_drill() {
         view_group.push(("↵", "drill"));
     }
-    view_group.push(("/", "filter"));
+    if !in_events_drill {
+        view_group.push(("/", "filter"));
+    }
     let system: &[(&str, &str)] = &[("?", "help"), ("q", "quit")];
 
     push_hint_group(&mut spans, nav, palette);
@@ -975,8 +1148,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
         hint("[ / ]", "previous / next section"),
         hint("h  ←", "pop drill, then focus sidebar"),
         hint("l  →", "focus main"),
-        hint("Enter", "drill (sidebar→main; main→push drill)"),
-        hint("Esc / ←", "cancel filter, close overlay, pop drill"),
+        hint(
+            "Enter",
+            "drill (push one level: section → sessions → events)",
+        ),
+        hint(
+            "Esc / ←",
+            "pop drill (one level), close overlay, cancel filter",
+        ),
         hint("gg / G", "top / bottom"),
         hint("Ctrl-d/u", "half page down / up"),
         blank.clone(),
@@ -1030,34 +1209,61 @@ fn draw_detail(
 }
 
 fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
-    if state.drill.is_some() {
-        return cache
-            .sessions
-            .get(
-                state
-                    .drill_index
-                    .min(cache.sessions.len().saturating_sub(1)),
-            )
-            .map(|row| {
-                vec![
-                    format!("session: {}", row.session_id),
-                    format!("source: {}", row.source.as_str()),
-                    format!(
-                        "project: {}",
-                        row.project.clone().unwrap_or_else(|| "(unknown)".into())
-                    ),
-                    format!(
-                        "latest: {}",
-                        row.latest_ts
-                            .with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M:%S")
-                    ),
-                    format!("tokens: {}", fmt_num(row.total_tokens)),
-                    format!("cost: {}", fmt_cost(row.cost)),
-                    "copy: y key, Y summary".into(),
-                ]
-            })
-            .unwrap_or_else(|| vec!["no session selected".into()]);
+    if let Some(d) = state.deepest_drill() {
+        return match d.kind {
+            DrillKind::Sessions { .. } => cache
+                .sessions
+                .get(
+                    state
+                        .current_index()
+                        .min(cache.sessions.len().saturating_sub(1)),
+                )
+                .map(|row| {
+                    vec![
+                        format!("session: {}", row.session_id),
+                        format!("source: {}", row.source.as_str()),
+                        format!(
+                            "project: {}",
+                            row.project.clone().unwrap_or_else(|| "(unknown)".into())
+                        ),
+                        format!(
+                            "latest: {}",
+                            row.latest_ts
+                                .with_timezone(&Local)
+                                .format("%Y-%m-%d %H:%M:%S")
+                        ),
+                        format!("tokens: {}", fmt_num(row.total_tokens)),
+                        format!("cost: {}", fmt_cost(row.cost)),
+                        "copy: y key, Y summary".into(),
+                    ]
+                })
+                .unwrap_or_else(|| vec!["no session selected".into()]),
+            DrillKind::Events { source } => cache
+                .events
+                .get(
+                    state
+                        .current_index()
+                        .min(cache.events.len().saturating_sub(1)),
+                )
+                .map(|row| {
+                    vec![
+                        format!("session: {}", d.key),
+                        format!("source: {}", source.as_str()),
+                        format!("model: {}", row.model),
+                        format!(
+                            "when: {}",
+                            row.ts.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S")
+                        ),
+                        format!("input: {}", fmt_num(row.input)),
+                        format!("output: {}", fmt_num(row.output)),
+                        format!("cache read: {}", fmt_num(row.cache_read)),
+                        format!("cache write: {}", fmt_num(row.cache_write)),
+                        format!("cost: {}", fmt_cost(row.cost)),
+                        "copy: y key, Y summary".into(),
+                    ]
+                })
+                .unwrap_or_else(|| vec!["no event selected".into()]),
+        };
     }
     match state.current_section {
         Section::Provider => cache
@@ -1186,31 +1392,33 @@ mod tests {
     use crate::tui::state::{Sort, SourceFilter, TimeWindow};
 
     fn cache() -> DataCache {
-        DataCache {
-            left: vec![LeftRow {
-                label: "tokctl".into(),
-                key: "/dev/tokctl".into(),
-                sessions: 2,
-                total_tokens: 1234,
-                cost: 4.2,
-                is_no_repo: false,
-            }],
-            sessions: vec![SessionRow {
-                session_id: "session-abcdef".into(),
-                source: crate::types::Source::Claude,
-                latest_ts: Utc::now(),
-                project: Some("tokctl".into()),
-                cost: 1.2,
-                total_tokens: 500,
-            }],
-            status: CacheStatus {
-                cache_path: "/tmp/cache.db".into(),
-                event_count: 7,
-                freshness: "fresh 1m".into(),
-                last_query: Utc::now(),
-            },
-            ..DataCache::default()
-        }
+        let mut c = DataCache::default();
+        c.left = vec![LeftRow {
+            label: "tokctl".into(),
+            key: "/dev/tokctl".into(),
+            sessions: 2,
+            total_tokens: 1234,
+            cost: 4.2,
+            is_no_repo: false,
+            latest_ts: None,
+            source: None,
+        }];
+        c.sessions = vec![SessionRow {
+            session_id: "session-abcdef".into(),
+            source: crate::types::Source::Claude,
+            latest_ts: Utc::now(),
+            project: Some("tokctl".into()),
+            cost: 1.2,
+            total_tokens: 500,
+        }];
+        c.status = CacheStatus {
+            cache_path: "/tmp/cache.db".into(),
+            event_count: 7,
+            freshness: "fresh 1m".into(),
+            last_query: Utc::now(),
+            mtime_ns: None,
+        };
+        c
     }
 
     #[test]
@@ -1248,16 +1456,77 @@ mod tests {
 
     #[test]
     fn detail_lines_for_drilled_view_show_session_id() {
-        let mut state = AppState::default();
-        state.set_drill(crate::tui::state::Drill {
-            section: Section::Repos,
+        let mut state = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        state.push_drill(crate::tui::state::Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
             key: "tokctl".into(),
             label: "tokctl".into(),
+            cursor: 0,
         });
         let lines = detail_lines(&state, &cache());
         assert!(lines
             .iter()
             .any(|line: &String| line.contains("session-abcdef")));
+    }
+
+    #[test]
+    fn detail_lines_for_event_drill_show_model_and_when() {
+        let mut state = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        state.push_drill(crate::tui::state::Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        let mut c = cache();
+        c.events = vec![EventRow {
+            ts: Utc::now(),
+            model: "claude-sonnet-4-6".into(),
+            input: 100,
+            output: 50,
+            cache_read: 200,
+            cache_write: 0,
+            cost: 0.42,
+        }];
+        let lines = detail_lines(&state, &c);
+        assert!(lines.iter().any(|l| l.contains("claude-sonnet-4-6")));
+        assert!(lines.iter().any(|l| l.starts_with("session: abc")));
+    }
+
+    #[test]
+    fn breadcrumb_stacks_labels() {
+        let mut state = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        state.push_drill(crate::tui::state::Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        state.push_drill(crate::tui::state::Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "72a0a659".into(),
+            label: "72a0a659".into(),
+            cursor: 0,
+        });
+        let title = breadcrumb_title(&state);
+        assert_eq!(title, "REPOS › tokctl › 72a0a659");
     }
 
     #[test]
