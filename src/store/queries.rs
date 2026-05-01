@@ -237,6 +237,7 @@ pub struct RepoAggregateRow {
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
+    pub latest_timestamp: DateTime<Utc>,
 }
 
 impl RepoAggregateRow {
@@ -257,7 +258,8 @@ pub fn repo_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<RepoAgg
              SUM(e.cache_read)  AS cache_read_tokens,
              SUM(e.cache_write) AS cache_write_tokens,
              SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
-             SUM(e.cost_usd)    AS cost_usd
+             SUM(e.cost_usd)    AS cost_usd,
+             MAX(e.ts)          AS latest_ts
            FROM events e
            LEFT JOIN repos r ON r.key = e.repo
            WHERE 1=1 {src} {ts} {repo}
@@ -283,6 +285,10 @@ pub fn repo_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<RepoAgg
             cache_write_tokens: row.get::<_, i64>(7)? as u64,
             total_tokens: row.get::<_, i64>(8)? as u64,
             cost_usd: row.get(9)?,
+            latest_timestamp: Utc
+                .timestamp_millis_opt(row.get(10)?)
+                .single()
+                .unwrap_or_else(Utc::now),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

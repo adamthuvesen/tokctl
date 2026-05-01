@@ -28,10 +28,8 @@ pub struct LeftRow {
     pub total_tokens: u64,
     pub cost: f64,
     pub is_no_repo: bool,
-    /// Most-recent timestamp for this row, when meaningful. Populated for
-    /// the `Sessions` section so the "when" column is real, not `Utc::now()`.
-    /// `None` for rows where a single timestamp isn't sensible (Repos
-    /// aggregates many sessions, Days is itself a date bucket, …).
+    /// Most-recent timestamp for this row, when meaningful. Used by the
+    /// recent sort for aggregate sections and by the Sessions "when" column.
     pub latest_ts: Option<DateTime<Utc>>,
     /// Source for this row, when the row maps 1:1 to a single source.
     /// Populated for `Sessions` so the events drill knows which `(source,
@@ -441,11 +439,17 @@ fn sort_left_rows(rows: &mut [LeftRow], section: Section, sort: Sort) {
                 if section == Section::Days {
                     b.key.cmp(&a.key)
                 } else {
-                    b.cost
-                        .partial_cmp(&a.cost)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    b.latest_ts.cmp(&a.latest_ts)
                 }
             }
+            Sort::RecentAsc => {
+                if section == Section::Days {
+                    a.key.cmp(&b.key)
+                } else {
+                    a.latest_ts.cmp(&b.latest_ts)
+                }
+            }
+            Sort::AlphaDesc => b.label.cmp(&a.label),
             Sort::AlphaAsc => a.label.cmp(&b.label),
         };
         match (section == Section::Repos, a.is_no_repo, b.is_no_repo) {
@@ -471,11 +475,13 @@ fn sort_event_rows(rows: &mut [EventRow], sort: Sort) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.ts.cmp(&b.ts)),
         Sort::RecentDesc => b.ts.cmp(&a.ts),
+        Sort::RecentAsc => a.ts.cmp(&b.ts),
+        Sort::AlphaDesc => b.model.cmp(&a.model).then_with(|| a.ts.cmp(&b.ts)),
         Sort::AlphaAsc => a.model.cmp(&b.model).then_with(|| a.ts.cmp(&b.ts)),
     });
 }
 
-fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
+pub(super) fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
     rows.sort_by(|a, b| match sort {
         Sort::CostDesc => b
             .cost
@@ -488,6 +494,12 @@ fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.latest_ts.cmp(&a.latest_ts)),
         Sort::RecentDesc => b.latest_ts.cmp(&a.latest_ts),
+        Sort::RecentAsc => a.latest_ts.cmp(&b.latest_ts),
+        Sort::AlphaDesc => b
+            .project
+            .as_deref()
+            .unwrap_or(&b.session_id)
+            .cmp(a.project.as_deref().unwrap_or(&a.session_id)),
         Sort::AlphaAsc => a
             .project
             .as_deref()
@@ -541,7 +553,7 @@ pub fn load_left_axis(
                     total_tokens: r.total_tokens,
                     cost: r.cost_usd,
                     is_no_repo: r.is_no_repo(),
-                    latest_ts: None,
+                    latest_ts: Some(r.latest_timestamp),
                     source: None,
                 })
                 .collect())
@@ -600,7 +612,8 @@ fn load_periods(
         r#"SELECT {bucket} AS bucket,
                   COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
-                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
+                  MAX(e.ts) AS latest_ts
              FROM events e
              WHERE 1=1 {src} {ts}
              GROUP BY bucket
@@ -637,7 +650,11 @@ fn load_periods(
             cost: row.get::<_, f64>(2)?,
             total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
-            latest_ts: None,
+            latest_ts: Some(
+                Utc.timestamp_millis_opt(row.get(4)?)
+                    .single()
+                    .unwrap_or_else(Utc::now),
+            ),
             source: None,
         })
     })?;
@@ -650,7 +667,8 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
         r#"SELECT e.model AS model,
                   COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
-                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
+                  MAX(e.ts) AS latest_ts
              FROM events e
              WHERE 1=1 {src} {ts} {repo}
              GROUP BY model
@@ -687,7 +705,11 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             cost: row.get::<_, f64>(2)?,
             total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
-            latest_ts: None,
+            latest_ts: Some(
+                Utc.timestamp_millis_opt(row.get(4)?)
+                    .single()
+                    .unwrap_or_else(Utc::now),
+            ),
             source: None,
         })
     })?;
@@ -1066,6 +1088,40 @@ mod tests {
         ];
         sort_session_rows(&mut sessions, Sort::RecentDesc);
         assert_eq!(sessions[0].session_id, "new");
+        sort_session_rows(&mut sessions, Sort::RecentAsc);
+        assert_eq!(sessions[0].session_id, "old");
+        sort_session_rows(&mut sessions, Sort::AlphaDesc);
+        assert_eq!(sessions[0].session_id, "old");
+    }
+
+    #[test]
+    fn sessions_section_recent_sort_is_global_across_sources() {
+        let mut left = vec![
+            LeftRow {
+                label: "claude-old".into(),
+                key: "claude-old".into(),
+                sessions: 1,
+                total_tokens: 0,
+                cost: 100.0,
+                is_no_repo: false,
+                latest_ts: Some("2026-04-18T09:00:00Z".parse().unwrap()),
+                source: Some(Source::Claude),
+            },
+            LeftRow {
+                label: "codex-new".into(),
+                key: "codex-new".into(),
+                sessions: 1,
+                total_tokens: 0,
+                cost: 1.0,
+                is_no_repo: false,
+                latest_ts: Some("2026-04-19T09:00:00Z".parse().unwrap()),
+                source: Some(Source::Codex),
+            },
+        ];
+
+        sort_left_rows(&mut left, Section::Sessions, Sort::RecentDesc);
+
+        assert_eq!(left[0].key, "codex-new");
     }
 
     fn left_memo_key(state: &AppState) -> LeftMemoKey {

@@ -194,6 +194,7 @@ pub fn repo_in_memory(
         cache_write: u64,
         total: u64,
         cost: f64,
+        latest_timestamp: Option<DateTime<Utc>>,
     }
     let mut buckets: HashMap<String, Bucket> = HashMap::new();
 
@@ -217,6 +218,12 @@ pub fn repo_in_memory(
         b.cache_write += e.cache_write_tokens;
         b.total += e.input_tokens + e.output_tokens + e.cache_read_tokens + e.cache_write_tokens;
         b.cost += cost_of(e, Some(unknown));
+        if match b.latest_timestamp {
+            Some(t) => e.timestamp > t,
+            None => true,
+        } {
+            b.latest_timestamp = Some(e.timestamp);
+        }
     }
 
     let mut rows: Vec<RepoAggregateRow> = buckets
@@ -232,6 +239,7 @@ pub fn repo_in_memory(
             cache_write_tokens: b.cache_write,
             total_tokens: b.total,
             cost_usd: b.cost,
+            latest_timestamp: b.latest_timestamp.unwrap_or(DateTime::<Utc>::MIN_UTC),
         })
         .collect();
     rows.sort_by(|a, b| {
