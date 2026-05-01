@@ -28,10 +28,8 @@ pub struct LeftRow {
     pub total_tokens: u64,
     pub cost: f64,
     pub is_no_repo: bool,
-    /// Most-recent timestamp for this row, when meaningful. Populated for
-    /// the `Sessions` section so the "when" column is real, not `Utc::now()`.
-    /// `None` for rows where a single timestamp isn't sensible (Repos
-    /// aggregates many sessions, Days is itself a date bucket, …).
+    /// Most-recent timestamp for this row, when meaningful. Used by the
+    /// recent sort for aggregate sections and by the Sessions "when" column.
     pub latest_ts: Option<DateTime<Utc>>,
     /// Source for this row, when the row maps 1:1 to a single source.
     /// Populated for `Sessions` so the events drill knows which `(source,
@@ -86,6 +84,48 @@ pub struct CacheStatus {
     pub mtime_ns: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshScope {
+    Status,
+    Left,
+    Sessions,
+    Events,
+    Sparkline,
+    Trend,
+}
+
+impl RefreshScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefreshScope::Status => "status",
+            RefreshScope::Left => "rows",
+            RefreshScope::Sessions => "sessions",
+            RefreshScope::Events => "events",
+            RefreshScope::Sparkline => "sparkline",
+            RefreshScope::Trend => "trend",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshError {
+    pub scope: RefreshScope,
+    pub message: String,
+}
+
+impl RefreshError {
+    pub fn new(scope: RefreshScope, err: impl std::fmt::Display) -> Self {
+        Self {
+            scope,
+            message: err.to_string(),
+        }
+    }
+
+    pub fn display_message(&self) -> String {
+        format!("refresh failed: {}: {}", self.scope.as_str(), self.message)
+    }
+}
+
 impl Default for CacheStatus {
     fn default() -> Self {
         Self {
@@ -126,6 +166,7 @@ pub struct DataCache {
     /// Time-bucketed per-source rows; see [`TrendRow`] (field name = time-series slice, not the UI label).
     pub trend: Vec<TrendRow>,
     pub status: CacheStatus,
+    pub refresh_error: Option<RefreshError>,
     /// Per-section LeftRow memo. Hits replace the live `left` without
     /// running SQL. Cleared on `Refresh` or when the events table's
     /// `mtime_ns` advances (signaling re-ingest).
@@ -153,6 +194,20 @@ impl DataCache {
         self.memo_mtime_ns = None;
     }
 
+    fn set_refresh_error(&mut self, scope: RefreshScope, err: impl std::fmt::Display) {
+        self.refresh_error = Some(RefreshError::new(scope, err));
+    }
+
+    fn clear_refresh_error(&mut self, scope: RefreshScope) {
+        if self
+            .refresh_error
+            .as_ref()
+            .is_some_and(|e| e.scope == scope)
+        {
+            self.refresh_error = None;
+        }
+    }
+
     pub fn refresh_for(
         &mut self,
         conn: &Connection,
@@ -161,107 +216,181 @@ impl DataCache {
     ) {
         let now = Utc::now();
         let filter = base_filter(state, now);
-        self.status = load_cache_status(conn, now).unwrap_or_else(|_| CacheStatus::default());
 
-        // Cache-freshness invalidation: if the underlying events table has
-        // been re-ingested since we last cached, drop every memo. Cheap —
-        // we already loaded `status.mtime_ns` above.
+        self.refresh_status(conn, now);
+        self.invalidate_memos_if_source_files_changed();
+
+        if mask.left {
+            self.refresh_left(conn, state, &filter);
+        }
+        if mask.sessions {
+            self.refresh_sessions(conn, state, &filter);
+        }
+        if mask.events {
+            self.refresh_events(conn, state, &filter);
+        }
+        if mask.sparkline {
+            self.refresh_sparkline(conn);
+        }
+        if mask.trend {
+            self.refresh_trend(conn, state, now);
+        }
+    }
+
+    fn refresh_status(&mut self, conn: &Connection, now: DateTime<Utc>) {
+        match load_cache_status(conn, now) {
+            Ok(status) => {
+                self.status = status;
+                self.clear_refresh_error(RefreshScope::Status);
+            }
+            Err(err) => self.set_refresh_error(RefreshScope::Status, err),
+        }
+    }
+
+    fn invalidate_memos_if_source_files_changed(&mut self) {
         if self.memo_mtime_ns != self.status.mtime_ns {
             self.left_memo.clear();
             self.trend_memo.clear();
             self.sparkline_memo = None;
             self.memo_mtime_ns = self.status.mtime_ns;
         }
+    }
 
-        if mask.left {
-            let key = LeftMemoKey(
-                state.current_section,
-                state.time_window,
-                state.source_filter,
-                state.trend_granularity,
-            );
-            if let Some(cached) = self.left_memo.get(&key) {
-                self.left = cached.clone();
-                sort_left_rows(&mut self.left, state.current_section, state.sort);
-            } else {
-                self.left = load_left_axis(
-                    conn,
-                    state.current_section,
-                    filter.clone(),
-                    state.trend_granularity,
-                )
-                .unwrap_or_default();
+    fn refresh_left(&mut self, conn: &Connection, state: &AppState, filter: &QueryFilter) {
+        let key = LeftMemoKey(
+            state.current_section,
+            state.time_window,
+            state.source_filter,
+            state.trend_granularity,
+        );
+        if let Some(cached) = self.left_memo.get(&key) {
+            self.left = cached.clone();
+            sort_left_rows(&mut self.left, state.current_section, state.sort);
+            self.clear_refresh_error(RefreshScope::Left);
+            return;
+        }
+
+        match load_left_axis(
+            conn,
+            state.current_section,
+            filter.clone(),
+            state.trend_granularity,
+        ) {
+            Ok(rows) => {
+                self.left = rows;
                 // Memoize before sort so the cached form is canonical;
                 // each consumer applies its own sort on top.
                 self.left_memo.insert(key, self.left.clone());
                 sort_left_rows(&mut self.left, state.current_section, state.sort);
+                self.clear_refresh_error(RefreshScope::Left);
             }
+            Err(err) => self.set_refresh_error(RefreshScope::Left, err),
         }
-        if mask.sessions {
-            // For sessions-drill views, scope sessions to the drilled key
-            // and originating section. Otherwise scope to whichever row is
-            // focused in the current section.
-            let (scope_section, sel_key): (Section, Option<String>) = match state.deepest_drill() {
-                Some(d) => match d.kind {
-                    DrillKind::Sessions { from_section } => (from_section, Some(d.key.clone())),
-                    // Inside an events drill, the sessions slice is whatever
-                    // the parent (sessions-drill or section root) populated;
-                    // leave it unchanged.
-                    DrillKind::Events { .. } => {
-                        (state.current_section, left_selected_key(state, &self.left))
-                    }
-                },
-                None => (state.current_section, left_selected_key(state, &self.left)),
-            };
-            // Inside an events drill, do NOT clobber the parent's session
-            // list — leave the previous sessions intact.
-            if !matches!(
-                state.deepest_drill().map(|d| d.kind),
-                Some(DrillKind::Events { .. })
-            ) {
-                self.sessions =
-                    load_sessions_for(conn, scope_section, sel_key.as_deref(), filter.clone())
-                        .unwrap_or_default();
+    }
+
+    fn refresh_sessions(&mut self, conn: &Connection, state: &AppState, filter: &QueryFilter) {
+        // For sessions-drill views, scope sessions to the drilled key
+        // and originating section. Otherwise scope to whichever row is
+        // focused in the current section.
+        let (scope_section, sel_key): (Section, Option<String>) = match state.deepest_drill() {
+            Some(d) => match d.kind {
+                DrillKind::Sessions { from_section } => (from_section, Some(d.key.clone())),
+                // Inside an events drill, the sessions slice is whatever
+                // the parent (sessions-drill or section root) populated;
+                // leave it unchanged.
+                DrillKind::Events { .. } => {
+                    (state.current_section, left_selected_key(state, &self.left))
+                }
+            },
+            None => (state.current_section, left_selected_key(state, &self.left)),
+        };
+        if matches!(
+            state.deepest_drill().map(|d| d.kind),
+            Some(DrillKind::Events { .. })
+        ) {
+            return;
+        }
+
+        match load_sessions_for(conn, scope_section, sel_key.as_deref(), filter.clone()) {
+            Ok(rows) => {
+                self.sessions = rows;
                 sort_session_rows(&mut self.sessions, state.sort);
+                self.clear_refresh_error(RefreshScope::Sessions);
+            }
+            Err(err) => self.set_refresh_error(RefreshScope::Sessions, err),
+        }
+    }
+
+    fn refresh_events(&mut self, conn: &Connection, state: &AppState, filter: &QueryFilter) {
+        match state.deepest_drill() {
+            Some(d) => match d.kind {
+                DrillKind::Events { source } => {
+                    match load_events_for(conn, source, &d.key, filter.clone()) {
+                        Ok(rows) => {
+                            self.events = rows;
+                            sort_event_rows(&mut self.events, state.sort);
+                            self.clear_refresh_error(RefreshScope::Events);
+                        }
+                        Err(err) => self.set_refresh_error(RefreshScope::Events, err),
+                    }
+                }
+                _ => {
+                    self.events.clear();
+                    self.clear_refresh_error(RefreshScope::Events);
+                }
+            },
+            None => {
+                self.events.clear();
+                self.clear_refresh_error(RefreshScope::Events);
             }
         }
-        if mask.events {
-            self.events = match state.deepest_drill() {
-                Some(d) => match d.kind {
-                    DrillKind::Events { source } => {
-                        load_events_for(conn, source, &d.key, filter.clone()).unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                },
-                None => Vec::new(),
-            };
-            sort_event_rows(&mut self.events, state.sort);
-        }
-        if mask.sparkline {
-            self.sparkline = match self.sparkline_memo.as_ref() {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fresh = load_sparkline(conn, 30).unwrap_or_default();
+    }
+
+    fn refresh_sparkline(&mut self, conn: &Connection) {
+        self.sparkline = match self.sparkline_memo.as_ref() {
+            Some(cached) => {
+                let rows = cached.clone();
+                self.clear_refresh_error(RefreshScope::Sparkline);
+                rows
+            }
+            None => match load_sparkline(conn, 30) {
+                Ok(fresh) => {
                     self.sparkline_memo = Some(fresh.clone());
+                    self.clear_refresh_error(RefreshScope::Sparkline);
                     fresh
                 }
-            };
-        }
-        if mask.trend {
-            let key = TrendMemoKey(
-                state.time_window,
-                state.source_filter,
-                state.trend_granularity,
-            );
-            self.trend = match self.trend_memo.get(&key) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fresh = load_trend(conn, state, now).unwrap_or_default();
+                Err(err) => {
+                    self.set_refresh_error(RefreshScope::Sparkline, err);
+                    self.sparkline.clone()
+                }
+            },
+        };
+    }
+
+    fn refresh_trend(&mut self, conn: &Connection, state: &AppState, now: DateTime<Utc>) {
+        let key = TrendMemoKey(
+            state.time_window,
+            state.source_filter,
+            state.trend_granularity,
+        );
+        self.trend = match self.trend_memo.get(&key) {
+            Some(cached) => {
+                let rows = cached.clone();
+                self.clear_refresh_error(RefreshScope::Trend);
+                rows
+            }
+            None => match load_trend(conn, state, now) {
+                Ok(fresh) => {
                     self.trend_memo.insert(key, fresh.clone());
+                    self.clear_refresh_error(RefreshScope::Trend);
                     fresh
                 }
-            };
-        }
+                Err(err) => {
+                    self.set_refresh_error(RefreshScope::Trend, err);
+                    self.trend.clone()
+                }
+            },
+        };
     }
 }
 
@@ -310,11 +439,17 @@ fn sort_left_rows(rows: &mut [LeftRow], section: Section, sort: Sort) {
                 if section == Section::Days {
                     b.key.cmp(&a.key)
                 } else {
-                    b.cost
-                        .partial_cmp(&a.cost)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    b.latest_ts.cmp(&a.latest_ts)
                 }
             }
+            Sort::RecentAsc => {
+                if section == Section::Days {
+                    a.key.cmp(&b.key)
+                } else {
+                    a.latest_ts.cmp(&b.latest_ts)
+                }
+            }
+            Sort::AlphaDesc => b.label.cmp(&a.label),
             Sort::AlphaAsc => a.label.cmp(&b.label),
         };
         match (section == Section::Repos, a.is_no_repo, b.is_no_repo) {
@@ -340,11 +475,13 @@ fn sort_event_rows(rows: &mut [EventRow], sort: Sort) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.ts.cmp(&b.ts)),
         Sort::RecentDesc => b.ts.cmp(&a.ts),
+        Sort::RecentAsc => a.ts.cmp(&b.ts),
+        Sort::AlphaDesc => b.model.cmp(&a.model).then_with(|| a.ts.cmp(&b.ts)),
         Sort::AlphaAsc => a.model.cmp(&b.model).then_with(|| a.ts.cmp(&b.ts)),
     });
 }
 
-fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
+pub(super) fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
     rows.sort_by(|a, b| match sort {
         Sort::CostDesc => b
             .cost
@@ -357,6 +494,12 @@ fn sort_session_rows(rows: &mut [SessionRow], sort: Sort) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.latest_ts.cmp(&a.latest_ts)),
         Sort::RecentDesc => b.latest_ts.cmp(&a.latest_ts),
+        Sort::RecentAsc => a.latest_ts.cmp(&b.latest_ts),
+        Sort::AlphaDesc => b
+            .project
+            .as_deref()
+            .unwrap_or(&b.session_id)
+            .cmp(a.project.as_deref().unwrap_or(&a.session_id)),
         Sort::AlphaAsc => a
             .project
             .as_deref()
@@ -410,7 +553,7 @@ pub fn load_left_axis(
                     total_tokens: r.total_tokens,
                     cost: r.cost_usd,
                     is_no_repo: r.is_no_repo(),
-                    latest_ts: None,
+                    latest_ts: Some(r.latest_timestamp),
                     source: None,
                 })
                 .collect())
@@ -469,7 +612,8 @@ fn load_periods(
         r#"SELECT {bucket} AS bucket,
                   COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
-                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
+                  MAX(e.ts) AS latest_ts
              FROM events e
              WHERE 1=1 {src} {ts}
              GROUP BY bucket
@@ -506,7 +650,11 @@ fn load_periods(
             cost: row.get::<_, f64>(2)?,
             total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
-            latest_ts: None,
+            latest_ts: Some(
+                Utc.timestamp_millis_opt(row.get(4)?)
+                    .single()
+                    .unwrap_or_else(Utc::now),
+            ),
             source: None,
         })
     })?;
@@ -519,7 +667,8 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
         r#"SELECT e.model AS model,
                   COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
                   SUM(e.cost_usd) AS cost,
-                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
+                  MAX(e.ts) AS latest_ts
              FROM events e
              WHERE 1=1 {src} {ts} {repo}
              GROUP BY model
@@ -556,7 +705,11 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             cost: row.get::<_, f64>(2)?,
             total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
-            latest_ts: None,
+            latest_ts: Some(
+                Utc.timestamp_millis_opt(row.get(4)?)
+                    .single()
+                    .unwrap_or_else(Utc::now),
+            ),
             source: None,
         })
     })?;
@@ -935,6 +1088,40 @@ mod tests {
         ];
         sort_session_rows(&mut sessions, Sort::RecentDesc);
         assert_eq!(sessions[0].session_id, "new");
+        sort_session_rows(&mut sessions, Sort::RecentAsc);
+        assert_eq!(sessions[0].session_id, "old");
+        sort_session_rows(&mut sessions, Sort::AlphaDesc);
+        assert_eq!(sessions[0].session_id, "old");
+    }
+
+    #[test]
+    fn sessions_section_recent_sort_is_global_across_sources() {
+        let mut left = vec![
+            LeftRow {
+                label: "claude-old".into(),
+                key: "claude-old".into(),
+                sessions: 1,
+                total_tokens: 0,
+                cost: 100.0,
+                is_no_repo: false,
+                latest_ts: Some("2026-04-18T09:00:00Z".parse().unwrap()),
+                source: Some(Source::Claude),
+            },
+            LeftRow {
+                label: "codex-new".into(),
+                key: "codex-new".into(),
+                sessions: 1,
+                total_tokens: 0,
+                cost: 1.0,
+                is_no_repo: false,
+                latest_ts: Some("2026-04-19T09:00:00Z".parse().unwrap()),
+                source: Some(Source::Codex),
+            },
+        ];
+
+        sort_left_rows(&mut left, Section::Sessions, Sort::RecentDesc);
+
+        assert_eq!(left[0].key, "codex-new");
     }
 
     fn left_memo_key(state: &AppState) -> LeftMemoKey {
@@ -1114,6 +1301,118 @@ mod tests {
         tx.commit().unwrap();
         let status = load_cache_status(&conn, Utc::now()).unwrap();
         assert_eq!(status.event_count, 1);
+    }
+
+    #[test]
+    fn refresh_failure_is_visible_not_empty_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut cache = DataCache::default();
+
+        cache.refresh_all(&conn, &AppState::default());
+
+        let err = cache.refresh_error.as_ref().expect("refresh error");
+        assert!(err.display_message().contains("refresh failed:"));
+    }
+
+    #[test]
+    fn valid_empty_refresh_has_no_error() {
+        let conn = mk_conn();
+        let mut cache = DataCache::default();
+
+        cache.refresh_all(&conn, &AppState::default());
+
+        assert!(cache.refresh_error.is_none());
+        assert!(cache.left.is_empty());
+    }
+
+    #[test]
+    fn successful_refresh_clears_prior_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut cache = DataCache::default();
+
+        cache.refresh_for(
+            &conn,
+            &AppState::default(),
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+        assert!(cache.refresh_error.is_some());
+
+        conn.execute_batch(DDL).unwrap();
+        cache.refresh_for(
+            &conn,
+            &AppState::default(),
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(cache.refresh_error.is_none());
+    }
+
+    #[test]
+    fn refresh_failure_preserves_previous_successful_rows() {
+        let conn = fixture_conn_with_events();
+        let state = AppState {
+            current_section: Section::Days,
+            time_window: TimeWindow::All,
+            ..AppState::default()
+        };
+        let mut cache = DataCache::default();
+        cache.refresh_for(
+            &conn,
+            &state,
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+        assert!(!cache.left.is_empty());
+
+        conn.execute("DROP TABLE events", []).unwrap();
+        cache.refresh_for(
+            &conn,
+            &state,
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(cache.refresh_error.is_some());
+        assert!(!cache.left.is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_mutate_cache_tables() {
+        let conn = fixture_conn_with_events();
+        let before_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let before_files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+
+        let mut cache = DataCache::default();
+        cache.refresh_all(
+            &conn,
+            &AppState {
+                time_window: TimeWindow::All,
+                ..AppState::default()
+            },
+        );
+
+        let after_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let after_files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_events, before_events);
+        assert_eq!(after_files, before_files);
     }
 
     fn mk_conn() -> Connection {

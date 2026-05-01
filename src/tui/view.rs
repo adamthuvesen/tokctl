@@ -14,7 +14,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::data::{DataCache, EventRow, LeftRow, SessionRow, TrendRow};
+use crate::tui::data::{sort_session_rows, DataCache, EventRow, LeftRow, SessionRow, TrendRow};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
 use crate::tui::shell::{draw_main_frame, draw_sidebar};
 use crate::tui::state::{AppState, DrillKind, Focus, Section, SourceFilter};
@@ -620,7 +620,7 @@ fn draw_sessions_table(
         return;
     }
 
-    let (filtered, _) = apply_filter_sessions(rows, state);
+    let filtered = display_session_rows(rows, state);
     let max_cost = filtered
         .iter()
         .map(|r| r.cost)
@@ -703,6 +703,14 @@ fn draw_sessions_table(
     let mut ts = TableState::default();
     ts.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut ts);
+}
+
+fn display_session_rows(rows: &[SessionRow], state: &AppState) -> Vec<SessionRow> {
+    let (mut filtered, scores) = apply_filter_sessions(rows, state);
+    if scores.is_empty() {
+        sort_session_rows(&mut filtered, state.sort);
+    }
+    filtered
 }
 
 // -- Events table (deepest drill) -------------------------------------------
@@ -1062,8 +1070,13 @@ fn draw_footer(
         Span::raw("  "),
     ];
 
-    if let Some(flash) = &state.flash {
-        spans.push(Span::styled(format!("{flash}  "), palette.accent_text()));
+    for message in footer_messages(state, cache) {
+        let style = if message.is_error {
+            palette.warn_text()
+        } else {
+            palette.accent_text()
+        };
+        spans.push(Span::styled(format!("{}  ", message.text), style));
     }
 
     spans.push(Span::styled("│  ", palette.dim_text()));
@@ -1100,6 +1113,28 @@ fn draw_footer(
     push_hint_group(&mut spans, system, palette);
 
     frame.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+}
+
+struct FooterMessage {
+    text: String,
+    is_error: bool,
+}
+
+fn footer_messages(state: &AppState, cache: &DataCache) -> Vec<FooterMessage> {
+    let mut messages = Vec::new();
+    if let Some(flash) = &state.flash {
+        messages.push(FooterMessage {
+            text: flash.clone(),
+            is_error: false,
+        });
+    }
+    if let Some(err) = &cache.refresh_error {
+        messages.push(FooterMessage {
+            text: err.display_message(),
+            is_error: true,
+        });
+    }
+    messages
 }
 
 fn push_hint_group(spans: &mut Vec<Span<'static>>, hints: &[(&str, &str)], palette: &Palette) {
@@ -1388,7 +1423,7 @@ fn should_filter(state: &AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::data::{CacheStatus, DataCache};
+    use crate::tui::data::{CacheStatus, DataCache, RefreshError, RefreshScope};
     use crate::tui::state::{Sort, SourceFilter, TimeWindow};
 
     fn cache() -> DataCache {
@@ -1501,6 +1536,54 @@ mod tests {
         let lines = detail_lines(&state, &c);
         assert!(lines.iter().any(|l| l.contains("claude-sonnet-4-6")));
         assert!(lines.iter().any(|l| l.starts_with("session: abc")));
+    }
+
+    #[test]
+    fn footer_messages_include_refresh_error() {
+        let mut c = cache();
+        c.refresh_error = Some(RefreshError::new(
+            RefreshScope::Left,
+            "no such table: events",
+        ));
+
+        let messages = footer_messages(&AppState::default(), &c);
+
+        assert!(messages.iter().any(|m| {
+            m.is_error
+                && m.text
+                    .contains("refresh failed: rows: no such table: events")
+        }));
+    }
+
+    #[test]
+    fn display_session_rows_sorts_recent_globally() {
+        let rows = vec![
+            SessionRow {
+                session_id: "expensive-old".into(),
+                source: crate::types::Source::Claude,
+                latest_ts: "2026-04-18T09:00:00Z".parse().unwrap(),
+                project: Some("expensive-old".into()),
+                cost: 100.0,
+                total_tokens: 0,
+            },
+            SessionRow {
+                session_id: "cheap-new".into(),
+                source: crate::types::Source::Codex,
+                latest_ts: "2026-04-19T09:00:00Z".parse().unwrap(),
+                project: Some("cheap-new".into()),
+                cost: 1.0,
+                total_tokens: 0,
+            },
+        ];
+        let state = AppState {
+            current_section: Section::Sessions,
+            sort: Sort::RecentDesc,
+            ..AppState::default()
+        };
+
+        let shown = display_session_rows(&rows, &state);
+
+        assert_eq!(shown[0].session_id, "cheap-new");
     }
 
     #[test]
