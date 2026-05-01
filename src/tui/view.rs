@@ -17,7 +17,7 @@ use ratatui::{
 use crate::tui::data::{sort_session_rows, DataCache, EventRow, LeftRow, SessionRow, TrendRow};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
 use crate::tui::shell::{draw_main_frame, draw_sidebar};
-use crate::tui::state::{AppState, DrillKind, Focus, Section, SourceFilter};
+use crate::tui::state::{AppState, DrillKind, Focus, Section, Sort, SourceFilter};
 use crate::tui::theme::Palette;
 use crate::tui::MIN_WIDTH;
 
@@ -835,7 +835,7 @@ fn draw_trend_table(
     cache: &DataCache,
     palette: &Palette,
 ) {
-    let rows = &cache.trend;
+    let rows = display_trend_rows(&cache.trend, state.sort);
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -944,6 +944,25 @@ fn draw_trend_table(
 
     let table = Table::new(body, constraints).header(header);
     frame.render_widget(table, area);
+}
+
+fn display_trend_rows(rows: &[TrendRow], sort: Sort) -> Vec<TrendRow> {
+    let mut out = rows.to_vec();
+    out.sort_by(|a, b| match sort {
+        Sort::CostDesc => b
+            .total_cost
+            .partial_cmp(&a.total_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.bucket.cmp(&a.bucket)),
+        Sort::CostAsc => a
+            .total_cost
+            .partial_cmp(&b.total_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.bucket.cmp(&a.bucket)),
+        Sort::RecentDesc | Sort::AlphaDesc => b.bucket.cmp(&a.bucket),
+        Sort::RecentAsc | Sort::AlphaAsc => a.bucket.cmp(&b.bucket),
+    });
+    out
 }
 
 fn trend_row<'a>(
@@ -1584,6 +1603,39 @@ mod tests {
         let shown = display_session_rows(&rows, &state);
 
         assert_eq!(shown[0].session_id, "cheap-new");
+    }
+
+    #[test]
+    fn display_trend_rows_honors_active_sort() {
+        let rows = vec![
+            TrendRow {
+                bucket: "2025-10-14".into(),
+                claude_cost: 0.0,
+                codex_cost: 0.0,
+                cursor_cost: 1.0,
+                total_tokens: 10,
+                total_cost: 1.0,
+                is_current: false,
+            },
+            TrendRow {
+                bucket: "2025-12-04".into(),
+                claude_cost: 0.0,
+                codex_cost: 0.0,
+                cursor_cost: 12.0,
+                total_tokens: 20,
+                total_cost: 12.0,
+                is_current: false,
+            },
+        ];
+
+        assert_eq!(
+            display_trend_rows(&rows, Sort::AlphaDesc)[0].bucket,
+            "2025-12-04"
+        );
+        assert_eq!(
+            display_trend_rows(&rows, Sort::CostAsc)[0].bucket,
+            "2025-10-14"
+        );
     }
 
     #[test]
