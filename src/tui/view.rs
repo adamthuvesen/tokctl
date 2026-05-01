@@ -1062,8 +1062,13 @@ fn draw_footer(
         Span::raw("  "),
     ];
 
-    if let Some(flash) = &state.flash {
-        spans.push(Span::styled(format!("{flash}  "), palette.accent_text()));
+    for message in footer_messages(state, cache) {
+        let style = if message.is_error {
+            palette.warn_text()
+        } else {
+            palette.accent_text()
+        };
+        spans.push(Span::styled(format!("{}  ", message.text), style));
     }
 
     spans.push(Span::styled("│  ", palette.dim_text()));
@@ -1100,6 +1105,28 @@ fn draw_footer(
     push_hint_group(&mut spans, system, palette);
 
     frame.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+}
+
+struct FooterMessage {
+    text: String,
+    is_error: bool,
+}
+
+fn footer_messages(state: &AppState, cache: &DataCache) -> Vec<FooterMessage> {
+    let mut messages = Vec::new();
+    if let Some(flash) = &state.flash {
+        messages.push(FooterMessage {
+            text: flash.clone(),
+            is_error: false,
+        });
+    }
+    if let Some(err) = &cache.refresh_error {
+        messages.push(FooterMessage {
+            text: err.display_message(),
+            is_error: true,
+        });
+    }
+    messages
 }
 
 fn push_hint_group(spans: &mut Vec<Span<'static>>, hints: &[(&str, &str)], palette: &Palette) {
@@ -1388,7 +1415,7 @@ fn should_filter(state: &AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::data::{CacheStatus, DataCache};
+    use crate::tui::data::{CacheStatus, DataCache, RefreshError, RefreshScope};
     use crate::tui::state::{Sort, SourceFilter, TimeWindow};
 
     fn cache() -> DataCache {
@@ -1501,6 +1528,23 @@ mod tests {
         let lines = detail_lines(&state, &c);
         assert!(lines.iter().any(|l| l.contains("claude-sonnet-4-6")));
         assert!(lines.iter().any(|l| l.starts_with("session: abc")));
+    }
+
+    #[test]
+    fn footer_messages_include_refresh_error() {
+        let mut c = cache();
+        c.refresh_error = Some(RefreshError::new(
+            RefreshScope::Left,
+            "no such table: events",
+        ));
+
+        let messages = footer_messages(&AppState::default(), &c);
+
+        assert!(messages.iter().any(|m| {
+            m.is_error
+                && m.text
+                    .contains("refresh failed: rows: no such table: events")
+        }));
     }
 
     #[test]
