@@ -13,9 +13,7 @@ use tokctl::{
     store::open_store,
     tui::{
         data::DataCache,
-        state::{
-            AppState, RefreshMask, Section, SourceFilter, TimeWindow, TrendGranularity,
-        },
+        state::{AppState, RefreshMask, Section, SourceFilter, TimeWindow, TrendGranularity},
     },
 };
 
@@ -164,11 +162,18 @@ fn main() -> anyhow::Result<()> {
         cache.refresh_all(&conn, &state);
     });
 
-    println!("\nrows resident:  left={} trend={} sparkline={} sessions={} events={}",
-        cache.left.len(), cache.trend.len(), cache.sparkline.len(),
-        cache.sessions.len(), cache.events.len()
+    println!(
+        "\nrows resident:  left={} trend={} sparkline={} sessions={} events={}",
+        cache.left.len(),
+        cache.trend.len(),
+        cache.sparkline.len(),
+        cache.sessions.len(),
+        cache.events.len()
     );
-    println!("status: {} events, mtime_ns={:?}", cache.status.event_count, cache.status.mtime_ns);
+    println!(
+        "status: {} events, mtime_ns={:?}",
+        cache.status.event_count, cache.status.mtime_ns
+    );
 
     Ok(())
 }
