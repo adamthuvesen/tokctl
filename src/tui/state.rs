@@ -159,6 +159,8 @@ pub enum Sort {
     CostDesc,
     CostAsc,
     RecentDesc,
+    RecentAsc,
+    AlphaDesc,
     AlphaAsc,
 }
 
@@ -167,7 +169,9 @@ impl Sort {
         match self {
             Sort::CostDesc => Sort::CostAsc,
             Sort::CostAsc => Sort::RecentDesc,
-            Sort::RecentDesc => Sort::AlphaAsc,
+            Sort::RecentDesc => Sort::RecentAsc,
+            Sort::RecentAsc => Sort::AlphaDesc,
+            Sort::AlphaDesc => Sort::AlphaAsc,
             Sort::AlphaAsc => Sort::CostDesc,
         }
     }
@@ -177,6 +181,8 @@ impl Sort {
             Sort::CostDesc => "cost↓",
             Sort::CostAsc => "cost↑",
             Sort::RecentDesc => "recent↓",
+            Sort::RecentAsc => "recent↑",
+            Sort::AlphaDesc => "alpha↓",
             Sort::AlphaAsc => "alpha↑",
         }
     }
@@ -961,6 +967,22 @@ mod tests {
         // Sessions rows drill *to events*, not to a sessions list.
         assert!(!Section::Sessions.rows_drill_to_sessions());
         assert!(!Section::Provider.rows_drill_to_sessions());
+    }
+
+    #[test]
+    fn sort_cycle_pairs_desc_then_asc() {
+        let mut sort = Sort::CostDesc;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            seen.push(sort.as_str());
+            sort = sort.next();
+        }
+
+        assert_eq!(
+            seen,
+            vec!["cost↓", "cost↑", "recent↓", "recent↑", "alpha↓", "alpha↑"]
+        );
+        assert_eq!(sort, Sort::CostDesc);
     }
 
     #[test]

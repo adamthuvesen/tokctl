@@ -14,7 +14,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::data::{DataCache, EventRow, LeftRow, SessionRow, TrendRow};
+use crate::tui::data::{sort_session_rows, DataCache, EventRow, LeftRow, SessionRow, TrendRow};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
 use crate::tui::shell::{draw_main_frame, draw_sidebar};
 use crate::tui::state::{AppState, DrillKind, Focus, Section, SourceFilter};
@@ -620,7 +620,7 @@ fn draw_sessions_table(
         return;
     }
 
-    let (filtered, _) = apply_filter_sessions(rows, state);
+    let filtered = display_session_rows(rows, state);
     let max_cost = filtered
         .iter()
         .map(|r| r.cost)
@@ -703,6 +703,14 @@ fn draw_sessions_table(
     let mut ts = TableState::default();
     ts.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut ts);
+}
+
+fn display_session_rows(rows: &[SessionRow], state: &AppState) -> Vec<SessionRow> {
+    let (mut filtered, scores) = apply_filter_sessions(rows, state);
+    if scores.is_empty() {
+        sort_session_rows(&mut filtered, state.sort);
+    }
+    filtered
 }
 
 // -- Events table (deepest drill) -------------------------------------------
@@ -1545,6 +1553,37 @@ mod tests {
                 && m.text
                     .contains("refresh failed: rows: no such table: events")
         }));
+    }
+
+    #[test]
+    fn display_session_rows_sorts_recent_globally() {
+        let rows = vec![
+            SessionRow {
+                session_id: "expensive-old".into(),
+                source: crate::types::Source::Claude,
+                latest_ts: "2026-04-18T09:00:00Z".parse().unwrap(),
+                project: Some("expensive-old".into()),
+                cost: 100.0,
+                total_tokens: 0,
+            },
+            SessionRow {
+                session_id: "cheap-new".into(),
+                source: crate::types::Source::Codex,
+                latest_ts: "2026-04-19T09:00:00Z".parse().unwrap(),
+                project: Some("cheap-new".into()),
+                cost: 1.0,
+                total_tokens: 0,
+            },
+        ];
+        let state = AppState {
+            current_section: Section::Sessions,
+            sort: Sort::RecentDesc,
+            ..AppState::default()
+        };
+
+        let shown = display_session_rows(&rows, &state);
+
+        assert_eq!(shown[0].session_id, "cheap-new");
     }
 
     #[test]
