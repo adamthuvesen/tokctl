@@ -46,7 +46,7 @@ pub fn map_key(state: &AppState, k: KeyEvent, last_g: &mut Option<Instant>) -> A
     // Provider / Days scoped overrides: d/w/m/y choose bucket granularity.
     // (The two sections share `trend_granularity`.) Window-setting on
     // lowercase w/m is shadowed in these sections — use uppercase W/M.
-    if matches!(state.current_section, Section::Provider | Section::Days) && state.drill.is_none() {
+    if matches!(state.current_section, Section::Provider | Section::Days) && !state.drill_active() {
         match k.code {
             KeyCode::Char('d') => return Action::SetTrendGranularity(TrendGranularity::Daily),
             KeyCode::Char('y') => return Action::SetTrendGranularity(TrendGranularity::Yearly),

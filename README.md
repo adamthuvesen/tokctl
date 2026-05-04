@@ -6,7 +6,7 @@ A terminal dashboard for what you actually spent on **Claude**, **Codex**, and *
 tokctl ui
 ```
 
-That's the whole pitch. Open it, drill into a day or a repo, see where the money went.
+That's the whole pitch. Open it, drill into a day, repo, or session — three levels deep, all the way down to the individual turn — and see where the money went.
 
 ---
 
@@ -31,8 +31,8 @@ First run ingests your local Claude/Codex JSONL and any Cursor CSV cache into `$
 | `j` `k` / arrows | move within the focused area |
 | `[` / `]` | previous / next section |
 | `h` `←` / `l` `→` | focus sidebar / focus main |
-| `Enter` | drill (sidebar→main; main→push drill) |
-| `Esc` / `Backspace` | cancel filter, close overlay, pop drill |
+| `Enter` | drill (sidebar→main; main pushes one level: section → sessions → events) |
+| `Esc` / `Backspace` | pop drill (one level), close overlay, cancel filter |
 | `g` `g` / `G` | top / bottom |
 | `Ctrl-d` / `Ctrl-u` | half page |
 | `Tab` | cycle main-pane tabs |
@@ -49,6 +49,8 @@ First run ingests your local Claude/Codex JSONL and any Cursor CSV cache into `$
 | `q` / `Ctrl-c` | quit |
 
 UI preferences persist to `<cache_dir>/ui_state.json` (delete to reset). Default builds include [`arboard`](https://crates.io/crates/arboard); on headless Linux `cargo install --path . --no-default-features` and `y` becomes a no-op.
+
+**Drill levels.** The main pane is a stack: pick a row in any section (except `Provider`) and `Enter` drills one level deeper. Repos / Days / Models drill into their session list; Sessions drills directly into per-turn events; inside a sessions drill another `Enter` drills into events. The breadcrumb shows where you are (`Repos › tokctl › 72a0a659…`); `Esc` or `←` pops one level at a time.
 
 ---
 

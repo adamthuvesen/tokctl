@@ -10,8 +10,11 @@ use crate::repo::project_basename;
 use crate::store::queries::{
     repo_report, session_report, QueryFilter, RepoAggregateRow, RepoFilterSpec,
 };
-use crate::tui::state::{AppState, Section, Sort, SourceFilter, TrendGranularity};
+use crate::tui::state::{
+    AppState, DrillKind, Section, Sort, SourceFilter, TimeWindow, TrendGranularity,
+};
 use crate::types::{AggregateRow, Source};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -25,6 +28,15 @@ pub struct LeftRow {
     pub total_tokens: u64,
     pub cost: f64,
     pub is_no_repo: bool,
+    /// Most-recent timestamp for this row, when meaningful. Populated for
+    /// the `Sessions` section so the "when" column is real, not `Utc::now()`.
+    /// `None` for rows where a single timestamp isn't sensible (Repos
+    /// aggregates many sessions, Days is itself a date bucket, …).
+    pub latest_ts: Option<DateTime<Utc>>,
+    /// Source for this row, when the row maps 1:1 to a single source.
+    /// Populated for `Sessions` so the events drill knows which `(source,
+    /// session_id)` to query.
+    pub source: Option<Source>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +47,18 @@ pub struct SessionRow {
     pub project: Option<String>,
     pub cost: f64,
     pub total_tokens: u64,
+}
+
+/// One row per turn within a single session — the deepest drill level.
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    pub ts: DateTime<Utc>,
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost: f64,
 }
 
 /// One time bucket with per-source (Claude / Codex / Cursor) costs. Used for the **Provider** section
@@ -56,6 +80,10 @@ pub struct CacheStatus {
     pub event_count: u64,
     pub freshness: String,
     pub last_query: DateTime<Utc>,
+    /// Most recent `mtime_ns` across indexed source files. Drives memo
+    /// invalidation: when this advances, the in-memory memos are dropped
+    /// because the underlying events may have changed.
+    pub mtime_ns: Option<i64>,
 }
 
 impl Default for CacheStatus {
@@ -65,23 +93,64 @@ impl Default for CacheStatus {
             event_count: 0,
             freshness: "unknown".into(),
             last_query: Utc::now(),
+            mtime_ns: None,
         }
     }
 }
+
+/// Memo key for the per-section `left` slice. Covers everything that
+/// materially affects what `load_left_axis` returns; two visits with the
+/// same key yield byte-identical rows.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LeftMemoKey(
+    pub Section,
+    pub TimeWindow,
+    pub SourceFilter,
+    pub TrendGranularity,
+);
+
+/// Memo key for the trend slice. Deliberately excludes `Section` — trend
+/// is a function of (window, source, granularity) only, so switching
+/// sections must reuse the cached entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TrendMemoKey(pub TimeWindow, pub SourceFilter, pub TrendGranularity);
 
 #[derive(Debug, Default, Clone)]
 pub struct DataCache {
     pub left: Vec<LeftRow>,
     pub sessions: Vec<SessionRow>,
+    /// Per-turn events for the currently drilled session (only populated
+    /// when the deepest drill is `DrillKind::Events`).
+    pub events: Vec<EventRow>,
     pub sparkline: Vec<f64>,
     /// Time-bucketed per-source rows; see [`TrendRow`] (field name = time-series slice, not the UI label).
     pub trend: Vec<TrendRow>,
     pub status: CacheStatus,
+    /// Per-section LeftRow memo. Hits replace the live `left` without
+    /// running SQL. Cleared on `Refresh` or when the events table's
+    /// `mtime_ns` advances (signaling re-ingest).
+    left_memo: BTreeMap<LeftMemoKey, Vec<LeftRow>>,
+    /// Per-(window, source, granularity) trend memo.
+    trend_memo: BTreeMap<TrendMemoKey, Vec<TrendRow>>,
+    /// Sparkline only depends on cache freshness — single optional cache.
+    sparkline_memo: Option<Vec<f64>>,
+    /// Last-seen events `mtime_ns` for the memos. When this differs from
+    /// the live status, all memos are dropped.
+    memo_mtime_ns: Option<i64>,
 }
 
 impl DataCache {
     pub fn refresh_all(&mut self, conn: &Connection, state: &AppState) {
         self.refresh_for(conn, state, crate::tui::state::RefreshMask::all());
+    }
+
+    /// Drop every in-memory memo. Called by `Action::Refresh` and
+    /// implicitly when ingest changes the underlying data.
+    pub fn clear_memos(&mut self) {
+        self.left_memo.clear();
+        self.trend_memo.clear();
+        self.sparkline_memo = None;
+        self.memo_mtime_ns = None;
     }
 
     pub fn refresh_for(
@@ -94,33 +163,104 @@ impl DataCache {
         let filter = base_filter(state, now);
         self.status = load_cache_status(conn, now).unwrap_or_else(|_| CacheStatus::default());
 
+        // Cache-freshness invalidation: if the underlying events table has
+        // been re-ingested since we last cached, drop every memo. Cheap —
+        // we already loaded `status.mtime_ns` above.
+        if self.memo_mtime_ns != self.status.mtime_ns {
+            self.left_memo.clear();
+            self.trend_memo.clear();
+            self.sparkline_memo = None;
+            self.memo_mtime_ns = self.status.mtime_ns;
+        }
+
         if mask.left {
-            self.left = load_left_axis(
-                conn,
+            let key = LeftMemoKey(
                 state.current_section,
-                filter.clone(),
+                state.time_window,
+                state.source_filter,
                 state.trend_granularity,
-            )
-            .unwrap_or_default();
-            sort_left_rows(&mut self.left, state.current_section, state.sort);
+            );
+            if let Some(cached) = self.left_memo.get(&key) {
+                self.left = cached.clone();
+                sort_left_rows(&mut self.left, state.current_section, state.sort);
+            } else {
+                self.left = load_left_axis(
+                    conn,
+                    state.current_section,
+                    filter.clone(),
+                    state.trend_granularity,
+                )
+                .unwrap_or_default();
+                // Memoize before sort so the cached form is canonical;
+                // each consumer applies its own sort on top.
+                self.left_memo.insert(key, self.left.clone());
+                sort_left_rows(&mut self.left, state.current_section, state.sort);
+            }
         }
         if mask.sessions {
-            // For drilled views, scope sessions to the drilled key.
-            // Otherwise, scope to whichever row is focused in the current section.
-            let (scope_section, sel_key): (Section, Option<String>) = match &state.drill {
-                Some(d) => (d.section, Some(d.key.clone())),
+            // For sessions-drill views, scope sessions to the drilled key
+            // and originating section. Otherwise scope to whichever row is
+            // focused in the current section.
+            let (scope_section, sel_key): (Section, Option<String>) = match state.deepest_drill() {
+                Some(d) => match d.kind {
+                    DrillKind::Sessions { from_section } => (from_section, Some(d.key.clone())),
+                    // Inside an events drill, the sessions slice is whatever
+                    // the parent (sessions-drill or section root) populated;
+                    // leave it unchanged.
+                    DrillKind::Events { .. } => {
+                        (state.current_section, left_selected_key(state, &self.left))
+                    }
+                },
                 None => (state.current_section, left_selected_key(state, &self.left)),
             };
-            self.sessions =
-                load_sessions_for(conn, scope_section, sel_key.as_deref(), filter.clone())
-                    .unwrap_or_default();
-            sort_session_rows(&mut self.sessions, state.sort);
+            // Inside an events drill, do NOT clobber the parent's session
+            // list — leave the previous sessions intact.
+            if !matches!(
+                state.deepest_drill().map(|d| d.kind),
+                Some(DrillKind::Events { .. })
+            ) {
+                self.sessions =
+                    load_sessions_for(conn, scope_section, sel_key.as_deref(), filter.clone())
+                        .unwrap_or_default();
+                sort_session_rows(&mut self.sessions, state.sort);
+            }
+        }
+        if mask.events {
+            self.events = match state.deepest_drill() {
+                Some(d) => match d.kind {
+                    DrillKind::Events { source } => {
+                        load_events_for(conn, source, &d.key, filter.clone()).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            sort_event_rows(&mut self.events, state.sort);
         }
         if mask.sparkline {
-            self.sparkline = load_sparkline(conn, 30).unwrap_or_default();
+            self.sparkline = match self.sparkline_memo.as_ref() {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fresh = load_sparkline(conn, 30).unwrap_or_default();
+                    self.sparkline_memo = Some(fresh.clone());
+                    fresh
+                }
+            };
         }
         if mask.trend {
-            self.trend = load_trend(conn, state, now).unwrap_or_default();
+            let key = TrendMemoKey(
+                state.time_window,
+                state.source_filter,
+                state.trend_granularity,
+            );
+            self.trend = match self.trend_memo.get(&key) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fresh = load_trend(conn, state, now).unwrap_or_default();
+                    self.trend_memo.insert(key, fresh.clone());
+                    fresh
+                }
+            };
         }
     }
 }
@@ -138,6 +278,7 @@ pub fn load_cache_status(conn: &Connection, now: DateTime<Utc>) -> Result<CacheS
         event_count: event_count.max(0) as u64,
         freshness,
         last_query: now,
+        mtime_ns: max_mtime_ns,
     })
 }
 
@@ -181,6 +322,25 @@ fn sort_left_rows(rows: &mut [LeftRow], section: Section, sort: Sort) {
             (true, false, true) => std::cmp::Ordering::Less,
             _ => ordering.then_with(|| a.label.cmp(&b.label)),
         }
+    });
+}
+
+fn sort_event_rows(rows: &mut [EventRow], sort: Sort) {
+    rows.sort_by(|a, b| match sort {
+        // Default chronological is preserved by load order; the sort cycle
+        // adds expense and reverse-chronological views on demand.
+        Sort::CostDesc => b
+            .cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.ts.cmp(&b.ts)),
+        Sort::CostAsc => a
+            .cost
+            .partial_cmp(&b.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.ts.cmp(&b.ts)),
+        Sort::RecentDesc => b.ts.cmp(&a.ts),
+        Sort::AlphaAsc => a.model.cmp(&b.model).then_with(|| a.ts.cmp(&b.ts)),
     });
 }
 
@@ -250,6 +410,8 @@ pub fn load_left_axis(
                     total_tokens: r.total_tokens,
                     cost: r.cost_usd,
                     is_no_repo: r.is_no_repo(),
+                    latest_ts: None,
+                    source: None,
                 })
                 .collect())
         }
@@ -259,13 +421,26 @@ pub fn load_left_axis(
             let rows = session_report(conn, filter)?;
             Ok(rows
                 .into_iter()
-                .map(|r| LeftRow {
-                    label: r.key.chars().take(10).collect(),
-                    key: r.key,
-                    sessions: 1,
-                    total_tokens: r.total_tokens,
-                    cost: r.cost_usd,
-                    is_no_repo: false,
+                .map(|r| {
+                    let source = match r.source {
+                        crate::types::SourceLabel::Source(s) => Some(s),
+                        _ => None,
+                    };
+                    LeftRow {
+                        label: r
+                            .project_path
+                            .as_deref()
+                            .map(crate::repo::project_basename)
+                            .map(String::from)
+                            .unwrap_or_else(|| r.key.chars().take(10).collect()),
+                        key: r.key,
+                        sessions: 1,
+                        total_tokens: r.total_tokens,
+                        cost: r.cost_usd,
+                        is_no_repo: false,
+                        latest_ts: r.latest_timestamp,
+                        source,
+                    }
                 })
                 .collect())
         }
@@ -322,7 +497,7 @@ fn load_periods(
             None => Value::Null,
         });
     }
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         Ok(LeftRow {
             label: row.get::<_, String>(0)?,
@@ -331,6 +506,8 @@ fn load_periods(
             cost: row.get::<_, f64>(2)?,
             total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
+            latest_ts: None,
+            source: None,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -370,7 +547,7 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             None => Value::Null,
         });
     }
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         Ok(LeftRow {
             label: row.get::<_, String>(0)?,
@@ -379,6 +556,8 @@ fn load_models(conn: &Connection, filter: QueryFilter) -> Result<Vec<LeftRow>> {
             cost: row.get::<_, f64>(2)?,
             total_tokens: row.get::<_, i64>(3)? as u64,
             is_no_repo: false,
+            latest_ts: None,
+            source: None,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -485,7 +664,7 @@ fn load_sessions_by_model(
             None => Value::Null,
         });
     }
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
         let src_str: String = row.get(1)?;
         let source = parse_source_column(src_str, 1)?;
@@ -528,9 +707,50 @@ fn day_bounds(day: &str) -> (i64, i64) {
     )
 }
 
+/// Load per-turn events for a single `(source, session_id)` pair, applying
+/// the active time-window if set. Ordered by `ts` ascending so the default
+/// chronological view comes for free; sort variants are applied in
+/// [`sort_event_rows`].
+pub fn load_events_for(
+    conn: &Connection,
+    source: Source,
+    session_id: &str,
+    filter: QueryFilter,
+) -> Result<Vec<EventRow>> {
+    let sql = "SELECT ts, model, input, output, cache_read, cache_write, cost_usd
+                 FROM events
+                WHERE source = ?1 AND session_id = ?2
+                  AND (?3 IS NULL OR ts >= ?3)
+                  AND (?4 IS NULL OR ts <= ?4)
+                ORDER BY ts ASC";
+    let mut stmt = conn.prepare_cached(sql)?;
+    let params: Vec<Value> = vec![
+        Value::Text(source.as_str().to_owned()),
+        Value::Text(session_id.to_owned()),
+        filter.since_ms.map_or(Value::Null, Value::Integer),
+        filter.until_ms.map_or(Value::Null, Value::Integer),
+    ];
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+        let ts_ms: i64 = row.get(0)?;
+        Ok(EventRow {
+            ts: Utc
+                .timestamp_millis_opt(ts_ms)
+                .single()
+                .unwrap_or_else(Utc::now),
+            model: row.get::<_, String>(1)?,
+            input: row.get::<_, i64>(2)? as u64,
+            output: row.get::<_, i64>(3)? as u64,
+            cache_read: row.get::<_, i64>(4)? as u64,
+            cache_write: row.get::<_, i64>(5)? as u64,
+            cost: row.get::<_, f64>(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn load_sparkline(conn: &Connection, days: u32) -> Result<Vec<f64>> {
     let sql = "SELECT day, SUM(cost_usd) FROM events GROUP BY day ORDER BY day DESC LIMIT ?1";
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map([days as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
     })?;
@@ -556,7 +776,7 @@ pub fn load_trend(
                  FROM events e
                  WHERE (?1 IS NULL OR e.ts >= ?1)
                  GROUP BY e.day, e.source"#;
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map([since_ms.map_or(Value::Null, Value::Integer)], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -678,6 +898,8 @@ mod tests {
                 total_tokens: 0,
                 cost: 2.0,
                 is_no_repo: false,
+                latest_ts: None,
+                source: None,
             },
             LeftRow {
                 label: "alpha".into(),
@@ -686,6 +908,8 @@ mod tests {
                 total_tokens: 0,
                 cost: 1.0,
                 is_no_repo: false,
+                latest_ts: None,
+                source: None,
             },
         ];
         sort_left_rows(&mut left, Section::Repos, Sort::AlphaAsc);
@@ -711,6 +935,156 @@ mod tests {
         ];
         sort_session_rows(&mut sessions, Sort::RecentDesc);
         assert_eq!(sessions[0].session_id, "new");
+    }
+
+    fn left_memo_key(state: &AppState) -> LeftMemoKey {
+        LeftMemoKey(
+            state.current_section,
+            state.time_window,
+            state.source_filter,
+            state.trend_granularity,
+        )
+    }
+
+    fn fixture_conn_with_events() -> Connection {
+        let mut conn = mk_conn();
+        let tx = conn.transaction().unwrap();
+        insert_events(
+            &tx,
+            &[
+                mk_event(1_000, "2024-01-01", "2024-01", Source::Claude, 1.0),
+                mk_event(2_000, "2024-01-02", "2024-01", Source::Claude, 2.0),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        conn
+    }
+
+    #[test]
+    fn left_memo_caches_after_first_refresh() {
+        let conn = fixture_conn_with_events();
+        let state = AppState {
+            current_section: Section::Days,
+            time_window: TimeWindow::All,
+            ..AppState::default()
+        };
+        let mut cache = DataCache::default();
+        cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+        let key = left_memo_key(&state);
+        assert!(
+            cache.left_memo.contains_key(&key),
+            "first refresh populates the memo"
+        );
+    }
+
+    #[test]
+    fn clear_memos_drops_everything() {
+        let conn = fixture_conn_with_events();
+        let state = AppState {
+            current_section: Section::Days,
+            time_window: TimeWindow::All,
+            ..AppState::default()
+        };
+        let mut cache = DataCache::default();
+        cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+        assert!(!cache.left_memo.is_empty());
+        cache.clear_memos();
+        assert!(cache.left_memo.is_empty());
+        assert!(cache.trend_memo.is_empty());
+        assert!(cache.sparkline_memo.is_none());
+        assert!(cache.memo_mtime_ns.is_none());
+    }
+
+    #[test]
+    fn switching_sections_keeps_both_memos_warm() {
+        let conn = fixture_conn_with_events();
+        let mut cache = DataCache::default();
+        let mut state = AppState {
+            current_section: Section::Days,
+            time_window: TimeWindow::All,
+            ..AppState::default()
+        };
+        cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+        let days_key = left_memo_key(&state);
+
+        // Visit Models — should add a second memo entry without evicting Days.
+        state.current_section = Section::Models;
+        cache.refresh_for(
+            &conn,
+            &state,
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+        let models_key = left_memo_key(&state);
+
+        assert!(cache.left_memo.contains_key(&days_key));
+        assert!(cache.left_memo.contains_key(&models_key));
+    }
+
+    #[test]
+    fn trend_memo_survives_section_switch() {
+        let conn = fixture_conn_with_events();
+        let mut cache = DataCache::default();
+        let mut state = AppState {
+            current_section: Section::Provider,
+            time_window: TimeWindow::All,
+            trend_granularity: TrendGranularity::Daily,
+            ..AppState::default()
+        };
+        cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+        let trend_key = TrendMemoKey(
+            state.time_window,
+            state.source_filter,
+            state.trend_granularity,
+        );
+        assert!(cache.trend_memo.contains_key(&trend_key));
+
+        // Switch to Repos and back — the same trend key must still be warm.
+        state.current_section = Section::Repos;
+        cache.refresh_for(
+            &conn,
+            &state,
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            cache.trend_memo.contains_key(&trend_key),
+            "trend memo is keyed without section, so a section switch must not evict it"
+        );
+    }
+
+    #[test]
+    fn mtime_change_clears_memos() {
+        let conn = fixture_conn_with_events();
+        let state = AppState {
+            current_section: Section::Days,
+            time_window: TimeWindow::All,
+            ..AppState::default()
+        };
+        let mut cache = DataCache::default();
+        cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+        assert!(!cache.left_memo.is_empty());
+
+        // Simulate ingest by advancing the recorded memo mtime so it
+        // differs from the live status on the next refresh — the live
+        // mtime will then reset memo_mtime_ns and clear the memos.
+        cache.memo_mtime_ns = Some(0);
+        cache.refresh_for(
+            &conn,
+            &state,
+            crate::tui::state::RefreshMask {
+                left: true,
+                ..Default::default()
+            },
+        );
+        // After this refresh the memo is freshly repopulated against the
+        // live mtime; assert the live mtime is what we expect.
+        assert_eq!(cache.memo_mtime_ns, cache.status.mtime_ns);
     }
 
     #[test]
@@ -859,6 +1233,59 @@ mod tests {
         assert_eq!(nov.cursor_cost, 0.0);
         assert!((nov.total_cost - 1.0).abs() < 1e-9);
         assert_eq!(nov.total_tokens, 20);
+    }
+
+    #[test]
+    fn load_events_for_returns_only_matching_session_ordered_chronologically() {
+        let mut conn = mk_conn();
+        let tx = conn.transaction().unwrap();
+        let mut e_match = mk_event(2_000, "2023-11-15", "2023-11", Source::Claude, 0.5);
+        e_match.session_id = "alpha".into();
+        let mut e_match_earlier = mk_event(1_000, "2023-11-15", "2023-11", Source::Claude, 0.2);
+        e_match_earlier.session_id = "alpha".into();
+        let mut e_other_session = mk_event(3_000, "2023-11-15", "2023-11", Source::Claude, 1.0);
+        e_other_session.session_id = "beta".into();
+        let mut e_other_source = mk_event(4_000, "2023-11-15", "2023-11", Source::Codex, 0.3);
+        e_other_source.session_id = "alpha".into();
+        insert_events(
+            &tx,
+            &[e_match, e_match_earlier, e_other_session, e_other_source],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let filter = QueryFilter {
+            source: None,
+            since_ms: None,
+            until_ms: None,
+            repo: None,
+        };
+        let rows = load_events_for(&conn, Source::Claude, "alpha", filter).unwrap();
+        assert_eq!(rows.len(), 2, "only alpha-claude events");
+        assert!(rows[0].ts < rows[1].ts, "ascending by ts");
+        assert!((rows[0].cost - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_events_for_respects_time_window() {
+        let mut conn = mk_conn();
+        let tx = conn.transaction().unwrap();
+        let mut early = mk_event(1_000, "2023-11-15", "2023-11", Source::Claude, 0.1);
+        early.session_id = "s".into();
+        let mut late = mk_event(5_000, "2023-11-15", "2023-11", Source::Claude, 0.2);
+        late.session_id = "s".into();
+        insert_events(&tx, &[early, late]).unwrap();
+        tx.commit().unwrap();
+
+        let filter = QueryFilter {
+            source: None,
+            since_ms: Some(3_000),
+            until_ms: None,
+            repo: None,
+        };
+        let rows = load_events_for(&conn, Source::Claude, "s", filter).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].cost - 0.2).abs() < 1e-9);
     }
 
     #[test]

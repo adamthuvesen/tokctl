@@ -76,13 +76,15 @@ impl Section {
         }
     }
 
-    /// Whether `Enter` on a row in this section pushes a drill view.
-    pub fn supports_drill(self) -> bool {
-        matches!(self, Section::Repos)
+    /// Whether rows in this section represent individually scoped drillable
+    /// entities. Provider buckets aggregate across sources/sessions and have
+    /// nothing meaningful to drill into; everything else does.
+    pub fn rows_drill_to_sessions(self) -> bool {
+        !matches!(self, Section::Provider | Section::Sessions)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeWindow {
     Today,
@@ -123,7 +125,7 @@ impl TimeWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceFilter {
     All,
@@ -180,7 +182,7 @@ impl Sort {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrendGranularity {
     Daily,
@@ -216,14 +218,27 @@ pub enum Focus {
     Main,
 }
 
-/// One level of in-main drill. `key` is the stable identifier (repo key,
-/// day bucket, etc.) for the row that was drilled into; `label` is the
-/// human-readable breadcrumb chunk.
+/// What the drill is showing. The kind determines which data slice fills the
+/// main pane and which row affordances apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrillKind {
+    /// Sessions scoped by some upstream section (repo / day / model).
+    Sessions { from_section: Section },
+    /// Per-turn events for a single `(source, session_id)`.
+    Events { source: crate::types::Source },
+}
+
+/// One level on the drill stack. `key` is the stable identifier of the row
+/// that was drilled into (repo key, day bucket, session id, …); `label` is
+/// the human-readable breadcrumb chunk; `cursor` is the row-cursor inside
+/// this drill's view, captured so we can restore it when a deeper drill is
+/// popped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Drill {
-    pub section: Section,
+    pub kind: DrillKind,
     pub key: String,
     pub label: String,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -242,15 +257,15 @@ pub struct AppState {
     pub help_open: bool,
     pub detail_open: bool,
     pub focus: Focus,
-    pub drill: Option<Drill>,
+    /// Stack of drill levels. Empty = at the section root. Each push deepens
+    /// the view (Section → Sessions → Events). Not persisted.
+    pub drill_stack: Vec<Drill>,
     /// Active tab index per section (only meaningful when `Section::tabs()` is non-empty).
     pub tab_per_section: BTreeMap<Section, u8>,
     /// Last-selected row key per section (persisted; falls back to first row when stale).
     pub section_selection: BTreeMap<Section, String>,
     /// Live row-cursor index per section (not persisted).
     pub section_index: BTreeMap<Section, usize>,
-    /// Live row-cursor index inside an active drill (not persisted).
-    pub drill_index: usize,
     /// Sidebar row cursor (live, not persisted — derived from `current_section`).
     pub sidebar_index: usize,
     pub filter: FilterState,
@@ -259,6 +274,9 @@ pub struct AppState {
     pub expanded: bool,
     /// One-shot intro flash on first launch under v3. Persisted so it shows once.
     pub seen_v3_intro: bool,
+    /// Set once a source-filter no-op flash has fired in the current events
+    /// drill, so the hint shows on first press only. Reset on every drill push/pop.
+    pub source_filter_hint_fired: bool,
 }
 
 impl Default for AppState {
@@ -273,16 +291,16 @@ impl Default for AppState {
             help_open: false,
             detail_open: false,
             focus: Focus::Main,
-            drill: None,
+            drill_stack: Vec::new(),
             tab_per_section: BTreeMap::new(),
             section_selection: BTreeMap::new(),
             section_index: BTreeMap::new(),
-            drill_index: 0,
             sidebar_index,
             filter: FilterState::default(),
             flash: None,
             expanded: false,
             seen_v3_intro: false,
+            source_filter_hint_fired: false,
         }
     }
 }
@@ -305,16 +323,38 @@ impl AppState {
         }
     }
 
+    /// True iff the main pane is currently showing a drilled view.
+    pub fn drill_active(&self) -> bool {
+        !self.drill_stack.is_empty()
+    }
+
+    /// Number of drill levels currently on the stack (0 at section root).
+    pub fn drill_depth(&self) -> usize {
+        self.drill_stack.len()
+    }
+
+    /// Deepest drill on the stack, i.e. the one whose contents the main
+    /// pane currently renders. `None` when at the section root.
+    pub fn deepest_drill(&self) -> Option<&Drill> {
+        self.drill_stack.last()
+    }
+
+    /// Mutable access to the deepest drill, used to update its cursor as the
+    /// user navigates within its view.
+    pub fn deepest_drill_mut(&mut self) -> Option<&mut Drill> {
+        self.drill_stack.last_mut()
+    }
+
     pub fn current_index(&self) -> usize {
-        if self.drill.is_some() {
-            return self.drill_index;
+        if let Some(d) = self.deepest_drill() {
+            return d.cursor;
         }
         *self.section_index.get(&self.current_section).unwrap_or(&0)
     }
 
     pub fn set_current_index(&mut self, idx: usize) {
-        if self.drill.is_some() {
-            self.drill_index = idx;
+        if let Some(d) = self.deepest_drill_mut() {
+            d.cursor = idx;
         } else {
             self.section_index.insert(self.current_section, idx);
         }
@@ -326,6 +366,7 @@ impl AppState {
 pub struct RefreshMask {
     pub left: bool,
     pub sessions: bool,
+    pub events: bool,
     pub sparkline: bool,
     pub trend: bool,
 }
@@ -335,12 +376,13 @@ impl RefreshMask {
         Self {
             left: true,
             sessions: true,
+            events: true,
             sparkline: true,
             trend: true,
         }
     }
     pub fn any(self) -> bool {
-        self.left || self.sessions || self.sparkline || self.trend
+        self.left || self.sessions || self.events || self.sparkline || self.trend
     }
 }
 
@@ -399,6 +441,112 @@ pub enum Action {
     None,
 }
 
+/// Centralized refresh-mask derivation: given an action, the section before
+/// it ran, and the resulting state, return the minimal set of cache slices
+/// that must be re-queried. One matrix, exhaustively declared, no scattered
+/// `out.refresh.X = true` lines through `apply()`.
+///
+/// Rules of thumb:
+/// - **Section change** (any path): `left` only. `trend` and `sparkline`
+///   don't depend on section, so they stay valid.
+/// - **Window / source / granularity change**: `left + trend + sparkline`
+///   — these three depend on the time window. Sessions/events stay
+///   scoped to the active drill and don't need reload here.
+/// - **Sort cycle**: `left`, plus the matching drill slice if currently
+///   inside one (so the drilled-into list re-sorts).
+/// - **Toggle expand**: empty. Pure layout, all data already in `left`.
+/// - **Drill push**: the slice the drill needs (`sessions` or `events`).
+/// - **Manual refresh (`r`)**: everything.
+/// - **Cursor moves at section root**: empty. Post-redesign nothing
+///   downstream depends on the focused row when not drilled.
+pub fn refresh_mask_for(action: &Action, section_before: Section, after: &AppState) -> RefreshMask {
+    let drilled_kind = after.deepest_drill().map(|d| d.kind);
+
+    // Section change subsumes any other mask the action might want — at
+    // root, no slice except `left` could meaningfully change yet.
+    if section_before != after.current_section {
+        return RefreshMask {
+            left: true,
+            ..RefreshMask::default()
+        };
+    }
+
+    match action {
+        Action::Refresh => RefreshMask::all(),
+
+        Action::SetWindow(_) | Action::SetSource(_) => RefreshMask {
+            left: true,
+            trend: true,
+            sparkline: true,
+            ..RefreshMask::default()
+        },
+
+        Action::SetTrendGranularity(_) => RefreshMask {
+            // Days section also buckets by granularity, so `left` reloads.
+            left: true,
+            trend: true,
+            ..RefreshMask::default()
+        },
+
+        Action::CycleSort => RefreshMask {
+            left: true,
+            sessions: matches!(drilled_kind, Some(DrillKind::Sessions { .. })),
+            events: matches!(drilled_kind, Some(DrillKind::Events { .. })),
+            ..RefreshMask::default()
+        },
+
+        Action::CycleTab => RefreshMask {
+            // Tabs on Repos swap between Costs (left) and Provider (trend).
+            left: true,
+            trend: true,
+            ..RefreshMask::default()
+        },
+
+        Action::Drill => match after.next_drill_kind_hint() {
+            // Note: `Drill` runs BEFORE `push_drill` in the event loop, so
+            // `deepest_drill()` here still reflects the parent. We use
+            // `next_drill_kind_hint` to know which slice the upcoming
+            // child view will need.
+            Some(DrillKind::Sessions { .. }) => RefreshMask {
+                sessions: true,
+                ..RefreshMask::default()
+            },
+            Some(DrillKind::Events { .. }) => RefreshMask {
+                events: true,
+                ..RefreshMask::default()
+            },
+            None => RefreshMask::default(),
+        },
+
+        Action::ToggleExpand
+        | Action::PopDrill
+        | Action::Pop
+        | Action::FocusSidebar
+        | Action::FocusMain
+        | Action::ToggleHelp
+        | Action::ToggleDetail
+        | Action::FilterOpen
+        | Action::FilterChar(_)
+        | Action::FilterBackspace
+        | Action::FilterCommit
+        | Action::FilterCancel
+        | Action::Yank
+        | Action::YankSummary
+        | Action::DismissFlash
+        | Action::None
+        | Action::Quit
+        | Action::JumpToSection(_)
+        | Action::NextSection
+        | Action::PrevSection
+        | Action::MoveUp
+        | Action::MoveDown
+        | Action::PageUp
+        | Action::PageDown
+        | Action::Top
+        | Action::Bottom => RefreshMask::default(),
+    }
+}
+
 impl AppState {
     pub fn apply(&mut self, action: Action) -> ApplyOutcome {
         let mut out = ApplyOutcome::default();
@@ -419,29 +567,52 @@ impl AppState {
             Action::DismissFlash => {}
             Action::FocusSidebar => {
                 self.focus = Focus::Sidebar;
+                out.dirty = true;
             }
             Action::FocusMain => {
                 self.focus = Focus::Main;
+                out.dirty = true;
             }
-            Action::MoveUp => self.nudge_selection(-1),
-            Action::MoveDown => self.nudge_selection(1),
-            Action::PageUp => self.nudge_selection(-10),
-            Action::PageDown => self.nudge_selection(10),
-            Action::Top => self.set_selection(0),
-            Action::Bottom => self.set_selection(usize::MAX),
+            Action::MoveUp => {
+                self.nudge_selection(-1);
+                out.dirty = true;
+            }
+            Action::MoveDown => {
+                self.nudge_selection(1);
+                out.dirty = true;
+            }
+            Action::PageUp => {
+                self.nudge_selection(-10);
+                out.dirty = true;
+            }
+            Action::PageDown => {
+                self.nudge_selection(10);
+                out.dirty = true;
+            }
+            Action::Top => {
+                self.set_selection(0);
+                out.dirty = true;
+            }
+            Action::Bottom => {
+                self.set_selection(usize::MAX);
+                out.dirty = true;
+            }
             Action::NextSection => {
-                self.switch_section(self.current_section.next(), &mut out);
+                self.switch_section(self.current_section.next());
+                out.dirty = true;
             }
             Action::PrevSection => {
-                self.switch_section(self.current_section.prev(), &mut out);
+                self.switch_section(self.current_section.prev());
+                out.dirty = true;
             }
             Action::JumpToSection(s) => {
                 if self.current_section != s {
-                    self.switch_section(s, &mut out);
-                } else if self.drill.is_some() {
-                    // already on the section but drilled — pop back
-                    self.drill = None;
-                    self.drill_index = 0;
+                    self.switch_section(s);
+                    out.dirty = true;
+                } else if self.drill_active() {
+                    // already on the section but drilled — pop back to root
+                    self.drill_stack.clear();
+                    self.source_filter_hint_fired = false;
                     out.dirty = true;
                 }
             }
@@ -451,170 +622,146 @@ impl AppState {
                     let cur = self.active_tab_index();
                     let next = ((cur as usize + 1) % tabs.len()) as u8;
                     self.tab_per_section.insert(self.current_section, next);
-                    out.refresh.left = true;
-                    out.refresh.trend = true;
-                    out.needs_refresh = true;
                     out.dirty = true;
                 }
             }
             Action::Drill => {
-                // The actual key/label is filled in by mod.rs after it reads
-                // the focused row and calls `set_drill`. Here we only mark
-                // that the drill view will need scoped sessions. drill state
-                // itself isn't persisted, so dirty stays false.
-                if self.drill.is_none() && self.current_section.supports_drill() {
-                    out.refresh.sessions = true;
-                    out.needs_refresh = true;
+                // The actual Drill is constructed in mod.rs after it reads
+                // the focused row, then pushed via `push_drill`. The mask
+                // derivation below picks up `next_drill_kind_hint`.
+                if self.next_drill_kind_hint().is_some() {
+                    out.dirty = true;
                 }
             }
             Action::PopDrill => {
-                if self.drill.is_some() {
-                    self.drill = None;
-                    self.drill_index = 0;
+                if self.drill_active() {
+                    self.drill_stack.pop();
+                    self.source_filter_hint_fired = false;
                     self.focus = Focus::Main;
                     out.dirty = true;
                 } else {
                     self.focus = Focus::Sidebar;
+                    out.dirty = true;
                 }
             }
             Action::Pop => {
                 if self.filter.active {
                     self.filter.active = false;
                     self.filter.query.clear();
+                    out.dirty = true;
                 } else if self.detail_open {
                     self.detail_open = false;
+                    out.dirty = true;
                 } else if self.help_open {
                     self.help_open = false;
-                } else if self.drill.is_some() {
-                    self.drill = None;
-                    self.drill_index = 0;
+                    out.dirty = true;
+                } else if self.drill_active() {
+                    self.drill_stack.pop();
+                    self.source_filter_hint_fired = false;
                     self.focus = Focus::Main;
                     out.dirty = true;
                 } else if self.focus == Focus::Main {
                     self.focus = Focus::Sidebar;
+                    out.dirty = true;
                 }
             }
             Action::CycleSort => {
                 self.sort = self.sort.next();
-                out.refresh.left = true;
-                out.refresh.sessions = true;
-                out.needs_refresh = true;
                 out.dirty = true;
             }
             Action::ToggleHelp => {
                 self.help_open = !self.help_open;
+                out.dirty = true;
             }
             Action::ToggleDetail => {
                 if !self.help_open {
                     self.detail_open = !self.detail_open;
+                    out.dirty = true;
                 }
             }
             Action::SetWindow(w) => {
                 if self.time_window != w {
                     self.time_window = w;
-                    out.refresh = RefreshMask::all();
-                    out.needs_refresh = true;
                     out.dirty = true;
                 }
             }
             Action::SetSource(s) => {
                 if self.source_filter != s {
                     self.source_filter = s;
-                    out.refresh = RefreshMask::all();
-                    out.needs_refresh = true;
+                    // Inside an Events drill the source is fixed by the
+                    // drilled `(source, session_id)` tuple — flip the header
+                    // value but skip the refetch and surface a one-shot hint.
+                    if matches!(
+                        self.deepest_drill().map(|d| d.kind),
+                        Some(DrillKind::Events { .. })
+                    ) && !self.source_filter_hint_fired
+                    {
+                        self.flash = Some("source filter ignored inside session".to_owned());
+                        self.source_filter_hint_fired = true;
+                    }
                     out.dirty = true;
                 }
             }
             Action::SetTrendGranularity(g) => {
                 if self.trend_granularity != g {
                     self.trend_granularity = g;
-                    // Days section also buckets by granularity, so refresh
-                    // the left-table data too.
-                    out.refresh.left = true;
-                    out.refresh.trend = true;
-                    out.needs_refresh = true;
                     out.dirty = true;
                 }
             }
             Action::Refresh => {
-                out.refresh = RefreshMask::all();
-                out.needs_refresh = true;
+                out.dirty = true;
             }
             Action::FilterOpen => {
                 self.filter.active = true;
                 self.filter.query.clear();
+                out.dirty = true;
             }
             Action::FilterChar(c) => {
                 if self.filter.active {
                     self.filter.query.push(c);
+                    out.dirty = true;
                 }
             }
             Action::FilterBackspace => {
                 if self.filter.active {
                     self.filter.query.pop();
+                    out.dirty = true;
                 }
             }
             Action::FilterCommit => {
                 self.filter.active = false;
+                out.dirty = true;
             }
             Action::FilterCancel => {
                 self.filter.active = false;
                 self.filter.query.clear();
+                out.dirty = true;
             }
             Action::Yank => {}
             Action::YankSummary => {}
             Action::ToggleExpand => {
                 self.expanded = !self.expanded;
-                out.refresh.left = true;
-                out.refresh.sessions = true;
-                out.needs_refresh = true;
                 out.dirty = true;
             }
         }
 
-        // Selection movement triggers a downstream refresh: in main (without
-        // drill) it may rescope sessions; in the sidebar it changes the
-        // active section, handled by the section-change check below.
-        match action {
-            Action::MoveUp
-            | Action::MoveDown
-            | Action::PageUp
-            | Action::PageDown
-            | Action::Top
-            | Action::Bottom => {
-                if self.focus != Focus::Sidebar {
-                    out.refresh.sessions = true;
-                    out.needs_refresh = true;
-                }
-                out.dirty = true;
-            }
-            _ => {}
-        }
-
-        // Catch-all: if any path changed the active section, force a full
-        // refresh. This covers sidebar j/k/gg/G/page nav that updates
-        // current_section directly via nudge_selection / set_selection.
-        if self.current_section != section_before {
-            out.refresh = RefreshMask::all();
-            out.needs_refresh = true;
-            out.dirty = true;
-        }
+        // Centralized refresh-mask derivation. One match, exhaustively
+        // declared, no scattered `out.refresh.X = true` lines.
+        out.refresh = refresh_mask_for(&action, section_before, self);
+        out.needs_refresh = out.refresh.any();
 
         out
     }
 
-    fn switch_section(&mut self, target: Section, out: &mut ApplyOutcome) {
+    fn switch_section(&mut self, target: Section) {
         if self.current_section == target {
             return;
         }
         self.current_section = target;
         self.sidebar_index = Section::ALL.iter().position(|s| *s == target).unwrap_or(0);
-        self.drill = None;
-        self.drill_index = 0;
+        self.drill_stack.clear();
+        self.source_filter_hint_fired = false;
         self.focus = Focus::Main;
-        out.refresh = RefreshMask::all();
-        out.needs_refresh = true;
-        out.dirty = true;
     }
 
     fn nudge_selection(&mut self, delta: isize) {
@@ -623,8 +770,8 @@ impl AppState {
                 as usize;
             self.sidebar_index = new;
             self.current_section = Section::ALL[new];
-            self.drill = None;
-            self.drill_index = 0;
+            self.drill_stack.clear();
+            self.source_filter_hint_fired = false;
         } else {
             let cur = self.current_index() as isize;
             let new = cur.saturating_add(delta).max(0) as usize;
@@ -637,19 +784,57 @@ impl AppState {
             let new = idx.min(Section::ALL.len() - 1);
             self.sidebar_index = new;
             self.current_section = Section::ALL[new];
-            self.drill = None;
-            self.drill_index = 0;
+            self.drill_stack.clear();
+            self.source_filter_hint_fired = false;
         } else {
             self.set_current_index(idx);
         }
     }
 
-    /// Push a drill view onto the main pane. Called by the event loop after
-    /// the focused row's key/label is resolved from the data cache.
-    pub fn set_drill(&mut self, drill: Drill) {
-        self.drill = Some(drill);
-        self.drill_index = 0;
+    /// Push a drill onto the stack. The new view starts with cursor at 0.
+    /// Caller is responsible for ensuring the push is legal (see
+    /// [`AppState::next_drill_kind_hint`] / [`AppState::can_push_drill`]).
+    pub fn push_drill(&mut self, mut drill: Drill) {
+        drill.cursor = 0;
+        self.drill_stack.push(drill);
+        self.source_filter_hint_fired = false;
         self.focus = Focus::Main;
+    }
+
+    /// What kind of drill the next `Action::Drill` *would* push, given the
+    /// current section and stack top. Returns `None` for "no drill possible
+    /// from here", which lets the dispatcher both gate the push and pre-flag
+    /// which cache slice needs refetching.
+    pub fn next_drill_kind_hint(&self) -> Option<DrillKind> {
+        match self.deepest_drill() {
+            None => {
+                if self.current_section == Section::Sessions {
+                    // Source comes from the focused row; mod.rs fills it in.
+                    Some(DrillKind::Events {
+                        source: crate::types::Source::Claude,
+                    })
+                } else if self.current_section.rows_drill_to_sessions() {
+                    Some(DrillKind::Sessions {
+                        from_section: self.current_section,
+                    })
+                } else {
+                    None
+                }
+            }
+            Some(d) => match d.kind {
+                // Sessions drill: rows are sessions → push events.
+                DrillKind::Sessions { .. } => Some(DrillKind::Events {
+                    source: crate::types::Source::Claude,
+                }),
+                // Events drill: terminal level.
+                DrillKind::Events { .. } => None,
+            },
+        }
+    }
+
+    /// Whether `Action::Drill` would do anything in the current state.
+    pub fn can_push_drill(&self) -> bool {
+        self.next_drill_kind_hint().is_some()
     }
 }
 
@@ -769,10 +954,13 @@ mod tests {
     }
 
     #[test]
-    fn only_repos_supports_drill() {
-        assert!(Section::Repos.supports_drill());
-        assert!(!Section::Days.supports_drill());
-        assert!(!Section::Provider.supports_drill());
+    fn rows_drill_to_sessions_excludes_provider_and_sessions() {
+        assert!(Section::Repos.rows_drill_to_sessions());
+        assert!(Section::Days.rows_drill_to_sessions());
+        assert!(Section::Models.rows_drill_to_sessions());
+        // Sessions rows drill *to events*, not to a sessions list.
+        assert!(!Section::Sessions.rows_drill_to_sessions());
+        assert!(!Section::Provider.rows_drill_to_sessions());
     }
 
     #[test]
@@ -816,15 +1004,21 @@ mod tests {
 
     #[test]
     fn drill_set_and_pop() {
-        let mut s = AppState::default();
-        s.set_drill(Drill {
-            section: Section::Repos,
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
             key: "tokctl".into(),
             label: "tokctl".into(),
+            cursor: 0,
         });
-        assert!(s.drill.is_some());
+        assert_eq!(s.drill_depth(), 1);
         let out = s.apply(Action::PopDrill);
-        assert!(s.drill.is_none());
+        assert_eq!(s.drill_depth(), 0);
         assert!(out.dirty);
     }
 
@@ -838,14 +1032,20 @@ mod tests {
 
     #[test]
     fn pop_cascades_drill_then_focus() {
-        let mut s = AppState::default();
-        s.set_drill(Drill {
-            section: Section::Repos,
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
             key: "x".into(),
             label: "x".into(),
+            cursor: 0,
         });
         s.apply(Action::Pop);
-        assert!(s.drill.is_none());
+        assert_eq!(s.drill_depth(), 0);
         assert_eq!(s.focus, Focus::Main);
         s.apply(Action::Pop);
         assert_eq!(s.focus, Focus::Sidebar);
@@ -864,21 +1064,24 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_move_triggers_full_refresh() {
+    fn sidebar_move_only_refreshes_left() {
         let mut s = AppState {
             focus: Focus::Sidebar,
             ..AppState::default()
         };
         let out = s.apply(Action::MoveDown);
         assert_eq!(s.current_section, Section::Models);
-        assert!(out.needs_refresh, "section change must trigger refresh");
-        assert!(out.refresh.left, "left/main pane data must refetch");
-        assert!(out.refresh.sessions);
-        assert!(out.refresh.trend);
+        assert!(out.needs_refresh, "section change triggers a refresh");
+        assert!(out.refresh.left, "left rebinds to the new section's data");
+        // Trend / sparkline / sessions / events don't depend on section.
+        assert!(!out.refresh.sessions);
+        assert!(!out.refresh.trend);
+        assert!(!out.refresh.sparkline);
+        assert!(!out.refresh.events);
     }
 
     #[test]
-    fn sidebar_bottom_jumps_and_refreshes() {
+    fn sidebar_bottom_jumps_and_refreshes_left_only() {
         let mut s = AppState {
             focus: Focus::Sidebar,
             ..AppState::default()
@@ -887,7 +1090,8 @@ mod tests {
         assert_eq!(s.current_section, Section::Sessions);
         assert!(out.needs_refresh);
         assert!(out.refresh.left);
-        assert!(out.refresh.trend);
+        assert!(!out.refresh.trend);
+        assert!(!out.refresh.sparkline);
     }
 
     #[test]
@@ -990,14 +1194,343 @@ mod tests {
     fn drill_is_not_persisted() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("ui_state.json");
-        let mut s = AppState::default();
-        s.set_drill(Drill {
-            section: Section::Repos,
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
             key: "tokctl".into(),
             label: "tokctl".into(),
+            cursor: 0,
         });
         save(&p, &s).unwrap();
         let loaded = load(&p);
-        assert!(loaded.drill.is_none());
+        assert_eq!(loaded.drill_depth(), 0);
+    }
+
+    // ---- new tests for the drill stack ---------------------------------
+
+    #[test]
+    fn next_drill_kind_root_repos_is_sessions() {
+        let s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        assert!(matches!(
+            s.next_drill_kind_hint(),
+            Some(DrillKind::Sessions {
+                from_section: Section::Repos
+            })
+        ));
+    }
+
+    #[test]
+    fn next_drill_kind_root_sessions_is_events() {
+        let s = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        assert!(matches!(
+            s.next_drill_kind_hint(),
+            Some(DrillKind::Events { .. })
+        ));
+    }
+
+    #[test]
+    fn next_drill_kind_root_provider_is_none() {
+        let s = AppState {
+            current_section: Section::Provider,
+            ..AppState::default()
+        };
+        assert!(s.next_drill_kind_hint().is_none());
+    }
+
+    #[test]
+    fn next_drill_kind_inside_sessions_drill_is_events() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        assert!(matches!(
+            s.next_drill_kind_hint(),
+            Some(DrillKind::Events { .. })
+        ));
+    }
+
+    #[test]
+    fn next_drill_kind_inside_events_is_terminal() {
+        let mut s = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        assert!(s.next_drill_kind_hint().is_none());
+    }
+
+    #[test]
+    fn esc_pops_one_level_at_a_time() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        s.push_drill(Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        assert_eq!(s.drill_depth(), 2);
+        s.apply(Action::PopDrill);
+        assert_eq!(s.drill_depth(), 1);
+        s.apply(Action::PopDrill);
+        assert_eq!(s.drill_depth(), 0);
+    }
+
+    #[test]
+    fn drill_action_signals_correct_refresh() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::Drill);
+        assert!(out.refresh.sessions);
+        assert!(!out.refresh.events);
+
+        let mut s = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::Drill);
+        assert!(out.refresh.events);
+        assert!(!out.refresh.sessions);
+
+        let mut s = AppState {
+            current_section: Section::Provider,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::Drill);
+        assert!(!out.refresh.events);
+        assert!(!out.refresh.sessions);
+    }
+
+    #[test]
+    fn cursor_lives_inside_each_drill() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        s.set_current_index(3);
+        assert_eq!(s.current_index(), 3);
+        s.push_drill(Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        // The new deepest drill starts at 0, even though the parent had cursor 3.
+        assert_eq!(s.current_index(), 0);
+        s.set_current_index(7);
+        assert_eq!(s.current_index(), 7);
+        // Pop, parent cursor restored.
+        s.apply(Action::PopDrill);
+        assert_eq!(s.current_index(), 3);
+    }
+
+    #[test]
+    fn source_filter_inside_events_drill_skips_event_refetch_with_flash() {
+        let mut s = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        let out = s.apply(Action::SetSource(SourceFilter::Codex));
+        // Filter persisted; the events slice is NOT re-fetched (the drilled
+        // session is fixed to one source). Parent slices that genuinely
+        // depend on source still refresh so popping back is correct.
+        assert_eq!(s.source_filter, SourceFilter::Codex);
+        assert!(!out.refresh.events);
+        assert!(!out.refresh.sessions);
+        assert!(out.refresh.left);
+        assert_eq!(
+            s.flash.as_deref(),
+            Some("source filter ignored inside session")
+        );
+        // Subsequent change does NOT re-flash.
+        s.flash = None;
+        let _ = s.apply(Action::SetSource(SourceFilter::Cursor));
+        assert!(s.flash.is_none());
+    }
+
+    // ---- new matrix tests for refresh_mask_for ------------------------------
+
+    #[test]
+    fn toggle_expand_does_no_refresh() {
+        let mut s = AppState::default();
+        let out = s.apply(Action::ToggleExpand);
+        assert!(s.expanded);
+        assert!(!out.refresh.any());
+        assert!(!out.needs_refresh);
+        // Still dirty so the redraw happens.
+        assert!(out.dirty);
+    }
+
+    #[test]
+    fn cycle_sort_at_root_only_refreshes_left() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::CycleSort);
+        assert!(out.refresh.left);
+        assert!(!out.refresh.sessions);
+        assert!(!out.refresh.events);
+        assert!(!out.refresh.trend);
+    }
+
+    #[test]
+    fn cycle_sort_in_sessions_drill_refreshes_sessions_too() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        let out = s.apply(Action::CycleSort);
+        assert!(out.refresh.left);
+        assert!(out.refresh.sessions);
+        assert!(!out.refresh.events);
+    }
+
+    #[test]
+    fn cycle_sort_in_events_drill_refreshes_events_too() {
+        let mut s = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        let out = s.apply(Action::CycleSort);
+        assert!(out.refresh.left);
+        assert!(out.refresh.events);
+        assert!(!out.refresh.sessions);
+    }
+
+    #[test]
+    fn set_window_refreshes_left_trend_sparkline_only() {
+        let mut s = AppState::default();
+        let out = s.apply(Action::SetWindow(TimeWindow::Today));
+        assert!(out.refresh.left);
+        assert!(out.refresh.trend);
+        assert!(out.refresh.sparkline);
+        assert!(!out.refresh.sessions);
+        assert!(!out.refresh.events);
+    }
+
+    #[test]
+    fn set_granularity_refreshes_left_and_trend() {
+        let mut s = AppState::default();
+        let out = s.apply(Action::SetTrendGranularity(TrendGranularity::Daily));
+        assert!(out.refresh.left);
+        assert!(out.refresh.trend);
+        assert!(!out.refresh.sparkline);
+        assert!(!out.refresh.sessions);
+    }
+
+    #[test]
+    fn cursor_move_at_root_refreshes_nothing() {
+        let mut s = AppState {
+            focus: Focus::Main,
+            ..AppState::default()
+        };
+        let out = s.apply(Action::MoveDown);
+        assert!(!out.needs_refresh, "no SQL on plain cursor moves");
+        assert!(out.dirty, "still need to redraw to move the highlight");
+    }
+
+    #[test]
+    fn refresh_action_invalidates_everything() {
+        let mut s = AppState::default();
+        let out = s.apply(Action::Refresh);
+        assert!(out.refresh.left);
+        assert!(out.refresh.sessions);
+        assert!(out.refresh.events);
+        assert!(out.refresh.trend);
+        assert!(out.refresh.sparkline);
+    }
+
+    #[test]
+    fn pop_drill_refreshes_nothing() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        let out = s.apply(Action::PopDrill);
+        assert!(!out.needs_refresh);
+        assert!(out.dirty);
     }
 }
