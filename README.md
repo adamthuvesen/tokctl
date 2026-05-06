@@ -112,7 +112,7 @@ Desktop **Claude.app** and **Codex.app** write to the same JSONL locations as th
 
 ---
 
-## How it works (briefly)
+## How it works
 
 - **Repo attribution:** nearest `.git` ancestor of each event's project path (Claude) or `cwd` (Codex), symlink-normalized. No match → `(no-repo)`.
 - **Ingest:** parallel parse, serial writes. Files ≥ 1 MB are mmapped; recently modified files bypass mmap via a safety window in the ingest plan.
