@@ -5,9 +5,6 @@ A terminal dashboard for what you actually spent on **Claude**, **Codex**, and *
 ```sh
 tokctl ui
 ```
-
-That's the whole pitch. Open it, drill into a day, repo, or session — three levels deep, all the way down to the individual turn — and see where the money went.
-
 ---
 
 ## Install
