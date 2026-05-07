@@ -23,6 +23,10 @@ impl ManifestLike for FileManifestRow {
     fn mtime_ns(&self) -> i64 {
         self.mtime_ns
     }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 #[derive(Debug, Clone)]

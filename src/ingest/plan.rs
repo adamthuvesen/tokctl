@@ -62,7 +62,7 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
             continue;
         }
 
-        if d.source == Source::Cursor {
+        if matches!(d.source, Source::Codex | Source::Cursor) {
             plan.to_full_parse.push(d.clone());
             continue;
         }
@@ -106,9 +106,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn mk_file(path: &str, size: u64, mtime: i64) -> DiscoveredFile {
+        mk_file_with_source(path, Source::Claude, size, mtime)
+    }
+
+    fn mk_file_with_source(path: &str, source: Source, size: u64, mtime: i64) -> DiscoveredFile {
         DiscoveredFile {
             path: PathBuf::from(path),
-            source: Source::Claude,
+            source,
             project: None,
             size,
             mtime_ns: mtime,
@@ -303,6 +307,43 @@ mod tests {
             FileManifestRow {
                 path: PathBuf::from("/cursor/usage.csv"),
                 source: Source::Cursor,
+                project: None,
+                size: 500,
+                mtime_ns: mt,
+                last_offset: 500,
+                n_events: 0,
+                session_id: None,
+                model: None,
+            },
+        );
+        let plan = plan_ingest(PlanInput {
+            manifest: &manifest,
+            discovery: &discovery,
+            safety_window_ms: 3_600_000,
+            now_ms: base_now_ms(),
+        });
+        assert_eq!(plan.to_full_parse.len(), 1);
+        assert!(plan.to_tail.is_empty());
+    }
+
+    #[test]
+    fn changed_codex_file_goes_to_full_parse_not_tail() {
+        let mt = far_past_ns();
+        let discovery = Discovery {
+            files: vec![mk_file_with_source(
+                "/codex/sess.jsonl",
+                Source::Codex,
+                800,
+                mt + 1,
+            )],
+            unchanged_paths: Default::default(),
+        };
+        let mut manifest = HashMap::new();
+        manifest.insert(
+            PathBuf::from("/codex/sess.jsonl"),
+            FileManifestRow {
+                path: PathBuf::from("/codex/sess.jsonl"),
+                source: Source::Codex,
                 project: None,
                 size: 500,
                 mtime_ns: mt,
