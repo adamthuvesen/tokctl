@@ -25,6 +25,7 @@ pub struct Discovery {
 /// The store module defines the full struct.
 pub trait ManifestLike {
     fn mtime_ns(&self) -> i64;
+    fn size(&self) -> u64;
 }
 
 /// Convert a SystemTime (typically from std::fs::Metadata::modified) to
@@ -111,15 +112,22 @@ fn walk_with_short_circuit<M: ManifestLike>(
     let dir_pb = dir.to_path_buf();
     if let Some(entry) = index.get(&dir_pb) {
         if dir_mtime_ns <= entry.max_mtime_ns {
-            // Dir hasn't advanced past any manifest entry. Short-circuit unless
-            // any manifest file under here is "recent" (within safety window).
-            let has_recent = entry.paths.iter().any(|p| {
-                manifest
-                    .get(p)
-                    .map(|r| r.mtime_ns() >= safety_threshold_ns)
-                    .unwrap_or(false)
+            // Dir hasn't advanced past any manifest entry. Short-circuit only
+            // when every known file still matches; appends update file metadata
+            // without necessarily touching the parent directory mtime.
+            let all_files_unchanged = entry.paths.iter().all(|p| {
+                let Some(row) = manifest.get(p) else {
+                    return false;
+                };
+                if row.mtime_ns() >= safety_threshold_ns {
+                    return false;
+                }
+                let Ok(md) = std::fs::metadata(p) else {
+                    return false;
+                };
+                md.is_file() && md.len() == row.size() && mtime_ns(&md) == row.mtime_ns()
             });
-            if !has_recent {
+            if all_files_unchanged {
                 for p in &entry.paths {
                     out.unchanged_paths.insert(p.clone());
                 }
@@ -274,12 +282,34 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::Write;
     use tempfile::tempdir;
 
-    struct FakeRow(i64);
+    struct FakeRow {
+        size: u64,
+        mtime_ns: i64,
+    }
+
     impl ManifestLike for FakeRow {
         fn mtime_ns(&self) -> i64 {
-            self.0
+            self.mtime_ns
+        }
+
+        fn size(&self) -> u64 {
+            self.size
+        }
+    }
+
+    fn stale_short_circuit_mtime_ns() -> i64 {
+        // Future relative to test-created files, but older than the synthetic
+        // safety threshold below so the row is not treated as "recent".
+        1_900_000_000_000_000_000
+    }
+
+    fn stale_short_circuit_opts() -> DiscoverOpts {
+        DiscoverOpts {
+            safety_window_ms: 60_000,
+            now_ms: 1_900_000_060_001,
         }
     }
 
@@ -367,5 +397,52 @@ mod tests {
         assert_eq!(d.files.len(), 1);
         assert_eq!(d.files[0].source, Source::Cursor);
         assert!(d.files[0].project.is_none());
+    }
+
+    #[test]
+    fn changed_file_in_stale_directory_is_discovered() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("sess.jsonl");
+        fs::write(&path, b"{\"type\":\"user\"}\n").unwrap();
+        let cached_size = fs::metadata(&path).unwrap().len();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{{\"type\":\"event_msg\"}}").unwrap();
+
+        let mut manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
+        manifest.insert(
+            path.clone(),
+            FakeRow {
+                size: cached_size,
+                mtime_ns: stale_short_circuit_mtime_ns(),
+            },
+        );
+
+        let d = discover_codex(&[root.to_path_buf()], &manifest, stale_short_circuit_opts());
+
+        assert!(d.unchanged_paths.is_empty());
+        assert_eq!(d.files.len(), 1);
+        assert_eq!(d.files[0].path, path);
+    }
+
+    #[test]
+    fn disappeared_file_in_stale_directory_is_not_marked_unchanged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("gone.jsonl");
+
+        let mut manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
+        manifest.insert(
+            path.clone(),
+            FakeRow {
+                size: 100,
+                mtime_ns: stale_short_circuit_mtime_ns(),
+            },
+        );
+
+        let d = discover_codex(&[root.to_path_buf()], &manifest, stale_short_circuit_opts());
+
+        assert!(d.files.is_empty());
+        assert!(d.unchanged_paths.is_empty());
     }
 }

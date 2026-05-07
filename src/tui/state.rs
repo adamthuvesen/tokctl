@@ -455,9 +455,10 @@ pub enum Action {
 /// Rules of thumb:
 /// - **Section change** (any path): `left` only. `trend` and `sparkline`
 ///   don't depend on section, so they stay valid.
-/// - **Window / source / granularity change**: `left + trend + sparkline`
-///   — these three depend on the time window. Sessions/events stay
-///   scoped to the active drill and don't need reload here.
+/// - **Window change**: `left + trend + sparkline`, plus the currently
+///   drilled slice because sessions/events also apply the active window.
+/// - **Source change**: `left + trend + sparkline`. Event drills are fixed
+///   to their drilled `(source, session_id)` tuple.
 /// - **Sort cycle**: `left`, plus the matching drill slice if currently
 ///   inside one (so the drilled-into list re-sorts).
 /// - **Toggle expand**: empty. Pure layout, all data already in `left`.
@@ -480,7 +481,15 @@ pub fn refresh_mask_for(action: &Action, section_before: Section, after: &AppSta
     match action {
         Action::Refresh => RefreshMask::all(),
 
-        Action::SetWindow(_) | Action::SetSource(_) => RefreshMask {
+        Action::SetWindow(_) => RefreshMask {
+            left: true,
+            sessions: matches!(drilled_kind, Some(DrillKind::Sessions { .. })),
+            events: matches!(drilled_kind, Some(DrillKind::Events { .. })),
+            trend: true,
+            sparkline: true,
+        },
+
+        Action::SetSource(_) => RefreshMask {
             left: true,
             trend: true,
             sparkline: true,
@@ -1495,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn set_window_refreshes_left_trend_sparkline_only() {
+    fn set_window_at_root_refreshes_left_trend_sparkline_only() {
         let mut s = AppState::default();
         let out = s.apply(Action::SetWindow(TimeWindow::Today));
         assert!(out.refresh.left);
@@ -1503,6 +1512,50 @@ mod tests {
         assert!(out.refresh.sparkline);
         assert!(!out.refresh.sessions);
         assert!(!out.refresh.events);
+    }
+
+    #[test]
+    fn set_window_in_sessions_drill_refreshes_sessions_too() {
+        let mut s = AppState {
+            current_section: Section::Repos,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Sessions {
+                from_section: Section::Repos,
+            },
+            key: "tokctl".into(),
+            label: "tokctl".into(),
+            cursor: 0,
+        });
+        let out = s.apply(Action::SetWindow(TimeWindow::Today));
+        assert!(out.refresh.left);
+        assert!(out.refresh.trend);
+        assert!(out.refresh.sparkline);
+        assert!(out.refresh.sessions);
+        assert!(!out.refresh.events);
+    }
+
+    #[test]
+    fn set_window_in_events_drill_refreshes_events_too() {
+        let mut s = AppState {
+            current_section: Section::Sessions,
+            ..AppState::default()
+        };
+        s.push_drill(Drill {
+            kind: DrillKind::Events {
+                source: crate::types::Source::Claude,
+            },
+            key: "abc".into(),
+            label: "abc".into(),
+            cursor: 0,
+        });
+        let out = s.apply(Action::SetWindow(TimeWindow::Today));
+        assert!(out.refresh.left);
+        assert!(out.refresh.trend);
+        assert!(out.refresh.sparkline);
+        assert!(out.refresh.events);
+        assert!(!out.refresh.sessions);
     }
 
     #[test]
