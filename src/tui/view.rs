@@ -109,10 +109,11 @@ fn draw_header(
     palette: &Palette,
 ) {
     let clock = Local::now().format("%Y-%m-%d %H:%M").to_string();
-    let total_cost: f64 = cache.left.iter().map(|r| r.cost).sum::<f64>()
-        + cache.trend.iter().map(|r| r.total_cost).sum::<f64>();
-    let total_tokens: u64 = cache.sessions.iter().map(|r| r.total_tokens).sum::<u64>()
-        + cache.trend.iter().map(|r| r.total_tokens).sum::<u64>();
+    // Window-scoped totals. Sourced solely from `cache.trend` so the header
+    // is a single source of truth — `cache.left` / `cache.sessions` are
+    // section/drill-scoped and overlap with trend, which double-counted.
+    let total_cost: f64 = cache.trend.iter().map(|r| r.total_cost).sum::<f64>();
+    let total_tokens: u64 = cache.trend.iter().map(|r| r.total_tokens).sum::<u64>();
 
     let line1 = Line::from(vec![
         Span::styled("tokctl ", Style::default().add_modifier(Modifier::BOLD)),
