@@ -59,6 +59,7 @@ pub struct IngestStats {
     pub files_tailed: usize,
     pub files_full_parsed: usize,
     pub files_purged: usize,
+    pub file_errors: usize,
     pub events_inserted: usize,
     pub skipped_lines: usize,
     pub unknown_models: HashSet<String>,

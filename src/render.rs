@@ -336,7 +336,11 @@ pub fn render_repo_json(rows: &[RepoAggregateRow]) -> String {
     serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_else(|_| "[]".into())
 }
 
-pub fn render_warnings(unknown_models: &HashSet<String>, skipped_lines: usize) -> Vec<String> {
+pub fn render_warnings(
+    unknown_models: &HashSet<String>,
+    skipped_lines: usize,
+    file_errors: usize,
+) -> Vec<String> {
     let mut out = Vec::new();
     if !unknown_models.is_empty() {
         let mut list: Vec<&String> = unknown_models.iter().collect();
@@ -353,6 +357,11 @@ pub fn render_warnings(unknown_models: &HashSet<String>, skipped_lines: usize) -
     if skipped_lines > 0 {
         out.push(format!(
             "warning: skipped {skipped_lines} malformed JSONL line(s)"
+        ));
+    }
+    if file_errors > 0 {
+        out.push(format!(
+            "warning: skipped {file_errors} unreadable or failed input file(s)"
         ));
     }
     out
@@ -423,8 +432,9 @@ mod tests {
         let mut set = HashSet::new();
         set.insert("zebra".into());
         set.insert("apple".into());
-        let w = render_warnings(&set, 3);
+        let w = render_warnings(&set, 3, 2);
         assert!(w[0].contains("apple, zebra"));
         assert!(w[1].contains("3 malformed"));
+        assert!(w[2].contains("2 unreadable"));
     }
 }

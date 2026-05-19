@@ -95,7 +95,7 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
     );
 
     let report = if args.no_cache {
-        let (events, skipped_lines) =
+        let (events, skipped_lines, file_errors) =
             gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
         let resolved = resolve_repos(&events);
         let repo_spec = args.repo.as_deref().map(resolve_repo_filter_in_memory);
@@ -108,7 +108,7 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
             args.top,
             &mut unknown,
         );
-        emit_warnings(&unknown, skipped_lines);
+        emit_warnings(&unknown, skipped_lines, file_errors);
         report
     } else {
         let cache_path = store_path();
@@ -141,7 +141,7 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
         let report = compare::compare_from_db(&conn, windows, filter, &dimensions, args.top)?;
         let mut unknown = stats.unknown_models.clone();
         collect_unknown_from_db(&conn, source.to_filter(), &mut unknown);
-        emit_warnings(&unknown, stats.skipped_lines);
+        emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
         report
     };
 
@@ -173,7 +173,7 @@ pub(super) fn run_ui() -> Result<()> {
     })?;
     let mut unknown = stats.unknown_models.clone();
     collect_unknown_from_db(&conn, None, &mut unknown);
-    emit_warnings(&unknown, stats.skipped_lines);
+    emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
     drop(conn);
     crate::tui::run()
 }
@@ -294,7 +294,7 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
     );
 
     if args.no_cache {
-        let (events, skipped_lines) =
+        let (events, skipped_lines, file_errors) =
             gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
         let filtered = filter_by_date(&events, since, until);
         let resolved = resolve_repos(&filtered);
@@ -311,7 +311,7 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
                 emit(&rows, ReportKind::Session, source, args.json);
             }
         }
-        emit_warnings(&unknown, skipped_lines);
+        emit_warnings(&unknown, skipped_lines, file_errors);
         return Ok(());
     }
 
@@ -354,7 +354,7 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
 
     let mut unknown = stats.unknown_models.clone();
     collect_unknown_from_db(&conn, source.to_filter(), &mut unknown);
-    emit_warnings(&unknown, stats.skipped_lines);
+    emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
     Ok(())
 }
 
@@ -501,7 +501,7 @@ fn run_report_cached(group: GroupBy, args: ReportArgs) -> Result<()> {
 
     let mut unknown = stats.unknown_models.clone();
     collect_unknown_from_db(&conn, source.to_filter(), &mut unknown);
-    emit_warnings(&unknown, stats.skipped_lines);
+    emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
     Ok(())
 }
 
@@ -557,7 +557,7 @@ fn run_report_no_cache(group: GroupBy, args: ReportArgs) -> Result<()> {
         args.codex_dir.as_deref(),
         args.cursor_dir.as_deref(),
     );
-    let (events, skipped_lines) =
+    let (events, skipped_lines, file_errors) =
         gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
     let filtered = filter_by_date(&events, since, until);
     let resolved = resolve_repos(&filtered);
@@ -586,7 +586,7 @@ fn run_report_no_cache(group: GroupBy, args: ReportArgs) -> Result<()> {
         }
     }
 
-    emit_warnings(&unknown, skipped_lines);
+    emit_warnings(&unknown, skipped_lines, file_errors);
     Ok(())
 }
 
@@ -605,9 +605,10 @@ fn gather_events_no_cache(
     claude_roots: &[PathBuf],
     codex_roots: &[PathBuf],
     cursor_roots: &[PathBuf],
-) -> Result<(Vec<UsageEvent>, usize)> {
+) -> Result<(Vec<UsageEvent>, usize, usize)> {
     let mut events: Vec<UsageEvent> = Vec::new();
     let mut skipped_lines = 0usize;
+    let mut file_errors = 0usize;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let discover_opts = DiscoverOpts {
         safety_window_ms: 60 * 60 * 1000,
@@ -618,28 +619,40 @@ fn gather_events_no_cache(
     if source.include_claude() {
         let d = discover_claude(claude_roots, &empty_manifest, discover_opts);
         for f in &d.files {
-            let r = ingest_claude_range(&f.path, f.project.as_deref(), 0, f.size)?;
-            skipped_lines += r.skipped_lines;
-            events.extend(r.events);
+            match ingest_claude_range(&f.path, f.project.as_deref(), 0, f.size) {
+                Ok(r) => {
+                    skipped_lines += r.skipped_lines;
+                    events.extend(r.events);
+                }
+                Err(_) => file_errors += 1,
+            }
         }
     }
     if source.include_codex() {
         let d = discover_codex(codex_roots, &empty_manifest, discover_opts);
         for f in &d.files {
-            let r = ingest_codex_range(&f.path, 0, f.size)?;
-            skipped_lines += r.skipped_lines;
-            events.extend(r.events);
+            match ingest_codex_range(&f.path, 0, f.size) {
+                Ok(r) => {
+                    skipped_lines += r.skipped_lines;
+                    events.extend(r.events);
+                }
+                Err(_) => file_errors += 1,
+            }
         }
     }
     if source.include_cursor() {
         let d = discover_cursor(cursor_roots, &empty_manifest, discover_opts);
         for f in &d.files {
-            let r = ingest_cursor_range(&f.path)?;
-            skipped_lines += r.skipped_lines;
-            events.extend(r.events);
+            match ingest_cursor_range(&f.path) {
+                Ok(r) => {
+                    skipped_lines += r.skipped_lines;
+                    events.extend(r.events);
+                }
+                Err(_) => file_errors += 1,
+            }
         }
     }
-    Ok((events, skipped_lines))
+    Ok((events, skipped_lines, file_errors))
 }
 
 fn emit(rows: &[AggregateRow], kind: ReportKind, source: SourceArg, as_json: bool) {
@@ -665,8 +678,8 @@ fn emit_repo(rows: &[crate::store::queries::RepoAggregateRow], as_json: bool) {
     let _ = writeln!(lock, "{body}");
 }
 
-fn emit_warnings(unknown: &HashSet<String>, skipped_lines: usize) {
-    for warning in render_warnings(unknown, skipped_lines) {
+fn emit_warnings(unknown: &HashSet<String>, skipped_lines: usize, file_errors: usize) {
+    for warning in render_warnings(unknown, skipped_lines, file_errors) {
         eprintln!("{warning}");
     }
 }

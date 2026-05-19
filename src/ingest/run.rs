@@ -265,20 +265,36 @@ fn execute_plan(
     // rayon's par_iter spreads file parsing across worker threads. Each returns
     // a ParsedFile containing rows + thread-local unknown-model set + skipped
     // line count. No SQLite access happens on these threads.
-    let full_parsed: Vec<ParsedFile> = plan
+    let full_results: Vec<Result<ParsedFile>> = plan
         .to_full_parse
         .into_par_iter()
         .map(|file| parse_file(file, 0))
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
 
-    let tail_parsed: Vec<(ParsedFile, u64)> = plan
+    let tail_results: Vec<Result<(ParsedFile, u64)>> = plan
         .to_tail
         .into_par_iter()
         .map(|item| {
             let from = item.from_offset;
             parse_file(item.file, from).map(|p| (p, from))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
+
+    let mut full_parsed = Vec::new();
+    for result in full_results {
+        match result {
+            Ok(parsed) => full_parsed.push(parsed),
+            Err(_) => stats.file_errors += 1,
+        }
+    }
+
+    let mut tail_parsed = Vec::new();
+    for result in tail_results {
+        match result {
+            Ok(parsed) => tail_parsed.push(parsed),
+            Err(_) => stats.file_errors += 1,
+        }
+    }
 
     // ---- Fold thread-local stats into the run-wide IngestStats ----
     for p in &full_parsed {
@@ -437,6 +453,54 @@ mod tests {
             cache_write: 0,
             cost_usd: 0.0,
         }
+    }
+
+    #[test]
+    fn parse_failure_does_not_drop_successful_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("good.jsonl");
+        std::fs::write(
+            &good_path,
+            r#"{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"sess-a","message":{"id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        )
+        .unwrap();
+        let good_md = std::fs::metadata(&good_path).unwrap();
+        let missing_path = dir.path().join("missing.jsonl");
+
+        let plan = IngestPlan {
+            to_full_parse: vec![
+                DiscoveredFile {
+                    path: good_path,
+                    source: Source::Claude,
+                    project: None,
+                    size: good_md.len(),
+                    mtime_ns: crate::discovery::mtime_ns(&good_md),
+                },
+                DiscoveredFile {
+                    path: missing_path,
+                    source: Source::Claude,
+                    project: None,
+                    size: 100,
+                    mtime_ns: 1,
+                },
+            ],
+            ..IngestPlan::default()
+        };
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+
+        let stats = execute_plan(&mut conn, plan, HashMap::new()).unwrap();
+
+        assert_eq!(stats.file_errors, 1);
+        assert_eq!(stats.events_inserted, 1);
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let manifest_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(manifest_count, 1);
     }
 
     #[test]
