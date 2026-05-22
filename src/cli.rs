@@ -6,6 +6,7 @@ use crate::compare::CompareDimension;
 use crate::store::store_path;
 use crate::types::{ReportKind, Source, SourceLabel};
 
+mod pipeline;
 mod workflows;
 
 #[derive(Debug, Parser)]
