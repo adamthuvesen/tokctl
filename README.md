@@ -127,4 +127,16 @@ sqlite3 "$(tokctl export-db)"
 
 Tables: `events` (token rows; `repo` = canonical key), `files`, `repos` (`display_name`, `origin_url`, `first_seen`), `meta`. Joins: `events.file_path = files.path`, `events.repo = repos.key`.
 
+---
 
+## Development
+
+```sh
+cargo fmt -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo test --locked --no-default-features
+cargo build --locked --release
+```
+
+CI runs the same checks on pushes to `main` and pull requests. Use `cargo test <name>` for a tight local loop while working, then run the full set before publishing changes.
