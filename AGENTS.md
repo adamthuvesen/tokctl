@@ -11,6 +11,8 @@ Spec-driven changes live under `openspec/` — proposals and deltas in `openspec
 - `src/main.rs` — thin entry; delegates to `cli::main_exit`
 - `src/lib.rs` — library crate (also consumed by `benches/`)
 - `src/cli.rs` — `clap` parser, routing, `--rebuild` / `--no-cache` / `ui` dispatch
+- `src/cli/pipeline.rs` — shared roots → ingest/gather → cached vs `--no-cache` prepared runs
+- `src/cli/workflows.rs` — command handlers (report, compare, repo, cursor)
 - `src/types.rs` + `src/dates.rs` — shared types (source kind, usage, options) and `--since` / window parsing
 - `src/sources/` — Claude and Codex JSONL parsers (typed `serde` deserialization)
 - `src/discovery.rs` + `src/paths.rs` — filesystem scanning + root resolution
@@ -20,7 +22,9 @@ Spec-driven changes live under `openspec/` — proposals and deltas in `openspec
 - `src/reports/in_memory.rs` — aggregations for `--no-cache`
 - `src/render.rs` — table + JSON output
 - `src/pricing.rs` — static model price table
-- `src/tui/` — ratatui dashboard: `mod.rs` event loop, `state.rs`, `data.rs` (read-only queries), `view.rs`, `keys.rs`, `format.rs`, `theme.rs`
+- `src/tui/` — ratatui dashboard: `mod.rs` (event loop), `input.rs` (drill/yank/clamp), `data.rs` → `rows.rs` / `cache.rs` / `load.rs`, `state/` (`types`, `apply`, `refresh`, `persist`), `view/` (`core`, `layout`, `chrome`, `tables`), `widgets/filter.rs`, `keys.rs`, `format.rs`, `theme.rs`
+- `src/doctor/` — `mod.rs` types + `run()`, `checks.rs`, `render.rs`
+- `src/test_support.rs` — shared SQL/in-memory parity fixtures (`test-fixtures` feature)
 - `benches/parse.rs` — criterion microbenchmarks for the parser hot path
 
 ## Commands
