@@ -86,7 +86,7 @@ fn source_label(f: &QueryFilter) -> SourceLabel {
     }
 }
 
-fn parse_source_column(raw: String, col: usize) -> rusqlite::Result<Source> {
+pub(crate) fn parse_source_column(raw: String, col: usize) -> rusqlite::Result<Source> {
     Source::from_str(&raw).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
             col,
@@ -312,6 +312,135 @@ pub fn repo_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<RepoAgg
 /// listing the candidates.
 ///
 /// The literal value `(no-repo)` maps to [`RepoFilterSpec::NoRepo`].
+/// Time bucket granularity for period-style aggregations (TUI days axis, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodGranularity {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+impl PeriodGranularity {
+    fn bucket_expr(self) -> &'static str {
+        match self {
+            PeriodGranularity::Daily => "e.day",
+            PeriodGranularity::Weekly => "strftime('%Y-W%W', e.day)",
+            PeriodGranularity::Monthly => "e.month",
+            PeriodGranularity::Yearly => "substr(e.day, 1, 4)",
+        }
+    }
+}
+
+/// Row returned by [`period_buckets`] and [`model_buckets`].
+#[derive(Debug, Clone)]
+pub struct BucketAggregateRow {
+    pub key: String,
+    pub sessions: u64,
+    pub cost_usd: f64,
+    pub total_tokens: u64,
+    pub latest_ts_ms: i64,
+}
+
+pub fn period_buckets(
+    conn: &Connection,
+    filter: QueryFilter,
+    granularity: PeriodGranularity,
+) -> Result<Vec<BucketAggregateRow>> {
+    let sql = format!(
+        r#"SELECT {bucket} AS bucket,
+                  COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
+                  SUM(e.cost_usd) AS cost,
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
+                  MAX(e.ts) AS latest_ts
+             FROM events e
+             WHERE 1=1 {src} {ts}
+             GROUP BY bucket
+             ORDER BY bucket DESC"#,
+        bucket = granularity.bucket_expr(),
+        src = source_clause(&filter),
+        ts = time_clause(),
+    );
+    run_bucket_aggregate_query(conn, &sql, &filter)
+}
+
+/// Model-grouped buckets for the TUI models section (no repo filter — matches prior TUI SQL).
+pub fn model_buckets(conn: &Connection, filter: QueryFilter) -> Result<Vec<BucketAggregateRow>> {
+    let sql = format!(
+        r#"SELECT e.model AS model,
+                  COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
+                  SUM(e.cost_usd) AS cost,
+                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
+                  MAX(e.ts) AS latest_ts
+             FROM events e
+             WHERE 1=1 {src} {ts}
+             GROUP BY model
+             ORDER BY cost DESC"#,
+        src = source_clause(&filter),
+        ts = time_clause(),
+    );
+    run_bucket_aggregate_query(conn, &sql, &filter)
+}
+
+fn run_bucket_aggregate_query(
+    conn: &Connection,
+    sql: &str,
+    filter: &QueryFilter,
+) -> Result<Vec<BucketAggregateRow>> {
+    let params = build_params(filter);
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+        Ok(BucketAggregateRow {
+            key: row.get(0)?,
+            sessions: row.get::<_, i64>(1)? as u64,
+            cost_usd: row.get(2)?,
+            total_tokens: row.get::<_, i64>(3)? as u64,
+            latest_ts_ms: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Per-day, per-source costs for provider-style trend charts.
+pub fn daily_cost_by_source(
+    conn: &Connection,
+    since_ms: Option<i64>,
+) -> Result<Vec<(String, Source, f64, u64)>> {
+    let sql = r#"SELECT
+                   e.day,
+                   e.source,
+                   SUM(e.cost_usd) AS cost,
+                   SUM(e.input + e.output + e.cache_read + e.cache_write) AS tokens
+                 FROM events e
+                 WHERE (?1 IS NULL OR e.ts >= ?1)
+                 GROUP BY e.day, e.source"#;
+    let mut stmt = conn.prepare_cached(sql)?;
+    let since = since_ms.map_or(Value::Null, Value::Integer);
+    let rows = stmt.query_map([since], |row| {
+        let src_str: String = row.get(1)?;
+        let source = parse_source_column(src_str, 1)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            source,
+            row.get::<_, f64>(2)?,
+            row.get::<_, i64>(3)? as u64,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn sparkline_costs(conn: &Connection, days: u32) -> Result<Vec<f64>> {
+    let sql = "SELECT day, SUM(cost_usd) FROM events GROUP BY day ORDER BY day DESC LIMIT ?1";
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map([days as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    let mut pairs: Vec<(String, f64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    pairs.reverse();
+    Ok(pairs.into_iter().map(|(_, c)| c).collect())
+}
+
 pub fn resolve_repo_filter(conn: &Connection, name: &str) -> Result<RepoFilterSpec> {
     if name == crate::repo::RepoIdentity::NO_REPO_DISPLAY {
         return Ok(RepoFilterSpec::NoRepo);
@@ -342,75 +471,8 @@ pub fn resolve_repo_filter(conn: &Connection, name: &str) -> Result<RepoFilterSp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema::DDL;
     use crate::store::writes::{insert_events, upsert_repo, EventRow, RepoRow};
-
-    fn fresh_conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(DDL).unwrap();
-        c
-    }
-
-    fn evt(
-        ts: i64,
-        session: &str,
-        repo: Option<&str>,
-        tokens: u64,
-        cost: f64,
-        source: Source,
-    ) -> EventRow {
-        EventRow {
-            file_path: format!("/{session}.jsonl"),
-            source,
-            ts,
-            day: "2026-04-22".into(),
-            month: "2026-04".into(),
-            session_id: session.into(),
-            project_path: repo.map(str::to_owned),
-            repo: repo.map(str::to_owned),
-            model: "claude-sonnet-4-6".into(),
-            input: tokens,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            cost_usd: cost,
-        }
-    }
-
-    fn seed(conn: &mut Connection) {
-        let tx = conn.transaction().unwrap();
-        upsert_repo(
-            &tx,
-            &RepoRow {
-                key: "/u/dev/alpha".into(),
-                display_name: "alpha".into(),
-                origin_url: None,
-                first_seen: 1,
-            },
-        )
-        .unwrap();
-        upsert_repo(
-            &tx,
-            &RepoRow {
-                key: "/u/dev/beta".into(),
-                display_name: "beta".into(),
-                origin_url: None,
-                first_seen: 1,
-            },
-        )
-        .unwrap();
-        insert_events(
-            &tx,
-            &[
-                evt(1, "sA", Some("/u/dev/alpha"), 100, 1.00, Source::Claude),
-                evt(2, "sA", Some("/u/dev/alpha"), 50, 0.50, Source::Claude),
-                evt(3, "sB", Some("/u/dev/beta"), 10, 5.00, Source::Codex),
-                evt(4, "sC", None, 20, 0.10, Source::Claude),
-            ],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-    }
+    use crate::test_support::{event_row as evt, fresh_conn, seed_standard_events as seed};
 
     #[test]
     fn repo_report_orders_by_cost_desc() {
