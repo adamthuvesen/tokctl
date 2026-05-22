@@ -17,7 +17,7 @@ Spec-driven changes live under `openspec/` — proposals and deltas in `openspec
 - `src/repo.rs` — git-aware repo identity resolution (repo key, display name, remote) for per-repo rollups
 - `src/ingest/` — ingest plan, byte-range reads (mmap for ≥ 1 MB), parallel runner
 - `src/store/` — SQLite schema, writes, queries
-- `src/legacy/in_memory.rs` — aggregations for `--no-cache`
+- `src/reports/in_memory.rs` — aggregations for `--no-cache`
 - `src/render.rs` — table + JSON output
 - `src/pricing.rs` — static model price table
 - `src/tui/` — ratatui dashboard: `mod.rs` event loop, `state.rs`, `data.rs` (read-only queries), `view.rs`, `keys.rs`, `format.rs`, `theme.rs`
