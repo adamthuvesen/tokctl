@@ -782,16 +782,28 @@ fn load_sessions_by_model(
     filter: &QueryFilter,
 ) -> Result<Vec<SessionRow>> {
     let sql = format!(
-        r#"SELECT e.session_id,
+        r#"WITH filtered AS (
+             SELECT e.*
+             FROM events e
+             WHERE e.model = ?1 {src} {ts}
+           )
+           SELECT e.session_id,
                   e.source,
                   MAX(r.display_name)  AS repo_display,
-                  MAX(e.project_path)  AS project_path,
+                  (
+                    SELECT fp.project_path
+                    FROM filtered fp
+                    WHERE fp.source = e.source
+                      AND fp.session_id = e.session_id
+                      AND fp.project_path IS NOT NULL
+                    ORDER BY fp.id ASC
+                    LIMIT 1
+                  ) AS project_path,
                   MAX(e.ts),
                   SUM(e.input + e.output + e.cache_read + e.cache_write),
                   SUM(e.cost_usd)
-             FROM events e
+             FROM filtered e
              LEFT JOIN repos r ON r.key = e.repo
-             WHERE e.model = ?1 {src} {ts}
              GROUP BY e.source, e.session_id
              ORDER BY MAX(e.ts) DESC"#,
         src = if filter.source.is_some() {
@@ -1301,6 +1313,73 @@ mod tests {
         tx.commit().unwrap();
         let status = load_cache_status(&conn, Utc::now()).unwrap();
         assert_eq!(status.event_count, 1);
+    }
+
+    #[test]
+    fn model_session_drill_uses_first_non_null_project_path() {
+        let mut conn = mk_conn();
+        let tx = conn.transaction().unwrap();
+        insert_events(
+            &tx,
+            &[
+                EventRow {
+                    file_path: "/x".into(),
+                    source: Source::Claude,
+                    ts: 1,
+                    day: "2026-04-22".into(),
+                    month: "2026-04".into(),
+                    session_id: "same".into(),
+                    project_path: None,
+                    repo: None,
+                    model: "model-x".into(),
+                    input: 1,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.1,
+                },
+                EventRow {
+                    file_path: "/x".into(),
+                    source: Source::Claude,
+                    ts: 2,
+                    day: "2026-04-22".into(),
+                    month: "2026-04".into(),
+                    session_id: "same".into(),
+                    project_path: Some("/tmp/zeta".into()),
+                    repo: None,
+                    model: "model-x".into(),
+                    input: 1,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.1,
+                },
+                EventRow {
+                    file_path: "/x".into(),
+                    source: Source::Claude,
+                    ts: 3,
+                    day: "2026-04-22".into(),
+                    month: "2026-04".into(),
+                    session_id: "same".into(),
+                    project_path: Some("/tmp/alpha".into()),
+                    repo: None,
+                    model: "model-x".into(),
+                    input: 1,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.1,
+                },
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = load_sessions_by_model(&conn, "model-x", &QueryFilter::default()).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project.as_deref(), Some("zeta"));
+        assert_eq!(rows[0].latest_ts.timestamp_millis(), 3);
     }
 
     #[test]

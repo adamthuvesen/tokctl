@@ -356,7 +356,7 @@ pub fn render_warnings(
     }
     if skipped_lines > 0 {
         out.push(format!(
-            "warning: skipped {skipped_lines} malformed JSONL line(s)"
+            "warning: skipped {skipped_lines} malformed input line(s)"
         ));
     }
     if file_errors > 0 {
@@ -434,7 +434,7 @@ mod tests {
         set.insert("apple".into());
         let w = render_warnings(&set, 3, 2);
         assert!(w[0].contains("apple, zebra"));
-        assert!(w[1].contains("3 malformed"));
+        assert!(w[1].contains("3 malformed input"));
         assert!(w[2].contains("2 unreadable"));
     }
 }

@@ -165,11 +165,24 @@ fn run_bucket_query(
 
 pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<AggregateRow>> {
     let sql = format!(
-        r#"SELECT
+        r#"WITH filtered AS (
+             SELECT e.*
+             FROM events e
+             WHERE 1=1 {src} {ts} {repo}
+           )
+           SELECT
              e.session_id,
              e.source,
              MAX(r.display_name)  AS repo_display,
-             MAX(e.project_path)  AS project_path,
+             (
+               SELECT fp.project_path
+               FROM filtered fp
+               WHERE fp.source = e.source
+                 AND fp.session_id = e.session_id
+                 AND fp.project_path IS NOT NULL
+               ORDER BY fp.id ASC
+               LIMIT 1
+             ) AS project_path,
              MAX(e.ts) AS latest_ts,
              SUM(e.input)       AS input_tokens,
              SUM(e.output)      AS output_tokens,
@@ -177,9 +190,8 @@ pub fn session_report(conn: &Connection, filter: QueryFilter) -> Result<Vec<Aggr
              SUM(e.cache_write) AS cache_write_tokens,
              SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
              SUM(e.cost_usd)    AS cost_usd
-           FROM events e
+           FROM filtered e
            LEFT JOIN repos r ON r.key = e.repo
-           WHERE 1=1 {src} {ts} {repo}
            GROUP BY e.source, e.session_id
            ORDER BY latest_ts DESC"#,
         src = source_clause(&filter),
@@ -487,6 +499,73 @@ mod tests {
         let rows = session_report(&conn, filter).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "sC");
+    }
+
+    #[test]
+    fn session_report_uses_first_non_null_project_path() {
+        let mut conn = fresh_conn();
+        let tx = conn.transaction().unwrap();
+        insert_events(
+            &tx,
+            &[
+                EventRow {
+                    file_path: "/a.jsonl".into(),
+                    source: Source::Claude,
+                    ts: 1,
+                    day: "2026-04-22".into(),
+                    month: "2026-04".into(),
+                    session_id: "same".into(),
+                    project_path: None,
+                    repo: None,
+                    model: "claude-sonnet-4-6".into(),
+                    input: 1,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.1,
+                },
+                EventRow {
+                    file_path: "/a.jsonl".into(),
+                    source: Source::Claude,
+                    ts: 2,
+                    day: "2026-04-22".into(),
+                    month: "2026-04".into(),
+                    session_id: "same".into(),
+                    project_path: Some("/tmp/zeta".into()),
+                    repo: None,
+                    model: "claude-sonnet-4-6".into(),
+                    input: 1,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.1,
+                },
+                EventRow {
+                    file_path: "/a.jsonl".into(),
+                    source: Source::Claude,
+                    ts: 3,
+                    day: "2026-04-22".into(),
+                    month: "2026-04".into(),
+                    session_id: "same".into(),
+                    project_path: Some("/tmp/alpha".into()),
+                    repo: None,
+                    model: "claude-sonnet-4-6".into(),
+                    input: 1,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.1,
+                },
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = session_report(&conn, QueryFilter::default()).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_path.as_deref(), Some("zeta"));
+        assert_eq!(rows[0].latest_timestamp.unwrap().timestamp_millis(), 3);
     }
 
     #[test]

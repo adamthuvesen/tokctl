@@ -3,6 +3,7 @@ use crate::pricing::cost_of;
 use crate::repo::{project_basename, RepoIdentity, Resolver};
 use crate::store::queries::{RepoAggregateRow, RepoFilterSpec, NO_REPO_SENTINEL};
 use crate::types::{AggregateRow, Source, SourceLabel, UsageEvent};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -58,6 +59,38 @@ fn matches_repo_filter(id: &RepoIdentity, filter: &Option<RepoFilterSpec>) -> bo
         Some(RepoFilterSpec::DisplayName(n)) => id.key.is_some() && &id.display_name == n,
         Some(RepoFilterSpec::KeyPrefix(p)) => id.key.as_deref().is_some_and(|k| k.starts_with(p)),
     }
+}
+
+/// Resolve a repo filter from already-resolved in-memory events, mirroring the
+/// cached resolver so `--no-cache` does not silently merge ambiguous repo names.
+pub fn resolve_repo_filter(
+    resolved: &[(UsageEvent, RepoIdentity)],
+    name: &str,
+) -> Result<RepoFilterSpec> {
+    if name == RepoIdentity::NO_REPO_DISPLAY {
+        return Ok(RepoFilterSpec::NoRepo);
+    }
+    if name.starts_with('/') {
+        return Ok(RepoFilterSpec::KeyPrefix(name.to_owned()));
+    }
+
+    let mut keys: Vec<String> = resolved
+        .iter()
+        .filter_map(|(_, id)| (id.display_name == name).then(|| id.key.clone()).flatten())
+        .collect();
+    keys.sort();
+    keys.dedup();
+
+    if keys.len() > 1 {
+        anyhow::bail!(
+            "repo name '{}' is ambiguous — matches {} repos: {}. \
+             Pass a path prefix (e.g. /Users/you/dev/...) to disambiguate.",
+            name,
+            keys.len(),
+            keys.join(", ")
+        );
+    }
+    Ok(RepoFilterSpec::DisplayName(name.to_owned()))
 }
 
 fn aggregate_by<K: Fn(&UsageEvent) -> String>(
@@ -269,6 +302,14 @@ mod tests {
         }
     }
 
+    fn repo_id(key: Option<&str>, display_name: &str) -> RepoIdentity {
+        RepoIdentity {
+            key: key.map(str::to_owned),
+            display_name: display_name.to_owned(),
+            origin_url: None,
+        }
+    }
+
     #[test]
     fn filter_excludes_before_since() {
         let events = vec![
@@ -367,5 +408,54 @@ mod tests {
         let rows = repo_in_memory(&resolved, &None, &mut unknown);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sessions, 2);
+    }
+
+    #[test]
+    fn resolve_repo_filter_errors_on_ambiguous_display_names() {
+        let a = event(
+            Source::Claude,
+            "a",
+            "claude-sonnet-4-6",
+            "2026-04-18T09:00:00Z",
+            10,
+        );
+        let b = event(Source::Codex, "b", "gpt-5.4", "2026-04-18T10:00:00Z", 20);
+        let resolved = vec![
+            (a, repo_id(Some("/u/work/alpha"), "alpha")),
+            (b, repo_id(Some("/u/play/alpha"), "alpha")),
+        ];
+
+        let err = resolve_repo_filter(&resolved, "alpha").unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous"));
+        assert!(err.to_string().contains("/u/work/alpha"));
+        assert!(err.to_string().contains("/u/play/alpha"));
+    }
+
+    #[test]
+    fn resolve_repo_filter_dedupes_same_repo_events() {
+        let a = event(
+            Source::Claude,
+            "a",
+            "claude-sonnet-4-6",
+            "2026-04-18T09:00:00Z",
+            10,
+        );
+        let b = event(
+            Source::Claude,
+            "b",
+            "claude-sonnet-4-6",
+            "2026-04-18T10:00:00Z",
+            20,
+        );
+        let resolved = vec![
+            (a, repo_id(Some("/u/work/alpha"), "alpha")),
+            (b, repo_id(Some("/u/work/alpha"), "alpha")),
+        ];
+
+        assert!(matches!(
+            resolve_repo_filter(&resolved, "alpha").unwrap(),
+            RepoFilterSpec::DisplayName(_)
+        ));
     }
 }

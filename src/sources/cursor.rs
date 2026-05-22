@@ -121,15 +121,31 @@ fn parse_row(
     let Some(output_tokens_raw) = get_field(fields, columns.output_tokens) else {
         return CursorRowParse::Malformed;
     };
-    let input_with_cache_write = parse_u64(input_with_cache_write_raw);
-    let input_without_cache_write = parse_u64(input_without_cache_write_raw);
-    let cache_read_tokens = parse_u64(cache_read_raw);
-    let output_tokens = parse_u64(output_tokens_raw);
+    let Some(input_with_cache_write) = parse_token_count(input_with_cache_write_raw) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(input_without_cache_write) = parse_token_count(input_without_cache_write_raw) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(cache_read_tokens) = parse_token_count(cache_read_raw) else {
+        return CursorRowParse::Malformed;
+    };
+    let Some(output_tokens) = parse_token_count(output_tokens_raw) else {
+        return CursorRowParse::Malformed;
+    };
     let cache_write_tokens = input_with_cache_write.saturating_sub(input_without_cache_write);
-    let explicit_cost_usd = columns
-        .cost
-        .and_then(|idx| get_field(fields, idx))
-        .and_then(parse_cost);
+    let explicit_cost_usd = match columns.cost {
+        Some(idx) => {
+            let Some(raw_cost) = get_field(fields, idx) else {
+                return CursorRowParse::Malformed;
+            };
+            let Some(cost) = parse_cost(raw_cost) else {
+                return CursorRowParse::Malformed;
+            };
+            Some(cost)
+        }
+        None => None,
+    };
 
     let event = UsageEvent {
         source: Source::Cursor,
@@ -158,12 +174,12 @@ fn get_field(fields: &StringRecord, idx: usize) -> Option<&str> {
     fields.get(idx).map(str::trim)
 }
 
-fn parse_u64(raw: &str) -> u64 {
-    raw.trim()
-        .trim_matches('"')
-        .replace(',', "")
-        .parse()
-        .unwrap_or(0)
+fn parse_token_count(raw: &str) -> Option<u64> {
+    let cleaned = raw.trim().trim_matches('"').replace(',', "");
+    if cleaned.is_empty() {
+        return Some(0);
+    }
+    cleaned.parse().ok()
 }
 
 fn parse_cost(raw: &str) -> Option<f64> {
@@ -297,5 +313,59 @@ mod tests {
 
         assert!(events.is_empty());
         assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn invalid_token_counts_are_malformed_not_zeroed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.csv");
+        std::fs::write(
+            &path,
+            "Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost\n\
+             2025-11-13,gpt-5-codex,10,nope,0,1,$0.01\n",
+        )
+        .unwrap();
+
+        let (events, skipped) = parse_cursor_csv(&path);
+
+        assert!(events.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn invalid_cost_is_malformed_not_silently_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.csv");
+        std::fs::write(
+            &path,
+            "Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost\n\
+             2025-11-13,gpt-5-codex,10,5,0,1,definitely-not-money\n",
+        )
+        .unwrap();
+
+        let (events, skipped) = parse_cursor_csv(&path);
+
+        assert!(events.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn blank_numeric_fields_still_count_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.csv");
+        std::fs::write(
+            &path,
+            "Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost\n\
+             2025-11-13,gpt-5-codex,,5,,1,$0.01\n",
+        )
+        .unwrap();
+
+        let (events, skipped) = parse_cursor_csv(&path);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input_tokens, 5);
+        assert_eq!(events[0].cache_write_tokens, 0);
+        assert_eq!(events[0].cache_read_tokens, 0);
     }
 }

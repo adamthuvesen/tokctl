@@ -27,11 +27,11 @@ use crate::render::{
 };
 use crate::reports::in_memory::{
     daily_in_memory, filter_by_date, filter_by_repo, monthly_in_memory, repo_in_memory,
-    resolve_repos, session_in_memory,
+    resolve_repo_filter as resolve_repo_filter_in_memory, resolve_repos, session_in_memory,
 };
 use crate::store::queries::{
-    daily_report, monthly_report, repo_report, resolve_repo_filter, session_report, QueryFilter,
-    RepoFilterSpec,
+    daily_report, monthly_report, repo_report, resolve_repo_filter as resolve_repo_filter_cached,
+    session_report, QueryFilter,
 };
 use crate::store::{open_store, store_path};
 use crate::types::{AggregateRow, ReportKind, Source, UsageEvent};
@@ -98,7 +98,10 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
         let (events, skipped_lines, file_errors) =
             gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
         let resolved = resolve_repos(&events);
-        let repo_spec = args.repo.as_deref().map(resolve_repo_filter_in_memory);
+        let repo_spec = match args.repo.as_deref() {
+            Some(name) => Some(resolve_repo_filter_in_memory(&resolved, name)?),
+            None => None,
+        };
         let mut unknown = HashSet::new();
         let report = compare::compare_from_events(
             &resolved,
@@ -129,7 +132,7 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
             now_ms: 0,
         })?;
         let repo_spec = match args.repo.as_deref() {
-            Some(name) => Some(resolve_repo_filter(&conn, name)?),
+            Some(name) => Some(resolve_repo_filter_cached(&conn, name)?),
             None => None,
         };
         let filter = QueryFilter {
@@ -296,8 +299,13 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
     if args.no_cache {
         let (events, skipped_lines, file_errors) =
             gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
+        let repo_catalog = resolve_repos(&events);
         let filtered = filter_by_date(&events, since, until);
-        let resolved = resolve_repos(&filtered);
+        let resolved = if since.is_none() && until.is_none() {
+            repo_catalog.clone()
+        } else {
+            resolve_repos(&filtered)
+        };
         let mut unknown: HashSet<String> = HashSet::new();
         match args.name.as_deref() {
             None => {
@@ -305,7 +313,7 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
                 emit_repo(&rows, args.json);
             }
             Some(name) => {
-                let spec = Some(resolve_repo_filter_in_memory(name));
+                let spec = Some(resolve_repo_filter_in_memory(&repo_catalog, name)?);
                 let only = filter_by_repo(&resolved, &spec);
                 let rows = session_in_memory(&only, &mut unknown);
                 emit(&rows, ReportKind::Session, source, args.json);
@@ -346,7 +354,7 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
             emit_repo(&rows, args.json);
         }
         Some(name) => {
-            filter.repo = Some(resolve_repo_filter(&conn, name)?);
+            filter.repo = Some(resolve_repo_filter_cached(&conn, name)?);
             let rows = session_report(&conn, filter)?;
             emit(&rows, ReportKind::Session, source, args.json);
         }
@@ -469,7 +477,7 @@ fn run_report_cached(group: GroupBy, args: ReportArgs) -> Result<()> {
     })?;
 
     let repo_spec = match args.repo.as_deref() {
-        Some(name) => Some(resolve_repo_filter(&conn, name)?),
+        Some(name) => Some(resolve_repo_filter_cached(&conn, name)?),
         None => None,
     };
 
@@ -559,9 +567,17 @@ fn run_report_no_cache(group: GroupBy, args: ReportArgs) -> Result<()> {
     );
     let (events, skipped_lines, file_errors) =
         gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
+    let repo_catalog = resolve_repos(&events);
     let filtered = filter_by_date(&events, since, until);
-    let resolved = resolve_repos(&filtered);
-    let repo_spec = args.repo.as_deref().map(resolve_repo_filter_in_memory);
+    let resolved = if since.is_none() && until.is_none() {
+        repo_catalog.clone()
+    } else {
+        resolve_repos(&filtered)
+    };
+    let repo_spec = match args.repo.as_deref() {
+        Some(name) => Some(resolve_repo_filter_in_memory(&repo_catalog, name)?),
+        None => None,
+    };
 
     let mut unknown: HashSet<String> = HashSet::new();
     match group {
@@ -588,16 +604,6 @@ fn run_report_no_cache(group: GroupBy, args: ReportArgs) -> Result<()> {
 
     emit_warnings(&unknown, skipped_lines, file_errors);
     Ok(())
-}
-
-fn resolve_repo_filter_in_memory(name: &str) -> RepoFilterSpec {
-    if name == crate::repo::RepoIdentity::NO_REPO_DISPLAY {
-        RepoFilterSpec::NoRepo
-    } else if name.starts_with('/') {
-        RepoFilterSpec::KeyPrefix(name.to_owned())
-    } else {
-        RepoFilterSpec::DisplayName(name.to_owned())
-    }
 }
 
 fn gather_events_no_cache(
