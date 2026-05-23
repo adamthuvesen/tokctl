@@ -1,3 +1,6 @@
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_support;
+
 pub mod cli;
 pub mod compare;
 pub mod cursor_sync;

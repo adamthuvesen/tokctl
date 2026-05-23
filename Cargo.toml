@@ -34,6 +34,11 @@ csv = "1"
 [features]
 default = ["clipboard"]
 clipboard = ["dep:arboard"]
+test-fixtures = []
+
+[[test]]
+name = "report_parity"
+required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = "3"

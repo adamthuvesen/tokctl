@@ -1,40 +1,34 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 use std::collections::HashSet;
 use std::io::{self, Write};
-use std::path::PathBuf;
 
+use super::pipeline::{
+    finish_cached_warnings, maybe_sync_cursor, prepare_cached, prepare_no_cache, resolve_root_dirs,
+    sync_cursor_if_needed, CachedRun, SourceScope,
+};
 use super::{
     CompareArgs, CursorArgs, CursorCommands, CursorLoginArgs, DoctorArgs, GroupBy, RepoArgs,
     ReportArgs, SourceArg,
 };
 use crate::compare;
 use crate::cursor_sync::{
-    has_configured_account, list_accounts, save_credentials, sync_active_account,
-    validate_active_account, validate_cursor_session,
+    list_accounts, save_credentials, sync_active_account, validate_active_account,
+    validate_cursor_session,
 };
 use crate::dates::{parse_since, parse_until};
-use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoverOpts};
-use crate::ingest::file_range::{ingest_claude_range, ingest_codex_range, ingest_cursor_range};
-use crate::ingest::run::{run_ingest, RunIngestOptions};
-use crate::paths::{
-    cursor_sync_cache_dir, default_claude_roots, default_codex_roots, default_cursor_roots,
-    resolve_roots, ResolveInput,
-};
-use crate::pricing;
+use crate::paths::cursor_sync_cache_dir;
 use crate::render::{
     render_json, render_repo_json, render_repo_table, render_table, render_warnings,
 };
 use crate::reports::in_memory::{
-    daily_in_memory, filter_by_date, filter_by_repo, monthly_in_memory, repo_in_memory,
-    resolve_repo_filter as resolve_repo_filter_in_memory, resolve_repos, session_in_memory,
+    daily_in_memory, filter_by_repo, monthly_in_memory, repo_in_memory,
+    resolve_repo_filter as resolve_repo_filter_in_memory, session_in_memory,
 };
 use crate::store::queries::{
     daily_report, monthly_report, repo_report, resolve_repo_filter as resolve_repo_filter_cached,
     session_report, QueryFilter,
 };
-use crate::store::{open_store, store_path};
-use crate::types::{AggregateRow, ReportKind, Source, UsageEvent};
+use crate::types::{AggregateRow, ReportKind};
 
 pub(super) fn run_doctor(args: DoctorArgs) -> Result<()> {
     let report = crate::doctor::run();
@@ -60,10 +54,19 @@ pub(super) fn run_report(kind: ReportKind, args: ReportArgs) -> Result<()> {
         Some(s) => GroupBy::parse(s)?,
     };
 
+    let source = SourceArg::parse(&args.source)?;
+    let scope = source_scope(source);
+    let roots = resolve_root_dirs(
+        args.claude_dir.as_deref(),
+        args.codex_dir.as_deref(),
+        args.cursor_dir.as_deref(),
+    );
+    sync_cursor_if_needed(scope, args.cursor_dir.as_deref());
+
     if args.no_cache {
-        run_report_no_cache(group, args)
+        run_report_no_cache(group, source, scope, roots, args)
     } else {
-        run_report_cached(group, args)
+        run_report_cached(group, source, scope, roots, args)
     }
 }
 
@@ -76,75 +79,52 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
     }
 
     let source = SourceArg::parse(&args.source)?;
+    let scope = source_scope(source);
     let windows = compare::resolve_windows(
         args.current.as_deref(),
         args.baseline.as_deref(),
         chrono::Utc::now(),
     )?;
     let dimensions = args.by.dimensions();
-
-    if source.include_cursor() {
-        let target = cursor_sync_target_dir(args.cursor_dir.as_deref());
-        maybe_sync_cursor(Some(&target));
-    }
-
-    let (claude_roots, codex_roots, cursor_roots) = resolve_all_roots(
+    let roots = resolve_root_dirs(
         args.claude_dir.as_deref(),
         args.codex_dir.as_deref(),
         args.cursor_dir.as_deref(),
     );
+    sync_cursor_if_needed(scope, args.cursor_dir.as_deref());
 
     let report = if args.no_cache {
-        let (events, skipped_lines, file_errors) =
-            gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
-        let resolved = resolve_repos(&events);
+        let run = prepare_no_cache(scope, &roots)?;
         let repo_spec = match args.repo.as_deref() {
-            Some(name) => Some(resolve_repo_filter_in_memory(&resolved, name)?),
+            Some(name) => Some(resolve_repo_filter_in_memory(&run.repo_catalog, name)?),
             None => None,
         };
         let mut unknown = HashSet::new();
         let report = compare::compare_from_events(
-            &resolved,
+            &run.resolved,
             windows,
             &repo_spec,
             &dimensions,
             args.top,
             &mut unknown,
         );
-        emit_warnings(&unknown, skipped_lines, file_errors);
+        emit_warnings(&unknown, run.skipped_lines, run.file_errors);
         report
     } else {
-        let cache_path = store_path();
-        if args.rebuild {
-            std::fs::remove_file(&cache_path).ok();
-        }
-        let mut conn = open_store(&cache_path)
-            .with_context(|| format!("opening cache at {}", cache_path.display()))?;
-        let stats = run_ingest(RunIngestOptions {
-            conn: &mut conn,
-            claude_roots,
-            codex_roots,
-            cursor_roots,
-            include_claude: source.include_claude(),
-            include_codex: source.include_codex(),
-            include_cursor: source.include_cursor(),
-            safety_window_ms: 60 * 60 * 1000,
-            now_ms: 0,
-        })?;
+        let CachedRun { conn, stats } = prepare_cached(scope, &roots, args.rebuild)?;
         let repo_spec = match args.repo.as_deref() {
             Some(name) => Some(resolve_repo_filter_cached(&conn, name)?),
             None => None,
         };
         let filter = QueryFilter {
-            source: source.to_filter(),
+            source: scope.filter,
             since_ms: None,
             until_ms: None,
             repo: repo_spec,
         };
         let report = compare::compare_from_db(&conn, windows, filter, &dimensions, args.top)?;
-        let mut unknown = stats.unknown_models.clone();
-        collect_unknown_from_db(&conn, source.to_filter(), &mut unknown);
-        emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
+        let (unknown, skipped, errors) = finish_cached_warnings(&conn, &stats, scope.filter);
+        emit_warnings(&unknown, skipped, errors);
         report
     };
 
@@ -159,24 +139,16 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
 
 pub(super) fn run_ui() -> Result<()> {
     maybe_sync_cursor(None);
-    let (claude_roots, codex_roots, cursor_roots) = resolve_all_roots(None, None, None);
-    let cache_path = store_path();
-    let mut conn = open_store(&cache_path)
-        .with_context(|| format!("opening cache at {}", cache_path.display()))?;
-    let stats = run_ingest(RunIngestOptions {
-        conn: &mut conn,
-        claude_roots,
-        codex_roots,
-        cursor_roots,
+    let roots = resolve_root_dirs(None, None, None);
+    let scope = SourceScope {
+        filter: None,
         include_claude: true,
         include_codex: true,
         include_cursor: true,
-        safety_window_ms: 60 * 60 * 1000,
-        now_ms: 0,
-    })?;
-    let mut unknown = stats.unknown_models.clone();
-    collect_unknown_from_db(&conn, None, &mut unknown);
-    emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
+    };
+    let CachedRun { conn, stats } = prepare_cached(scope, &roots, false)?;
+    let (unknown, skipped, errors) = finish_cached_warnings(&conn, &stats, None);
+    emit_warnings(&unknown, skipped, errors);
     drop(conn);
     crate::tui::run()
 }
@@ -282,67 +254,38 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
         anyhow::bail!("--rebuild and --no-cache are mutually exclusive");
     }
     let source = SourceArg::parse(&args.source)?;
+    let scope = source_scope(source);
     let since = parse_since(args.since.as_deref())?;
     let until = parse_until(args.until.as_deref())?;
-
-    if source.include_cursor() {
-        let target = cursor_sync_target_dir(args.cursor_dir.as_deref());
-        maybe_sync_cursor(Some(&target));
-    }
-
-    let (claude_roots, codex_roots, cursor_roots) = resolve_all_roots(
+    let roots = resolve_root_dirs(
         args.claude_dir.as_deref(),
         args.codex_dir.as_deref(),
         args.cursor_dir.as_deref(),
     );
+    sync_cursor_if_needed(scope, args.cursor_dir.as_deref());
 
     if args.no_cache {
-        let (events, skipped_lines, file_errors) =
-            gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
-        let repo_catalog = resolve_repos(&events);
-        let filtered = filter_by_date(&events, since, until);
-        let resolved = if since.is_none() && until.is_none() {
-            repo_catalog.clone()
-        } else {
-            resolve_repos(&filtered)
-        };
-        let mut unknown: HashSet<String> = HashSet::new();
+        let run = prepare_no_cache(scope, &roots)?.with_date_filter(since, until);
+        let mut unknown = HashSet::new();
         match args.name.as_deref() {
             None => {
-                let rows = repo_in_memory(&resolved, &None, &mut unknown);
+                let rows = repo_in_memory(&run.resolved, &None, &mut unknown);
                 emit_repo(&rows, args.json);
             }
             Some(name) => {
-                let spec = Some(resolve_repo_filter_in_memory(&repo_catalog, name)?);
-                let only = filter_by_repo(&resolved, &spec);
+                let spec = Some(resolve_repo_filter_in_memory(&run.repo_catalog, name)?);
+                let only = filter_by_repo(&run.resolved, &spec);
                 let rows = session_in_memory(&only, &mut unknown);
                 emit(&rows, ReportKind::Session, source, args.json);
             }
         }
-        emit_warnings(&unknown, skipped_lines, file_errors);
+        emit_warnings(&unknown, run.skipped_lines, run.file_errors);
         return Ok(());
     }
 
-    let cache_path = store_path();
-    if args.rebuild {
-        std::fs::remove_file(&cache_path).ok();
-    }
-    let mut conn = open_store(&cache_path)
-        .with_context(|| format!("opening cache at {}", cache_path.display()))?;
-    let stats = run_ingest(RunIngestOptions {
-        conn: &mut conn,
-        claude_roots,
-        codex_roots,
-        cursor_roots,
-        include_claude: source.include_claude(),
-        include_codex: source.include_codex(),
-        include_cursor: source.include_cursor(),
-        safety_window_ms: 60 * 60 * 1000,
-        now_ms: 0,
-    })?;
-
+    let CachedRun { conn, stats } = prepare_cached(scope, &roots, args.rebuild)?;
     let mut filter = QueryFilter {
-        source: source.to_filter(),
+        source: scope.filter,
         since_ms: since.map(|t| t.timestamp_millis()),
         until_ms: until.map(|t| t.timestamp_millis()),
         repo: None,
@@ -360,38 +303,18 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
         }
     }
 
-    let mut unknown = stats.unknown_models.clone();
-    collect_unknown_from_db(&conn, source.to_filter(), &mut unknown);
-    emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
+    let (unknown, skipped, errors) = finish_cached_warnings(&conn, &stats, scope.filter);
+    emit_warnings(&unknown, skipped, errors);
     Ok(())
 }
 
-fn maybe_sync_cursor(target_dir: Option<&std::path::Path>) {
-    if !has_configured_account() {
-        return;
+fn source_scope(source: SourceArg) -> SourceScope {
+    SourceScope {
+        filter: source.to_filter(),
+        include_claude: source.include_claude(),
+        include_codex: source.include_codex(),
+        include_cursor: source.include_cursor(),
     }
-    let result = sync_active_account(target_dir);
-    if !result.synced {
-        if let Some(error) = result.error {
-            eprintln!("warning: Cursor sync failed: {error}");
-        }
-    }
-}
-
-fn cursor_sync_target_dir(cursor_dir: Option<&str>) -> PathBuf {
-    let env = |k: &str| std::env::var(k).ok();
-    let resolved = resolve_roots(ResolveInput {
-        flag: cursor_dir,
-        tokctl_env: env("TOKCTL_CURSOR_DIR").as_deref(),
-        tool_env: None,
-        tool_env_suffix: None,
-        defaults: default_cursor_roots(),
-    });
-    resolved
-        .roots
-        .into_iter()
-        .next()
-        .unwrap_or_else(cursor_sync_cache_dir)
 }
 
 fn default_group_for(kind: ReportKind) -> GroupBy {
@@ -402,79 +325,16 @@ fn default_group_for(kind: ReportKind) -> GroupBy {
     }
 }
 
-fn resolve_all_roots(
-    claude_dir: Option<&str>,
-    codex_dir: Option<&str>,
-    cursor_dir: Option<&str>,
-) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
-    let env = |k: &str| std::env::var(k).ok();
-    let claude = resolve_roots(ResolveInput {
-        flag: claude_dir,
-        tokctl_env: env("TOKCTL_CLAUDE_DIR").as_deref(),
-        tool_env: env("CLAUDE_CONFIG_DIR").as_deref(),
-        tool_env_suffix: Some("projects"),
-        defaults: default_claude_roots(),
-    });
-    let codex = resolve_roots(ResolveInput {
-        flag: codex_dir,
-        tokctl_env: env("TOKCTL_CODEX_DIR").as_deref(),
-        tool_env: env("CODEX_HOME").as_deref(),
-        tool_env_suffix: Some("sessions"),
-        defaults: default_codex_roots(),
-    });
-    let cursor = resolve_roots(ResolveInput {
-        flag: cursor_dir,
-        tokctl_env: env("TOKCTL_CURSOR_DIR").as_deref(),
-        tool_env: None,
-        tool_env_suffix: None,
-        defaults: default_cursor_roots(),
-    });
-    (
-        existing_dirs(claude),
-        existing_dirs(codex),
-        existing_dirs(cursor),
-    )
-}
-
-fn existing_dirs(resolved: crate::paths::ResolvedRoots) -> Vec<PathBuf> {
-    resolved.roots.into_iter().filter(|p| p.is_dir()).collect()
-}
-
-fn run_report_cached(group: GroupBy, args: ReportArgs) -> Result<()> {
-    let source = SourceArg::parse(&args.source)?;
+fn run_report_cached(
+    group: GroupBy,
+    source: SourceArg,
+    scope: SourceScope,
+    roots: super::pipeline::RootDirs,
+    args: ReportArgs,
+) -> Result<()> {
     let since = parse_since(args.since.as_deref())?;
     let until = parse_until(args.until.as_deref())?;
-
-    if source.include_cursor() {
-        let target = cursor_sync_target_dir(args.cursor_dir.as_deref());
-        maybe_sync_cursor(Some(&target));
-    }
-
-    let cache_path = store_path();
-    if args.rebuild {
-        std::fs::remove_file(&cache_path).ok();
-    }
-
-    let (claude_roots, codex_roots, cursor_roots) = resolve_all_roots(
-        args.claude_dir.as_deref(),
-        args.codex_dir.as_deref(),
-        args.cursor_dir.as_deref(),
-    );
-
-    let mut conn = open_store(&cache_path)
-        .with_context(|| format!("opening cache at {}", cache_path.display()))?;
-
-    let stats = run_ingest(RunIngestOptions {
-        conn: &mut conn,
-        claude_roots,
-        codex_roots,
-        cursor_roots,
-        include_claude: source.include_claude(),
-        include_codex: source.include_codex(),
-        include_cursor: source.include_cursor(),
-        safety_window_ms: 60 * 60 * 1000,
-        now_ms: 0,
-    })?;
+    let CachedRun { conn, stats } = prepare_cached(scope, &roots, args.rebuild)?;
 
     let repo_spec = match args.repo.as_deref() {
         Some(name) => Some(resolve_repo_filter_cached(&conn, name)?),
@@ -482,7 +342,7 @@ fn run_report_cached(group: GroupBy, args: ReportArgs) -> Result<()> {
     };
 
     let filter = QueryFilter {
-        source: source.to_filter(),
+        source: scope.filter,
         since_ms: since.map(|t| t.timestamp_millis()),
         until_ms: until.map(|t| t.timestamp_millis()),
         repo: repo_spec,
@@ -507,158 +367,52 @@ fn run_report_cached(group: GroupBy, args: ReportArgs) -> Result<()> {
         }
     }
 
-    let mut unknown = stats.unknown_models.clone();
-    collect_unknown_from_db(&conn, source.to_filter(), &mut unknown);
-    emit_warnings(&unknown, stats.skipped_lines, stats.file_errors);
+    let (unknown, skipped, errors) = finish_cached_warnings(&conn, &stats, scope.filter);
+    emit_warnings(&unknown, skipped, errors);
     Ok(())
 }
 
-fn collect_unknown_from_db(
-    conn: &Connection,
-    source: Option<Source>,
-    unknown: &mut HashSet<String>,
-) {
-    let sql = match source {
-        Some(_) => "SELECT DISTINCT model, source FROM events WHERE source = ?1",
-        None => "SELECT DISTINCT model, source FROM events",
-    };
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let iter: Result<Vec<(String, String)>, _> = match source {
-        Some(s) => stmt
-            .query_map([s.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .and_then(|rs| rs.collect()),
-        None => stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .and_then(|rs| rs.collect()),
-    };
-    if let Ok(models) = iter {
-        for (m, src) in models {
-            if src == Source::Cursor.as_str() {
-                continue;
-            }
-            if !pricing::has_price(&m) {
-                unknown.insert(m);
-            }
-        }
-    }
-}
-
-fn run_report_no_cache(group: GroupBy, args: ReportArgs) -> Result<()> {
-    let source = SourceArg::parse(&args.source)?;
+fn run_report_no_cache(
+    group: GroupBy,
+    source: SourceArg,
+    scope: SourceScope,
+    roots: super::pipeline::RootDirs,
+    args: ReportArgs,
+) -> Result<()> {
     let since = parse_since(args.since.as_deref())?;
     let until = parse_until(args.until.as_deref())?;
+    let run = prepare_no_cache(scope, &roots)?.with_date_filter(since, until);
 
-    if source.include_cursor() {
-        let target = cursor_sync_target_dir(args.cursor_dir.as_deref());
-        maybe_sync_cursor(Some(&target));
-    }
-
-    let (claude_roots, codex_roots, cursor_roots) = resolve_all_roots(
-        args.claude_dir.as_deref(),
-        args.codex_dir.as_deref(),
-        args.cursor_dir.as_deref(),
-    );
-    let (events, skipped_lines, file_errors) =
-        gather_events_no_cache(source, &claude_roots, &codex_roots, &cursor_roots)?;
-    let repo_catalog = resolve_repos(&events);
-    let filtered = filter_by_date(&events, since, until);
-    let resolved = if since.is_none() && until.is_none() {
-        repo_catalog.clone()
-    } else {
-        resolve_repos(&filtered)
-    };
     let repo_spec = match args.repo.as_deref() {
-        Some(name) => Some(resolve_repo_filter_in_memory(&repo_catalog, name)?),
+        Some(name) => Some(resolve_repo_filter_in_memory(&run.repo_catalog, name)?),
         None => None,
     };
 
-    let mut unknown: HashSet<String> = HashSet::new();
+    let mut unknown = HashSet::new();
     match group {
         GroupBy::Day => {
-            let filtered = filter_by_repo(&resolved, &repo_spec);
+            let filtered = filter_by_repo(&run.resolved, &repo_spec);
             let rows = daily_in_memory(&filtered, source.label(), &mut unknown);
             emit(&rows, ReportKind::Daily, source, args.json);
         }
         GroupBy::Month => {
-            let filtered = filter_by_repo(&resolved, &repo_spec);
+            let filtered = filter_by_repo(&run.resolved, &repo_spec);
             let rows = monthly_in_memory(&filtered, source.label(), &mut unknown);
             emit(&rows, ReportKind::Monthly, source, args.json);
         }
         GroupBy::Session => {
-            let filtered = filter_by_repo(&resolved, &repo_spec);
+            let filtered = filter_by_repo(&run.resolved, &repo_spec);
             let rows = session_in_memory(&filtered, &mut unknown);
             emit(&rows, ReportKind::Session, source, args.json);
         }
         GroupBy::Repo => {
-            let rows = repo_in_memory(&resolved, &repo_spec, &mut unknown);
+            let rows = repo_in_memory(&run.resolved, &repo_spec, &mut unknown);
             emit_repo(&rows, args.json);
         }
     }
 
-    emit_warnings(&unknown, skipped_lines, file_errors);
+    emit_warnings(&unknown, run.skipped_lines, run.file_errors);
     Ok(())
-}
-
-fn gather_events_no_cache(
-    source: SourceArg,
-    claude_roots: &[PathBuf],
-    codex_roots: &[PathBuf],
-    cursor_roots: &[PathBuf],
-) -> Result<(Vec<UsageEvent>, usize, usize)> {
-    let mut events: Vec<UsageEvent> = Vec::new();
-    let mut skipped_lines = 0usize;
-    let mut file_errors = 0usize;
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let discover_opts = DiscoverOpts {
-        safety_window_ms: 60 * 60 * 1000,
-        now_ms,
-    };
-    let empty_manifest = std::collections::HashMap::<PathBuf, crate::store::FileManifestRow>::new();
-
-    if source.include_claude() {
-        let d = discover_claude(claude_roots, &empty_manifest, discover_opts);
-        for f in &d.files {
-            match ingest_claude_range(&f.path, f.project.as_deref(), 0, f.size) {
-                Ok(r) => {
-                    skipped_lines += r.skipped_lines;
-                    events.extend(r.events);
-                }
-                Err(_) => file_errors += 1,
-            }
-        }
-    }
-    if source.include_codex() {
-        let d = discover_codex(codex_roots, &empty_manifest, discover_opts);
-        for f in &d.files {
-            match ingest_codex_range(&f.path, 0, f.size) {
-                Ok(r) => {
-                    skipped_lines += r.skipped_lines;
-                    events.extend(r.events);
-                }
-                Err(_) => file_errors += 1,
-            }
-        }
-    }
-    if source.include_cursor() {
-        let d = discover_cursor(cursor_roots, &empty_manifest, discover_opts);
-        for f in &d.files {
-            match ingest_cursor_range(&f.path) {
-                Ok(r) => {
-                    skipped_lines += r.skipped_lines;
-                    events.extend(r.events);
-                }
-                Err(_) => file_errors += 1,
-            }
-        }
-    }
-    Ok((events, skipped_lines, file_errors))
 }
 
 fn emit(rows: &[AggregateRow], kind: ReportKind, source: SourceArg, as_json: bool) {

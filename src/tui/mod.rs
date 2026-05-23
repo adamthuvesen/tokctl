@@ -1,10 +1,12 @@
 pub mod data;
 pub mod format;
+mod input;
 pub mod keys;
 pub mod shell;
 pub mod state;
 pub mod theme;
 pub mod view;
+pub mod widgets;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -178,7 +180,7 @@ fn event_loop(
                 // tells us whether a Drill action is even legal here.
                 let drill_target =
                     if matches!(action, state::Action::Drill) && state.can_push_drill() {
-                        drill_target_for_current(&state, &cache)
+                        input::drill_target_for_current(&state, &cache)
                     } else {
                         None
                     };
@@ -202,12 +204,12 @@ fn event_loop(
                 // end of the list (or after the cache shrinks) doesn't drift
                 // off-screen. Done after refresh so we clamp against fresh
                 // data, not stale.
-                clamp_cursor_to_visible_rows(&mut state, &cache);
+                input::clamp_cursor_to_visible_rows(&mut state, &cache);
                 if outcome.dirty {
                     dirty_state = true;
                 }
                 if is_yank {
-                    let key = yank_key(&state, &cache);
+                    let key = input::yank_key(&state, &cache);
                     if let Some(k) = key {
                         state.flash = Some(if copy_to_clipboard(&k) {
                             "copied key".into()
@@ -217,7 +219,7 @@ fn event_loop(
                     }
                 }
                 if is_yank_summary {
-                    let summary = yank_summary(&state, &cache);
+                    let summary = input::yank_summary(&state, &cache);
                     if let Some(summary) = summary {
                         state.flash = Some(if copy_to_clipboard(&summary) {
                             "copied summary".into()
@@ -246,225 +248,12 @@ fn event_loop(
     Ok(())
 }
 
-fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
-    match state.deepest_drill() {
-        Some(d) => match d.kind {
-            state::DrillKind::Sessions { .. } => cache
-                .sessions
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.sessions.len().saturating_sub(1)),
-                )
-                .map(|r| r.session_id.clone()),
-            state::DrillKind::Events { source } => cache
-                .events
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.events.len().saturating_sub(1)),
-                )
-                .map(|r| format!("{}/{}@{}", source.as_str(), d.key, r.ts.to_rfc3339())),
-        },
-        None => match state.current_section {
-            Section::Provider => cache
-                .trend
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.trend.len().saturating_sub(1)),
-                )
-                .map(|r| r.bucket.clone()),
-            _ => cache
-                .left
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.left.len().saturating_sub(1)),
-                )
-                .map(|r| r.key.clone()),
-        },
-    }
-}
-
-fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String> {
-    match state.deepest_drill() {
-        Some(d) => match d.kind {
-            state::DrillKind::Sessions { .. } => cache
-                .sessions
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.sessions.len().saturating_sub(1)),
-                )
-                .map(|r| {
-                    format!(
-                        "{}:{} · {} · {} tokens · {}",
-                        r.source.as_str(),
-                        r.session_id,
-                        r.project.clone().unwrap_or_else(|| "(unknown)".into()),
-                        r.total_tokens,
-                        crate::tui::format::fmt_cost(r.cost)
-                    )
-                }),
-            state::DrillKind::Events { .. } => cache
-                .events
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.events.len().saturating_sub(1)),
-                )
-                .map(|r| {
-                    let when = r.ts.with_timezone(&chrono::Local).format("%H:%M:%S");
-                    format!(
-                        "{} {} in={} out={} cost={}",
-                        when,
-                        r.model,
-                        r.input,
-                        r.output,
-                        crate::tui::format::fmt_cost(r.cost)
-                    )
-                }),
-        },
-        None => match state.current_section {
-            Section::Provider => cache
-                .trend
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.trend.len().saturating_sub(1)),
-                )
-                .map(|r| {
-                    format!(
-                        "{} · {} tokens · {}",
-                        r.bucket,
-                        r.total_tokens,
-                        crate::tui::format::fmt_cost(r.total_cost)
-                    )
-                }),
-            _ => cache
-                .left
-                .get(
-                    state
-                        .current_index()
-                        .min(cache.left.len().saturating_sub(1)),
-                )
-                .map(|r| {
-                    format!(
-                        "{} · {} sessions · {} tokens · {}",
-                        r.label,
-                        r.sessions,
-                        r.total_tokens,
-                        crate::tui::format::fmt_cost(r.cost)
-                    )
-                }),
-        },
-    }
-}
-
-/// Build the next drill target from the focused row in the current view.
-/// The kind of drill we're about to push is defined by the state machine
-/// (via `next_drill_kind_hint`); here we just attach the row's key + label
-/// (and the source for events) by reading the appropriate cache slice.
-fn drill_target_for_current(state: &AppState, cache: &data::DataCache) -> Option<state::Drill> {
-    let kind = state.next_drill_kind_hint()?;
-    match kind {
-        state::DrillKind::Sessions { from_section } => {
-            if cache.left.is_empty() {
-                return None;
-            }
-            let idx = state.current_index().min(cache.left.len() - 1);
-            let row = &cache.left[idx];
-            Some(state::Drill {
-                kind: state::DrillKind::Sessions { from_section },
-                key: row.key.clone(),
-                label: row.label.clone(),
-                cursor: 0,
-            })
-        }
-        state::DrillKind::Events { .. } => {
-            // Events drills come from a session row — either Section::Sessions
-            // at the root or a sessions-drill view. The session row tells us
-            // the actual source.
-            match state.deepest_drill() {
-                None => {
-                    if cache.left.is_empty() {
-                        return None;
-                    }
-                    let idx = state.current_index().min(cache.left.len() - 1);
-                    let row = &cache.left[idx];
-                    // Section::Sessions LeftRows now carry the real source.
-                    // Old fallback (Claude) only kicks in if upstream parsing
-                    // produced an "all" SourceLabel, which shouldn't happen
-                    // for a single-session aggregation.
-                    let source = row.source.unwrap_or(crate::types::Source::Claude);
-                    Some(state::Drill {
-                        kind: state::DrillKind::Events { source },
-                        key: row.key.clone(),
-                        label: short_session_label(&row.key),
-                        cursor: 0,
-                    })
-                }
-                Some(_sessions_drill) => {
-                    if cache.sessions.is_empty() {
-                        return None;
-                    }
-                    let idx = state.current_index().min(cache.sessions.len() - 1);
-                    let row = &cache.sessions[idx];
-                    Some(state::Drill {
-                        kind: state::DrillKind::Events { source: row.source },
-                        key: row.session_id.clone(),
-                        label: short_session_label(&row.session_id),
-                        cursor: 0,
-                    })
-                }
-            }
-        }
-    }
-}
-
-/// Returns the local time truncated to the current minute. Used to detect
-/// footer-clock rollover so we redraw at most once per displayed minute
-/// rather than once per Tick (~30/sec).
 fn current_minute() -> chrono::DateTime<chrono::Local> {
     use chrono::{Local, Timelike};
     Local::now()
         .with_second(0)
         .and_then(|t| t.with_nanosecond(0))
         .unwrap_or_else(Local::now)
-}
-
-/// Cap the focused-row cursor at `rows.len() - 1` for whichever cache
-/// slice is currently rendered. Without this, repeated `j` past the end
-/// makes `current_index()` drift past the data and the highlight vanishes
-/// off-screen even with a stateful viewport.
-fn clamp_cursor_to_visible_rows(state: &mut state::AppState, cache: &data::DataCache) {
-    let rows = match state.deepest_drill().map(|d| d.kind) {
-        Some(state::DrillKind::Sessions { .. }) => cache.sessions.len(),
-        Some(state::DrillKind::Events { .. }) => cache.events.len(),
-        None => match state.current_section {
-            state::Section::Provider => cache.trend.len(),
-            _ => cache.left.len(),
-        },
-    };
-    if rows == 0 {
-        state.set_current_index(0);
-        return;
-    }
-    let cur = state.current_index();
-    if cur >= rows {
-        state.set_current_index(rows - 1);
-    }
-}
-
-/// Compact label used in the breadcrumb for a session id. Keeps the first
-/// 8 chars and ellipsizes — enough to disambiguate while staying narrow.
-fn short_session_label(session_id: &str) -> String {
-    let mut s: String = session_id.chars().take(8).collect();
-    if session_id.chars().count() > 8 {
-        s.push('…');
-    }
-    s
 }
 
 #[cfg(feature = "clipboard")]

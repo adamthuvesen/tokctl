@@ -294,11 +294,17 @@ pub fn compare_from_events(
             cache_write: event.cache_write_tokens,
             cost_usd: cost,
         };
-        if windows.current.contains_day(&day) {
-            current.push(row.clone());
-        }
-        if windows.baseline.contains_day(&day) {
-            baseline.push(row);
+        match (
+            windows.current.contains_day(&day),
+            windows.baseline.contains_day(&day),
+        ) {
+            (true, true) => {
+                current.push(row.clone());
+                baseline.push(row);
+            }
+            (true, false) => current.push(row),
+            (false, true) => baseline.push(row),
+            (false, false) => {}
         }
     }
     build_report_from_rows(windows, &current, &baseline, dimensions, top)
