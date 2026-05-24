@@ -2,7 +2,7 @@ use chrono::Utc;
 
 use super::{
     breadcrumb_title, context_text, detail_lines, display_session_rows, display_trend_rows,
-    footer_messages, render_bar, BAR_WIDTH,
+    footer_messages, header_scope, render_bar, BAR_WIDTH,
 };
 use crate::tui::data::{
     CacheStatus, DataCache, EventRow, LeftRow, RefreshError, RefreshScope, SessionRow, TrendRow,
@@ -248,4 +248,173 @@ fn render_bar_spans_total_width() {
     let bar = render_bar(0.5, BAR_WIDTH, &p);
     let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
     assert_eq!(total, BAR_WIDTH);
+}
+
+fn header_cache() -> DataCache {
+    DataCache {
+        trend: vec![
+            TrendRow {
+                bucket: "2026-04".into(),
+                claude_cost: 6.0,
+                codex_cost: 3.0,
+                cursor_cost: 1.0,
+                total_tokens: 1_000,
+                total_cost: 10.0,
+                is_current: false,
+            },
+            TrendRow {
+                bucket: "2026-05".into(),
+                claude_cost: 4.0,
+                codex_cost: 2.0,
+                cursor_cost: 0.0,
+                total_tokens: 600,
+                total_cost: 6.0,
+                is_current: true,
+            },
+        ],
+        left: vec![
+            LeftRow {
+                label: "tokctl".into(),
+                key: "/dev/tokctl".into(),
+                sessions: 2,
+                total_tokens: 1234,
+                cost: 4.2,
+                is_no_repo: false,
+                latest_ts: None,
+                source: None,
+            },
+            LeftRow {
+                label: "other-repo".into(),
+                key: "/dev/other-repo".into(),
+                sessions: 1,
+                total_tokens: 500,
+                cost: 1.5,
+                is_no_repo: false,
+                latest_ts: None,
+                source: None,
+            },
+        ],
+        sessions: vec![
+            SessionRow {
+                session_id: "alpha".into(),
+                source: crate::types::Source::Claude,
+                latest_ts: Utc::now(),
+                project: Some("tokctl".into()),
+                cost: 2.0,
+                total_tokens: 800,
+            },
+            SessionRow {
+                session_id: "bravo".into(),
+                source: crate::types::Source::Codex,
+                latest_ts: Utc::now(),
+                project: Some("zzz".into()),
+                cost: 0.5,
+                total_tokens: 200,
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn header_scope_default_sums_trend() {
+    let state = AppState::default();
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    assert_eq!(cost, 16.0);
+    assert_eq!(tokens, 1_600);
+    assert_eq!(suffix, "");
+}
+
+#[test]
+fn header_scope_sessions_drill_sums_sessions_with_label() {
+    let mut state = AppState::default();
+    state.push_drill(crate::tui::state::Drill {
+        kind: DrillKind::Sessions {
+            from_section: Section::Repos,
+        },
+        key: "/dev/tokctl".into(),
+        label: "tokctl".into(),
+        cursor: 0,
+    });
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    assert_eq!(cost, 2.5);
+    assert_eq!(tokens, 1_000);
+    assert_eq!(suffix, " · tokctl");
+}
+
+#[test]
+fn header_scope_events_drill_sums_event_token_columns() {
+    let mut state = AppState {
+        current_section: Section::Sessions,
+        ..AppState::default()
+    };
+    state.push_drill(crate::tui::state::Drill {
+        kind: DrillKind::Events {
+            source: crate::types::Source::Claude,
+        },
+        key: "alpha".into(),
+        label: "alpha".into(),
+        cursor: 0,
+    });
+    let mut c = header_cache();
+    c.events = vec![
+        EventRow {
+            ts: Utc::now(),
+            model: "claude".into(),
+            input: 100,
+            output: 50,
+            cache_read: 200,
+            cache_write: 10,
+            cost: 0.42,
+        },
+        EventRow {
+            ts: Utc::now(),
+            model: "claude".into(),
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            cost: 0.08,
+        },
+    ];
+    let (cost, tokens, suffix) = header_scope(&state, &c);
+    assert!((cost - 0.50).abs() < 1e-9);
+    assert_eq!(tokens, 100 + 50 + 200 + 10 + 1 + 2 + 3 + 4);
+    assert_eq!(suffix, " · alpha");
+}
+
+#[test]
+fn header_scope_fuzzy_filter_on_left_pane_shrinks_total() {
+    let mut state = AppState {
+        current_section: Section::Repos,
+        focus: crate::tui::state::Focus::Main,
+        ..AppState::default()
+    };
+    state.filter.query = "tokctl".into();
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    assert_eq!(cost, 4.2);
+    assert_eq!(tokens, 1_234);
+    assert_eq!(suffix, " · filter:tokctl");
+}
+
+#[test]
+fn header_scope_fuzzy_filter_inside_drill_appends_both_suffixes() {
+    let mut state = AppState {
+        focus: crate::tui::state::Focus::Main,
+        ..AppState::default()
+    };
+    state.push_drill(crate::tui::state::Drill {
+        kind: DrillKind::Sessions {
+            from_section: Section::Repos,
+        },
+        key: "/dev/tokctl".into(),
+        label: "tokctl".into(),
+        cursor: 0,
+    });
+    state.filter.query = "tokctl".into();
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    // Only the "tokctl"-project session matches.
+    assert_eq!(cost, 2.0);
+    assert_eq!(tokens, 800);
+    assert_eq!(suffix, " · tokctl · filter:tokctl");
 }

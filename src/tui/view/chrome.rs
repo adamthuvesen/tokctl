@@ -13,6 +13,7 @@ use crate::tui::data::DataCache;
 use crate::tui::format::{fmt_cost, fmt_num};
 use crate::tui::state::{AppState, DrillKind, Section};
 use crate::tui::theme::Palette;
+use crate::tui::widgets::filter::{apply_filter_left, apply_filter_sessions, should_filter};
 
 // -- Header / context -------------------------------------------------------
 
@@ -24,11 +25,11 @@ pub(super) fn draw_header(
     palette: &Palette,
 ) {
     let clock = Local::now().format("%Y-%m-%d %H:%M").to_string();
-    // Window-scoped totals. Sourced solely from `cache.trend` so the header
-    // is a single source of truth — `cache.left` / `cache.sessions` are
-    // section/drill-scoped and overlap with trend, which double-counted.
-    let total_cost: f64 = cache.trend.iter().map(|r| r.total_cost).sum::<f64>();
-    let total_tokens: u64 = cache.trend.iter().map(|r| r.total_tokens).sum::<u64>();
+    // Totals reflect the deepest active scope: an events/sessions drill, then
+    // a fuzzy filter, then the bare window+source filter via `cache.trend`.
+    // Drill-scoped caches (`cache.sessions`, `cache.events`) are already
+    // narrowed at load time, so summing them here doesn't double-count.
+    let (total_cost, total_tokens, scope_suffix) = header_scope(state, cache);
 
     let line1 = Line::from(vec![
         Span::styled("tokctl ", Style::default().add_modifier(Modifier::BOLD)),
@@ -36,8 +37,9 @@ pub(super) fn draw_header(
         Span::raw("  "),
         Span::styled(
             format!(
-                "last {} · {} · {} tok",
+                "last {}{} · {} · {} tok",
                 state.time_window.as_str(),
+                scope_suffix,
                 fmt_cost(total_cost),
                 fmt_num(total_tokens),
             ),
@@ -51,6 +53,57 @@ pub(super) fn draw_header(
         palette.dim_text(),
     ));
     frame.render_widget(Paragraph::new(vec![line1, line2]), area);
+}
+
+/// Pick the totals shown in the header so they match what's actually on screen.
+/// Most-specific scope wins; the returned suffix is appended after the time
+/// window (e.g. " · acme-repo", " · filter:foo", or both).
+pub(crate) fn header_scope(state: &AppState, cache: &DataCache) -> (f64, u64, String) {
+    let filtering = should_filter(state);
+    let filter_suffix = || format!(" · filter:{}", state.filter.query);
+
+    if let Some(drill) = state.deepest_drill() {
+        let drill_suffix = format!(" · {}", drill.label);
+        match drill.kind {
+            DrillKind::Events { .. } => {
+                let (cost, tokens) = cache.events.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
+                    (c + r.cost, t + r.input + r.output + r.cache_read + r.cache_write)
+                });
+                return (cost, tokens, drill_suffix);
+            }
+            DrillKind::Sessions { .. } => {
+                if filtering {
+                    let (rows, _) = apply_filter_sessions(&cache.sessions, state);
+                    let (cost, tokens) = sum_sessions(&rows);
+                    return (cost, tokens, format!("{}{}", drill_suffix, filter_suffix()));
+                }
+                let (cost, tokens) = sum_sessions(&cache.sessions);
+                return (cost, tokens, drill_suffix);
+            }
+        }
+    }
+
+    if filtering {
+        if state.current_section == Section::Sessions {
+            let (rows, _) = apply_filter_sessions(&cache.sessions, state);
+            let (cost, tokens) = sum_sessions(&rows);
+            return (cost, tokens, filter_suffix());
+        }
+        let (rows, _) = apply_filter_left(&cache.left, state);
+        let (cost, tokens) = rows
+            .iter()
+            .fold((0.0_f64, 0_u64), |(c, t), r| (c + r.cost, t + r.total_tokens));
+        return (cost, tokens, filter_suffix());
+    }
+
+    let cost = cache.trend.iter().map(|r| r.total_cost).sum::<f64>();
+    let tokens = cache.trend.iter().map(|r| r.total_tokens).sum::<u64>();
+    (cost, tokens, String::new())
+}
+
+fn sum_sessions(rows: &[crate::tui::data::SessionRow]) -> (f64, u64) {
+    rows.iter()
+        .fold((0.0_f64, 0_u64), |(c, t), r| (c + r.cost, t + r.total_tokens))
 }
 
 pub(crate) fn context_text(state: &AppState, width: usize) -> String {
