@@ -8,7 +8,7 @@ mod tables;
 pub use core::draw;
 
 #[cfg(test)]
-pub(crate) use chrome::{context_text, detail_lines, footer_messages};
+pub(crate) use chrome::{context_text, detail_lines, footer_messages, header_scope};
 #[cfg(test)]
 pub(crate) use core::breadcrumb_title;
 #[cfg(test)]
