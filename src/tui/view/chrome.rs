@@ -67,7 +67,10 @@ pub(crate) fn header_scope(state: &AppState, cache: &DataCache) -> (f64, u64, St
         match drill.kind {
             DrillKind::Events { .. } => {
                 let (cost, tokens) = cache.events.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
-                    (c + r.cost, t + r.input + r.output + r.cache_read + r.cache_write)
+                    (
+                        c + r.cost,
+                        t + r.input + r.output + r.cache_read + r.cache_write,
+                    )
                 });
                 return (cost, tokens, drill_suffix);
             }
@@ -90,9 +93,9 @@ pub(crate) fn header_scope(state: &AppState, cache: &DataCache) -> (f64, u64, St
             return (cost, tokens, filter_suffix());
         }
         let (rows, _) = apply_filter_left(&cache.left, state);
-        let (cost, tokens) = rows
-            .iter()
-            .fold((0.0_f64, 0_u64), |(c, t), r| (c + r.cost, t + r.total_tokens));
+        let (cost, tokens) = rows.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
+            (c + r.cost, t + r.total_tokens)
+        });
         return (cost, tokens, filter_suffix());
     }
 
@@ -102,8 +105,9 @@ pub(crate) fn header_scope(state: &AppState, cache: &DataCache) -> (f64, u64, St
 }
 
 fn sum_sessions(rows: &[crate::tui::data::SessionRow]) -> (f64, u64) {
-    rows.iter()
-        .fold((0.0_f64, 0_u64), |(c, t), r| (c + r.cost, t + r.total_tokens))
+    rows.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
+        (c + r.cost, t + r.total_tokens)
+    })
 }
 
 pub(crate) fn context_text(state: &AppState, width: usize) -> String {
