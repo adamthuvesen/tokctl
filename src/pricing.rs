@@ -14,6 +14,25 @@ pub struct PriceEntry {
 const PRICES: &[(&str, PriceEntry)] = &[
     // Anthropic
     (
+        "claude-fable-5",
+        PriceEntry {
+            input: 10.0,
+            output: 50.0,
+            cache_read: 1.0,
+            cache_write: 12.5,
+        },
+    ),
+    // Long-context variant: 1M context is billed at standard rates (no premium).
+    (
+        "claude-fable-5[1m]",
+        PriceEntry {
+            input: 10.0,
+            output: 50.0,
+            cache_read: 1.0,
+            cache_write: 12.5,
+        },
+    ),
+    (
         "claude-opus-4-7",
         PriceEntry {
             input: 5.0,
@@ -392,6 +411,21 @@ mod tests {
             1_000_000,
         );
         assert!((cost_of(&e, None) - 36.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fable_price_is_used() {
+        // $10 input + $50 output + $1 cache read + $12.50 cache write per MTok
+        let e = event("claude-fable-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost_of(&e, None) - 73.5).abs() < 1e-9);
+        let long = event(
+            "claude-fable-5[1m]",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert!((cost_of(&long, None) - 73.5).abs() < 1e-9);
     }
 
     #[test]
