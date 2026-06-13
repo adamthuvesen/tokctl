@@ -33,6 +33,15 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     (
+        "claude-opus-4-8",
+        PriceEntry {
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+        },
+    ),
+    (
         "claude-opus-4-7",
         PriceEntry {
             input: 5.0,
