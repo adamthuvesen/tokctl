@@ -2,7 +2,7 @@ use chrono::Utc;
 
 use super::{
     breadcrumb_title, context_text, detail_lines, display_session_rows, display_trend_rows,
-    footer_messages, header_scope, render_bar, BAR_WIDTH,
+    footer_messages, header_scope, provider_cost_text, render_bar, BAR_WIDTH,
 };
 use crate::tui::data::{
     CacheStatus, DataCache, EventRow, LeftRow, RefreshError, RefreshScope, SessionRow, TrendRow,
@@ -248,6 +248,16 @@ fn render_bar_spans_total_width() {
     let bar = render_bar(0.5, BAR_WIDTH, &p);
     let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
     assert_eq!(total, BAR_WIDTH);
+}
+
+#[test]
+fn provider_missing_cost_aligns_with_cost_cells() {
+    let missing = provider_cost_text(0.0);
+    let value = provider_cost_text(1.23);
+
+    assert_eq!(missing.chars().count(), value.chars().count());
+    assert_eq!(missing, "         —");
+    assert_eq!(value, "     $1.23");
 }
 
 fn header_cache() -> DataCache {

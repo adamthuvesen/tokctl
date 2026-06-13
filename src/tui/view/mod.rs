@@ -14,7 +14,7 @@ pub(crate) use core::breadcrumb_title;
 #[cfg(test)]
 pub(crate) use layout::BAR_WIDTH;
 #[cfg(test)]
-pub(crate) use tables::{display_session_rows, display_trend_rows, render_bar};
+pub(crate) use tables::{display_session_rows, display_trend_rows, provider_cost_text, render_bar};
 
 #[cfg(test)]
 #[path = "../view_tests.rs"]
