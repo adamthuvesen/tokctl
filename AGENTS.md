@@ -4,8 +4,6 @@
 
 `tokctl` is a **local-only Rust CLI** (edition 2021) that reads Claude/Codex JSONL session logs and prints token/cost reports. Persistence is a **SQLite** cache (`rusqlite`, bundled feature); default runs use incremental ingest + SQL reports; **`--no-cache`** uses the in-memory path without touching the DB. `tokctl ui` launches an interactive ratatui dashboard over the same cache.
 
-Spec-driven changes live under `openspec/` — proposals and deltas in `openspec/changes/`, canonical capability specs in `openspec/specs/`. Keep specs in sync when capability behavior changes.
-
 ## Layout
 
 - `src/main.rs` — thin entry; delegates to `cli::main_exit`
