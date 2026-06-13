@@ -616,9 +616,17 @@ fn trend_row<'a>(
 
 fn cost_cell_or_dash(cost: f64, value_style: Style, dim_style: Style) -> Cell<'static> {
     if cost < 0.001 {
-        Cell::from("—").style(dim_style)
+        Cell::from(provider_cost_text(cost)).style(dim_style)
     } else {
-        Cell::from(format!("{:>10}", fmt_cost(cost))).style(value_style)
+        Cell::from(provider_cost_text(cost)).style(value_style)
+    }
+}
+
+pub(crate) fn provider_cost_text(cost: f64) -> String {
+    if cost < 0.001 {
+        format!("{:>10}", "—")
+    } else {
+        format!("{:>10}", fmt_cost(cost))
     }
 }
 
