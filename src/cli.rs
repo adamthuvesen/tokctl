@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::compare::CompareDimension;
@@ -42,8 +43,33 @@ enum Commands {
     ExportDb,
     /// Cursor account setup, sync, and status.
     Cursor(CursorArgs),
-    /// Launch the interactive terminal UI (read-only against the cache).
-    Ui,
+    /// Seed a synthetic demo cache for screenshots and public demos.
+    Demo(DemoArgs),
+    /// Launch the interactive terminal UI.
+    Ui(UiArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct DemoArgs {
+    /// directory where demo cache.db should be written
+    #[arg(long = "cache-dir", default_value = "/tmp/tokctl-demo")]
+    cache_dir: PathBuf,
+    /// replace an existing demo cache at --cache-dir
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct UiArgs {
+    /// launch against synthetic demo data without reading local logs
+    #[arg(long)]
+    demo: bool,
+    /// directory for the synthetic demo cache used by --demo
+    #[arg(long = "cache-dir", default_value = "/tmp/tokctl-demo")]
+    cache_dir: PathBuf,
+    /// replace an existing synthetic demo cache before launching --demo
+    #[arg(long)]
+    overwrite: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -299,7 +325,8 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::Cursor(a) => workflows::run_cursor(a),
-        Commands::Ui => workflows::run_ui(),
+        Commands::Demo(a) => workflows::run_demo(a),
+        Commands::Ui(a) => workflows::run_ui(a),
     }
 }
 

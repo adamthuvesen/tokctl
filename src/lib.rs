@@ -5,6 +5,7 @@ pub mod cli;
 pub mod compare;
 pub mod cursor_sync;
 pub mod dates;
+pub mod demo;
 pub mod discovery;
 pub mod doctor;
 pub mod ingest;

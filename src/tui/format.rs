@@ -45,6 +45,11 @@ pub fn relative_time(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     ts.with_timezone(&Local).format("%Y-%m-%d").to_string()
 }
 
+/// Stable timestamp for sorted session tables.
+pub fn session_when(ts: DateTime<Utc>) -> String {
+    ts.with_timezone(&Local).format("%m-%d %H:%M").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +81,15 @@ mod tests {
         let long_ago = n - Duration::days(40);
         let s = relative_time(long_ago, n);
         assert!(s.starts_with("2026-") || s.starts_with("2026"));
+    }
+    #[test]
+    fn session_when_is_absolute_and_compact() {
+        let ts = Local
+            .with_ymd_and_hms(2026, 6, 19, 8, 15, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(session_when(ts), "06-19 08:15");
     }
     #[test]
     fn short_tokens() {
