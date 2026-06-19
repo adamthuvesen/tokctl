@@ -7,8 +7,8 @@ use super::pipeline::{
     sync_cursor_if_needed, CachedRun, SourceScope,
 };
 use super::{
-    CompareArgs, CursorArgs, CursorCommands, CursorLoginArgs, DoctorArgs, GroupBy, RepoArgs,
-    ReportArgs, SourceArg,
+    CompareArgs, CursorArgs, CursorCommands, CursorLoginArgs, DemoArgs, DoctorArgs, GroupBy,
+    RepoArgs, ReportArgs, SourceArg, UiArgs,
 };
 use crate::compare;
 use crate::cursor_sync::{
@@ -137,7 +137,15 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run_ui() -> Result<()> {
+pub(super) fn run_ui(args: UiArgs) -> Result<()> {
+    if args.demo {
+        let result = crate::demo::seed_demo_cache(&args.cache_dir, args.overwrite)?;
+        // SAFETY: tokctl is still single-threaded here; the TUI reads this
+        // process-local override immediately when resolving store_path().
+        std::env::set_var("TOKCTL_CACHE_DIR", &result.cache_dir);
+        return crate::tui::run();
+    }
+
     maybe_sync_cursor(None);
     let roots = resolve_root_dirs(None, None, None);
     let scope = SourceScope {
@@ -151,6 +159,21 @@ pub(super) fn run_ui() -> Result<()> {
     emit_warnings(&unknown, skipped, errors);
     drop(conn);
     crate::tui::run()
+}
+
+pub(super) fn run_demo(args: DemoArgs) -> Result<()> {
+    let result = crate::demo::seed_demo_cache(&args.cache_dir, args.overwrite)?;
+    println!(
+        "Seeded {} synthetic events across {} repos into {}",
+        result.events,
+        result.repos,
+        result.cache_path.display()
+    );
+    println!(
+        "Run: tokctl ui --demo --cache-dir {} --overwrite",
+        result.cache_dir.display()
+    );
+    Ok(())
 }
 
 pub(super) fn run_cursor(args: CursorArgs) -> Result<()> {

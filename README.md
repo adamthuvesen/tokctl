@@ -5,6 +5,15 @@ A terminal dashboard for what you actually spent on **Claude**, **Codex**, and *
 ```sh
 tokctl ui
 ```
+
+![tokctl sessions dashboard with synthetic demo data](assets/tokctl-demo-sessions.png)
+
+The screenshot uses deterministic synthetic data. To try the same public-safe demo without reading your local Claude, Codex, or Cursor logs:
+
+```sh
+tokctl ui --demo --cache-dir /tmp/tokctl-demo --overwrite
+```
+
 ---
 
 ## Install
@@ -17,7 +26,7 @@ cargo build --release && ln -sf "$(pwd)/target/release/tokctl" ~/.local/bin/tokc
 
 Rust 1.75+, edition 2021. SQLite is bundled — no system `libsqlite` needed.
 
-First run ingests your local Claude/Codex JSONL and any Cursor CSV cache into `$XDG_DATA_HOME/tokctl/cache.db`. Subsequent runs are incremental.
+First run ingests your local Claude/Codex JSONL and any Cursor CSV cache into `$XDG_DATA_HOME/tokctl/cache.db`. Subsequent runs are incremental. `tokctl ui --demo` is the exception: it seeds a separate synthetic cache and opens the UI against that cache only.
 
 ---
 
@@ -78,6 +87,8 @@ tokctl repo tokctl                        # sessions inside one repo
 tokctl compare                            # this month-to-date vs comparable previous month
 tokctl compare this-week last-week --by repo
 tokctl doctor                             # roots, cache, pricing, sync readiness
+tokctl demo                               # seed a synthetic cache for public demos
+tokctl ui --demo                          # launch UI against synthetic data only
 
 # filter / pivot any of the above
 tokctl daily --source claude
