@@ -49,6 +49,31 @@ const REPOS: &[DemoRepo] = &[
         name: "mobile-kit",
         origin: "https://github.com/example/mobile-kit",
     },
+    DemoRepo {
+        key: "/demo/workspaces/search-core",
+        name: "search-core",
+        origin: "https://github.com/example/search-core",
+    },
+    DemoRepo {
+        key: "/demo/workspaces/billing-api",
+        name: "billing-api",
+        origin: "https://github.com/example/billing-api",
+    },
+    DemoRepo {
+        key: "/demo/workspaces/infra-ops",
+        name: "infra-ops",
+        origin: "https://github.com/example/infra-ops",
+    },
+    DemoRepo {
+        key: "/demo/workspaces/design-system",
+        name: "design-system",
+        origin: "https://github.com/example/design-system",
+    },
+    DemoRepo {
+        key: "/demo/workspaces/analytics-warehouse",
+        name: "analytics-warehouse",
+        origin: "https://github.com/example/analytics-warehouse",
+    },
 ];
 
 const SOURCES: &[DemoSource] = &[
@@ -64,8 +89,8 @@ const SOURCES: &[DemoSource] = &[
     },
     DemoSource {
         source: Source::Cursor,
-        model: "cursor-usage",
-        weight: 2,
+        model: "composer-2.5",
+        weight: 3,
     },
 ];
 
@@ -115,9 +140,9 @@ pub fn seed_demo_cache(cache_dir: &Path, overwrite: bool) -> Result<DemoSeedResu
                 path: PathBuf::from(format!("/demo/logs/{}.jsonl", source.as_str())),
                 source,
                 project: Some("demo".to_owned()),
-                size: 64_000,
+                size: 384_000,
                 mtime_ns: now_ns,
-                last_offset: 64_000,
+                last_offset: 384_000,
                 n_events: events.iter().filter(|event| event.source == source).count() as u64,
                 session_id: None,
                 model: None,
@@ -157,12 +182,12 @@ fn build_demo_events() -> Vec<EventRow> {
             continue;
         }
 
-        let day_intensity = 1 + ((35 - day_back) % 5) as u64;
-        let sessions_today = 2 + ((day_back + 1) % 4) as u64;
+        let day_intensity = 3 + ((35 - day_back) % 6) as u64;
+        let sessions_today = 7 + ((day_back + 1) % 6) as u64;
         for session_idx in 0..sessions_today {
-            let repo_idx = ((day_back as usize) + (session_idx as usize * 2)) % REPOS.len();
-            let source = weighted_source(day_back as u64 + session_idx);
-            let hour = 8 + ((session_idx * 3 + day_intensity) % 11) as u32;
+            let repo_idx = ((day_back as usize * 3) + (session_idx as usize * 2)) % REPOS.len();
+            let source = weighted_source(day_back as u64 + session_idx * 2);
+            let hour = 7 + ((session_idx * 2 + day_intensity) % 13) as u32;
             let minute = (session_idx * 13 % 60) as u32;
             let ts = local_ts(day, hour, minute);
             session_counter += 1;
@@ -172,7 +197,7 @@ fn build_demo_events() -> Vec<EventRow> {
                 base36(session_counter)
             );
 
-            let turns = 2 + ((day_back as u64 + session_idx) % 4);
+            let turns = 4 + ((day_back as u64 + session_idx) % 5);
             for turn in 0..turns {
                 let mut event_ts = ts + Duration::minutes((turn * 17) as i64);
                 if event_ts > now {
@@ -214,20 +239,20 @@ fn demo_event(
     intensity: u64,
     turn: u64,
 ) -> EventRow {
-    let input = 18_000 + intensity * 4_400 + turn * 2_350;
-    let output = 2_400 + intensity * 950 + turn * 875;
+    let input = 52_000 + intensity * 12_500 + turn * 8_750;
+    let output = 7_500 + intensity * 2_200 + turn * 1_450;
     let cache_read = match source.source {
         Source::Cursor => 0,
-        _ => 8_000 + intensity * 3_200 + turn * 1_000,
+        _ => 48_000 + intensity * 18_500 + turn * 6_250,
     };
     let cache_write = match source.source {
-        Source::Claude => 1_500 + intensity * 450,
+        Source::Claude => 7_500 + intensity * 1_800,
         _ => 0,
     };
     let cost = match source.source {
         Source::Cursor => {
             // Cursor CSVs carry explicit costs, so mirror that in the demo.
-            ((input + output) as f64 / 1_000_000.0) * 18.0
+            ((input + output) as f64 / 1_000_000.0) * 22.0
         }
         _ => pricing::cost_of(
             &UsageEvent {
@@ -297,8 +322,8 @@ mod tests {
 
         let result = seed_demo_cache(dir.path(), false).unwrap();
 
-        assert_eq!(result.repos, 5);
-        assert!(result.events > 300);
+        assert_eq!(result.repos, 10);
+        assert!(result.events > 1_500);
         let conn = open_store(&result.cache_path).unwrap();
         let repos: i64 = conn
             .query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))
@@ -321,7 +346,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(repos, 5);
+        assert_eq!(repos, 10);
         assert_eq!(events as usize, result.events);
         assert_eq!(private_paths, 0);
         assert_eq!(future_events, 0);
