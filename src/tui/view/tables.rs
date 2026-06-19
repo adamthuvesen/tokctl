@@ -1,4 +1,4 @@
-use chrono::{Local, Utc};
+use chrono::Local;
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
@@ -9,7 +9,7 @@ use ratatui::{
 
 use super::layout::{BAR_WIDTH, LEFT_NAME_WIDTH, SESSION_PROJECT_WIDTH};
 use crate::tui::data::{sort_session_rows, DataCache, EventRow, LeftRow, SessionRow, TrendRow};
-use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, relative_time};
+use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, session_when};
 use crate::tui::state::{AppState, Focus, Sort, SourceFilter};
 use crate::tui::theme::Palette;
 use crate::tui::widgets::filter::{apply_filter_left, apply_filter_sessions};
@@ -221,7 +221,6 @@ pub(super) fn draw_sessions_table(
         .map(|r| r.cost)
         .fold(0f64, f64::max)
         .max(0.0001);
-    let now = Utc::now();
     let selected = state.current_index().min(filtered.len().saturating_sub(1));
     let active = state.focus == Focus::Main;
 
@@ -258,7 +257,7 @@ pub(super) fn draw_sessions_table(
                 palette,
             ));
             let mut row = Row::new(vec![
-                Cell::from(relative_time(r.latest_ts, now)),
+                Cell::from(session_when(r.latest_ts)),
                 Cell::from(r.source.as_str().to_owned()).style(src_style),
                 proj_cell,
                 Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),

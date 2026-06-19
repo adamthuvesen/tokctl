@@ -147,6 +147,7 @@ fn clear_demo_cache(conn: &Connection) -> Result<()> {
 
 fn build_demo_events() -> Vec<EventRow> {
     let today = Local::now().date_naive();
+    let now = Utc::now();
     let mut rows = Vec::new();
     let mut session_counter = 1000_u64;
 
@@ -173,11 +174,16 @@ fn build_demo_events() -> Vec<EventRow> {
 
             let turns = 2 + ((day_back as u64 + session_idx) % 4);
             for turn in 0..turns {
+                let mut event_ts = ts + Duration::minutes((turn * 17) as i64);
+                if event_ts > now {
+                    let minutes_back = ((session_idx + 1) * 19 + (turn + 1) * 7) as i64;
+                    event_ts = now - Duration::minutes(minutes_back);
+                }
                 rows.push(demo_event(
                     &session_id,
                     &REPOS[repo_idx],
                     source,
-                    ts + Duration::minutes((turn * 17) as i64),
+                    event_ts,
                     day_intensity,
                     turn,
                 ));
@@ -307,10 +313,18 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let future_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ts > ?1",
+                [Utc::now().timestamp_millis()],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(repos, 5);
         assert_eq!(events as usize, result.events);
         assert_eq!(private_paths, 0);
+        assert_eq!(future_events, 0);
     }
 
     #[test]
