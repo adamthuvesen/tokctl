@@ -6,7 +6,7 @@ A terminal dashboard for what you actually spent on **Claude**, **Codex**, and *
 tokctl ui
 ```
 
-![tokctl sessions dashboard with synthetic demo data](assets/tokctl-demo-sessions.png)
+![tokctl provider dashboard with synthetic demo data](assets/tokctl-demo-provider.png)
 
 The screenshot uses deterministic synthetic data. To try the same public-safe demo without reading your local Claude, Codex, or Cursor logs:
 
