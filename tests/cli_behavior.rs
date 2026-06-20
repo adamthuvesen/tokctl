@@ -155,6 +155,12 @@ fn doctor_json_does_not_create_cache_or_config() {
         parsed["summary"]["cache_path"],
         expected_cache_path.to_str().expect("utf8 cache path")
     );
+    let check_counts = &parsed["check_counts"];
+    let ok = check_counts["ok"].as_u64().expect("ok count");
+    let warn = check_counts["warn"].as_u64().expect("warn count");
+    let error = check_counts["error"].as_u64().expect("error count");
+    let checks = parsed["checks"].as_array().expect("checks array");
+    assert_eq!(ok + warn + error, checks.len() as u64);
     assert!(!expected_cache_path.exists());
     assert!(!expected_config_dir.exists());
 }

@@ -72,9 +72,35 @@ pub struct DoctorSummary {
     pub discovered_cursor_files: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DoctorCheckCounts {
+    pub ok: usize,
+    pub warn: usize,
+    pub error: usize,
+}
+
+impl DoctorCheckCounts {
+    pub(crate) fn from_checks(checks: &[DoctorCheck]) -> Self {
+        let mut counts = Self {
+            ok: 0,
+            warn: 0,
+            error: 0,
+        };
+        for check in checks {
+            match check.severity {
+                CheckSeverity::Ok => counts.ok += 1,
+                CheckSeverity::Warn => counts.warn += 1,
+                CheckSeverity::Error => counts.error += 1,
+            }
+        }
+        counts
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub status: CheckSeverity,
+    pub check_counts: DoctorCheckCounts,
     pub checks: Vec<DoctorCheck>,
     pub summary: DoctorSummary,
 }
@@ -153,9 +179,11 @@ pub fn run() -> DoctorReport {
         .map(|check| check.severity)
         .max()
         .unwrap_or(CheckSeverity::Ok);
+    let check_counts = DoctorCheckCounts::from_checks(&checks);
 
     DoctorReport {
         status,
+        check_counts,
         checks,
         summary,
     }
@@ -174,6 +202,11 @@ mod tests {
                 .into_iter()
                 .max()
                 .unwrap(),
+            check_counts: DoctorCheckCounts {
+                ok: 0,
+                warn: 0,
+                error: 0,
+            },
             checks: Vec::new(),
             summary: DoctorSummary {
                 cache_path: "/tmp/cache.db".into(),
@@ -237,9 +270,61 @@ mod tests {
     }
 
     #[test]
-    fn doctor_json_contains_status() {
+    fn check_counts_tally_each_severity() {
+        let checks = vec![
+            DoctorCheck::new("cache", CheckSeverity::Ok, "fine"),
+            DoctorCheck::new("roots", CheckSeverity::Warn, "missing"),
+            DoctorCheck::new("cache", CheckSeverity::Warn, "stale"),
+            DoctorCheck::new("schema", CheckSeverity::Error, "newer"),
+        ];
+
+        assert_eq!(
+            DoctorCheckCounts::from_checks(&checks),
+            DoctorCheckCounts {
+                ok: 1,
+                warn: 2,
+                error: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_rendering_contains_check_counts() {
+        let report = DoctorReport {
+            status: CheckSeverity::Warn,
+            check_counts: DoctorCheckCounts {
+                ok: 1,
+                warn: 2,
+                error: 0,
+            },
+            checks: vec![
+                DoctorCheck::new("cache", CheckSeverity::Ok, "fine"),
+                DoctorCheck::new("roots", CheckSeverity::Warn, "missing"),
+                DoctorCheck::new("roots", CheckSeverity::Warn, "empty"),
+            ],
+            summary: DoctorSummary {
+                cache_path: "/tmp/cache.db".into(),
+                event_count: 1,
+                file_count: 1,
+                repo_count: 0,
+                discovered_claude_files: 0,
+                discovered_codex_files: 0,
+                discovered_cursor_files: 0,
+            },
+        };
+
+        assert!(render_human(&report).contains("checks: 1 ok, 2 warn, 0 error"));
+    }
+
+    #[test]
+    fn doctor_json_contains_status_and_check_counts() {
         let report = DoctorReport {
             status: CheckSeverity::Ok,
+            check_counts: DoctorCheckCounts {
+                ok: 1,
+                warn: 0,
+                error: 0,
+            },
             checks: vec![DoctorCheck::new("cache", CheckSeverity::Ok, "fine")],
             summary: DoctorSummary {
                 cache_path: "/tmp/cache.db".into(),
@@ -253,5 +338,7 @@ mod tests {
         };
         let json = render_json(&report);
         assert!(json.contains("\"status\": \"ok\""));
+        assert!(json.contains("\"check_counts\": {"));
+        assert!(json.contains("\"ok\": 1"));
     }
 }

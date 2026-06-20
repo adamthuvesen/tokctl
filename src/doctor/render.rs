@@ -6,8 +6,11 @@ use super::{DoctorCheck, DoctorReport};
 pub fn render_human(report: &DoctorReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "tokctl doctor: {}\ncache: {}\n\n",
+        "tokctl doctor: {}\nchecks: {} ok, {} warn, {} error\ncache: {}\n\n",
         report.status.as_str(),
+        report.check_counts.ok,
+        report.check_counts.warn,
+        report.check_counts.error,
         report.summary.cache_path
     ));
 
