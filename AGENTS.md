@@ -1,31 +1,28 @@
-# Agent instructions (tokctl)
+# AGENTS.md — tokctl
 
-## Project
+`tokctl` is a local-only Rust CLI (edition 2021) that reads Claude/Codex JSONL
+session logs and prints token/cost reports, backed by a SQLite cache with an
+optional `--no-cache` in-memory path and a `tokctl ui` ratatui dashboard.
 
-`tokctl` is a **local-only Rust CLI** (edition 2021) that reads Claude/Codex JSONL session logs and prints token/cost reports. Persistence is a **SQLite** cache (`rusqlite`, bundled feature); default runs use incremental ingest + SQL reports; **`--no-cache`** uses the in-memory path without touching the DB. `tokctl ui` launches an interactive ratatui dashboard over the same cache.
+User-level guidance (tone, principles, git etiquette) lives in `~/.claude/CLAUDE.md`
+and `~/dotfiles/agents/AGENTS.md` and is *not* duplicated here. This file is for
+project-specific facts.
 
 ## Layout
 
-- `src/main.rs` — thin entry; delegates to `cli::main_exit`
-- `src/lib.rs` — library crate (also consumed by `benches/`)
-- `src/cli.rs` — `clap` parser, routing, `--rebuild` / `--no-cache` / `ui` dispatch
-- `src/cli/pipeline.rs` — shared roots → ingest/gather → cached vs `--no-cache` prepared runs
-- `src/cli/workflows.rs` — command handlers (report, compare, repo, cursor)
-- `src/types.rs` + `src/dates.rs` — shared types (source kind, usage, options) and `--since` / window parsing
-- `src/sources/` — Claude and Codex JSONL parsers (typed `serde` deserialization)
-- `src/discovery.rs` + `src/paths.rs` — filesystem scanning + root resolution
-- `src/repo.rs` — git-aware repo identity resolution (repo key, display name, remote) for per-repo rollups
-- `src/ingest/` — ingest plan, byte-range reads (mmap for ≥ 1 MB), parallel runner
-- `src/store/` — SQLite schema, writes, queries
-- `src/reports/in_memory.rs` — aggregations for `--no-cache`
-- `src/render.rs` — table + JSON output
-- `src/pricing.rs` — static model price table
-- `src/tui/` — ratatui dashboard: `mod.rs` (event loop), `input.rs` (drill/yank/clamp), `data.rs` → `rows.rs` / `cache.rs` / `load.rs`, `state/` (`types`, `apply`, `refresh`, `persist`), `view/` (`core`, `layout`, `chrome`, `tables`), `widgets/filter.rs`, `keys.rs`, `format.rs`, `theme.rs`
-- `src/doctor/` — `mod.rs` types + `run()`, `checks.rs`, `render.rs`
-- `src/test_support.rs` — shared SQL/in-memory parity fixtures (`test-fixtures` feature)
-- `benches/parse.rs` — criterion microbenchmarks for the parser hot path
+```
+src/
+├── cli/        clap parser, routing, command handlers, pipeline
+├── sources/    Claude + Codex JSONL parsers
+├── ingest/     ingest plan, byte-range reads, parallel runner
+├── store/      SQLite schema, writes, queries
+├── tui/        ratatui dashboard
+└── reports/    in-memory aggregations for --no-cache
+```
 
-## Commands
+Full module-by-module map is in [docs/architecture.md](docs/architecture.md).
+
+## Quickstart
 
 ```sh
 cargo build           # debug build
@@ -36,13 +33,29 @@ cargo fmt             # format
 cargo bench           # parser benches
 ```
 
-## Change discipline
+## Critical Conventions
 
-- Prefer the **smallest** diff that satisfies requirements; match existing patterns in `src/`.
-- Do not add network calls or shipping of secrets; the cache path is local only.
-- Parse in parallel, write serially — rusqlite connections are not `Sync`. The split is in `src/ingest/run.rs`.
-- mmap is only safe because the ingest plan's safety window routes recently-modified files to full-parse. If you change that invariant, audit `src/ingest/file_range.rs::map_file`.
+Non-obvious rules; verify against the code before relying on them.
 
-## Global policy
+- **Parse in parallel, write serially.** rusqlite connections are not `Sync`;
+  the split is in [src/ingest/run.rs](src/ingest/run.rs).
+- **mmap safety window.** mmap (for files ≥ 1 MB) is only safe because the
+  ingest plan routes recently-modified files to full-parse. Changing that
+  invariant means auditing [src/ingest/file_range.rs](src/ingest/file_range.rs)
+  (`map_file`).
+- **Smallest diff that satisfies the requirement.** Match existing patterns in `src/`.
+- **No network.** The cache path is local only; never commit secrets, `.env`, or AI-attribution lines.
 
-Where this file is silent, follow the repository maintainer's global **AGENTS.md** / Cursor rules for commits (no push without ask), security, and workflow.
+## Read The Docs First
+
+Before editing a subsystem, read the matching doc:
+
+- **Architecture / module map** → [docs/architecture.md](docs/architecture.md)
+- **Ingest / mmap invariant** → [docs/architecture.md#ingest](docs/architecture.md#ingest)
+- **TUI dashboard** → [docs/architecture.md#tui](docs/architecture.md#tui)
+
+If a doc disagrees with code, fix the doc in the same change.
+
+## Index
+
+Start in [docs/architecture.md](docs/architecture.md).
