@@ -1,6 +1,6 @@
 # tokctl
 
-A terminal dashboard for what you actually spent on **Claude**, **Codex**, and **Cursor** — built on the JSONL/CSV logs already on your disk. SQLite-cached, keyboard-driven, local-only.
+A terminal dashboard for what you actually spent on **Claude**, **Codex**, and **Cursor**, built on the JSONL/CSV logs already on your disk. SQLite-cached, keyboard-driven, local-only.
 
 ```sh
 tokctl ui
@@ -24,7 +24,7 @@ cargo install --path .
 cargo build --release && ln -sf "$(pwd)/target/release/tokctl" ~/.local/bin/tokctl
 ```
 
-Rust 1.75+, edition 2021. SQLite is bundled — no system `libsqlite` needed.
+Rust 1.75+, edition 2021. SQLite is bundled, so no system `libsqlite` is needed.
 
 First run ingests your local Claude/Codex JSONL and any Cursor CSV cache into `$XDG_DATA_HOME/tokctl/cache.db`. Subsequent runs are incremental. `tokctl ui --demo` is the exception: it seeds a separate synthetic cache and opens the UI against that cache only.
 
@@ -135,7 +135,7 @@ tokctl daily --no-cache                   # in-memory only, skip SQLite
 tokctl export-db                          # print cache path (does not create DB)
 ```
 
-`tokctl doctor` is the one to run if anything looks off — it checks roots, discovered inputs, cache health, pricing coverage, and Cursor sync readiness without mutating local data.
+Run `tokctl doctor` if anything looks off. It checks roots, discovered inputs, cache health, pricing coverage, and Cursor sync readiness without mutating local data.
 
 ---
 
