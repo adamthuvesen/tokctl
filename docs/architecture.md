@@ -29,8 +29,9 @@ reports; `--no-cache` uses the in-memory path without touching the DB.
 ### Ingest
 
 - `src/ingest/` — ingest plan, byte-range reads (mmap for ≥ 1 MB), parallel runner.
-  Parse in parallel, write serially — rusqlite connections are not `Sync`; the
-  split is in `src/ingest/run.rs`. mmap is only safe because the ingest plan's
+  Parse in parallel, write serially, because rusqlite connections are not
+  `Sync`. The split is in `src/ingest/run.rs`. mmap is only safe because the
+  ingest plan's
   safety window routes recently-modified files to full-parse; that invariant
   lives in `src/ingest/file_range.rs::map_file`.
 
