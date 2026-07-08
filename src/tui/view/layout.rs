@@ -48,7 +48,7 @@ pub(crate) fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16
         Section::Repos | Section::Provider => {
             let n = active_provider_count(state, cache) as usize;
             let mut cells: Vec<u16> = vec![TREND_BUCKET_WIDTH];
-            cells.extend(std::iter::repeat(PROVIDER_COL_WIDTH).take(n));
+            cells.extend(std::iter::repeat_n(PROVIDER_COL_WIDTH, n));
             cells.extend([8u16, 10, bar_w]);
             let rows = cache.trend.len() as u16;
             // header + rows + separator + TOTAL
