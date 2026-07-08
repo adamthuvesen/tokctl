@@ -1,5 +1,7 @@
 # tokctl
 
+![License](https://img.shields.io/github/license/adamthuvesen/tokctl) ![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)
+
 A terminal dashboard for what you actually spent on **Claude**, **Codex**, and **Cursor**, built on the JSONL/CSV logs already on your disk. SQLite-cached, keyboard-driven, local-only.
 
 ```sh
