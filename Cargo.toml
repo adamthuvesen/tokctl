@@ -5,7 +5,7 @@ edition = "2021"
 description = "Local-only CLI that reports token usage and cost across Claude, Codex, and Cursor."
 license = "MIT"
 repository = "https://github.com/adamthuvesen/tokctl"
-rust-version = "1.75"
+rust-version = "1.95"
 
 [[bin]]
 name = "tokctl"
