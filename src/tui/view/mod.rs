@@ -19,5 +19,4 @@ pub(crate) use layout::BAR_WIDTH;
 pub(crate) use tables::{provider_cost_text, render_bar};
 
 #[cfg(test)]
-#[path = "../view_tests.rs"]
 mod tests;

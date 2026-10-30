@@ -174,20 +174,7 @@ Tables: `events` (token rows; `repo` = canonical key), `files`, `repos` (`displa
 
 ## Development
 
-Install [just](https://just.systems) and use the repository recipes:
-
-```sh
-just                    # list commands
-just test sources::     # focused tests
-just verify-cli         # CLI and query contracts
-just verify-ui          # TUI tests and a real PTY run
-just check              # fast lane, same as pre-commit and the first CI step
-just verify             # slow lane: no-default-features tests, release build
-just bench /path/to/cache.db
-```
-
-CI runs on Linux and macOS, including the declared minimum Rust version.
-`just check` runs formatting, strict clippy for both feature sets, and the test suite. `just verify` adds tests without clipboard support and a release build.
+Install [just](https://just.systems) and [pre-commit](https://pre-commit.com). [AGENTS.md](AGENTS.md#verify) lists the commands, including the fast lane `just check`.
 `--no-cache` avoids the persistent report database. Configured Cursor sync can still update its local CSV export cache.
 
 The refresh benchmark requires an explicit nonempty cache with current provenance. Query errors fail the benchmark.

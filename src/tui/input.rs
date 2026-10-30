@@ -256,5 +256,4 @@ fn short_session_label(session_id: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "input_tests.rs"]
 mod tests;

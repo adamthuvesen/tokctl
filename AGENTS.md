@@ -21,9 +21,12 @@ just test sources::     # focused test name filter
 just verify-cli         # CLI and report contracts
 just verify-ui          # TUI behavior and actual PTY interaction
 just check              # fast lane: format, lint, tests (local, pre-commit, CI)
-just verify             # slow lane: no-default-features tests, release build
+just fix                # auto-fix: cargo fmt in place
+just slow               # slow lane: no-default-features tests, release build
+pre-commit install      # once per clone: runs just check before each commit
 ```
 
+Prove changes with `just verify` (`verify-tokctl` skill at `.agents/skills/verify-tokctl/`).
 Use `tokctl ui --demo --cache-dir PATH` for public-safe application checks.
 
 ## Contracts that need judgment
@@ -37,16 +40,19 @@ Report local verification separately from live Cursor, clipboard, host-terminal,
 
 ## Enforced Rules
 
+Cite each enforcer as `path::name`; `enforced_rules_table_cites_real_enforcers` checks that the file defines it.
+
 | Rule | Enforced by | Added |
 | --- | --- | --- |
-| SQL has one connection owner | `src/store/mod.rs` compile-fail doctests, `clippy.toml` disallowed-types, `connection_lint_allows_stay_in_store` | 2026-11-04 |
-| A file has one provider claim | `conflicting_provider_claims_fail_before_any_ingest_mutation` | 2026-11-04 |
-| Missing or failed roots never authorize deletion | `absent_unselected_and_failed_roots_preserve_snapshots`, `complete_other_provider_root_cannot_purge_unavailable_source` | 2026-11-04 |
-| A failed replacement keeps the last valid snapshot | `malformed_only_replacement_preserves_nonempty_valid_snapshot` | 2026-11-04 |
-| Report values and warnings describe one snapshot | `read_batches_pin_one_snapshot_and_readonly_queries_reject_changed_provenance`, `diagnostic_failure_prevents_partial_report_stdout` | 2026-11-04 |
-| Displayed and activated rows agree | `filtered_highlight_copy_details_totals_and_drill_use_the_same_repo` | 2026-11-04 |
-| Demo overwrite needs a synthetic cache | `overwrite_refuses_normal_cache_without_changing_rows`, `normal_ingestion_and_rebuild_remove_demo_overwrite_authority` | 2026-11-04 |
-| Doctor is read-only and offline | `doctor_json_does_not_create_cache_or_config`, `doctor_stays_offline` | 2026-11-06 |
-| Fixtures hold no real home paths, user names, session IDs, or emails | `fixtures_contain_no_real_identities` | 2026-11-06 |
-| Local, pre-commit, and CI run one fast lane | `fast_lane_runs_in_pre_commit_and_ci` | 2026-11-04 |
-| This table cites real enforcers | `enforced_rules_table_cites_real_enforcers` | 2026-11-06 |
+| SQL has one connection owner | `clippy.toml::disallowed-types`, `tests/repo_rules.rs::connection_lint_allows_stay_in_store` | 2026-11-04 |
+| A file has one provider claim | `tests/ingest_safety.rs::conflicting_provider_claims_fail_before_any_ingest_mutation` | 2026-11-04 |
+| Missing or failed roots never authorize deletion | `tests/ingest_safety.rs::absent_unselected_and_failed_roots_preserve_snapshots`, `tests/ingest_safety.rs::complete_other_provider_root_cannot_purge_unavailable_source` | 2026-11-04 |
+| A failed replacement keeps the last valid snapshot | `tests/ingest_safety.rs::malformed_only_replacement_preserves_nonempty_valid_snapshot` | 2026-11-04 |
+| Report values and warnings describe one snapshot | `tests/ingest_safety.rs::read_batches_pin_one_snapshot_and_readonly_queries_reject_changed_provenance`, `tests/cli_behavior.rs::diagnostic_failure_prevents_partial_report_stdout` | 2026-11-04 |
+| Displayed and activated rows agree | `src/tui/input/tests.rs::filtered_highlight_copy_details_totals_and_drill_use_the_same_repo` | 2026-11-04 |
+| Demo overwrite needs a synthetic cache | `src/demo.rs::overwrite_refuses_normal_cache_without_changing_rows`, `tests/ingest_safety.rs::normal_ingestion_and_rebuild_remove_demo_overwrite_authority` | 2026-11-04 |
+| Doctor is read-only and offline | `tests/cli_behavior.rs::doctor_json_does_not_create_cache_or_config`, `tests/repo_rules.rs::doctor_stays_offline` | 2026-11-06 |
+| Fixtures hold no real home paths, user names, session IDs, or emails | `tests/repo_rules.rs::fixtures_contain_no_real_identities` | 2026-11-06 |
+| Local, pre-commit, and CI run one fast lane | `tests/repo_rules.rs::fast_lane_runs_in_pre_commit_and_ci` | 2026-11-04 |
+| `verify control` must observe FAIL before a verify pass counts | `.agents/skills/verify-tokctl/verify::control` | 2026-11-06 |
+| This table cites real enforcers | `tests/repo_rules.rs::enforced_rules_table_cites_real_enforcers` | 2026-11-06 |

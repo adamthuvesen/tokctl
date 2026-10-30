@@ -5,7 +5,15 @@ default:
 check: fmt lint test
 
 # Slow lane: CI runs it after `check`.
-verify: test-minimal build
+slow: test-minimal build
+
+# Drive the real binary: no args = drives for changed files; also `all`, `list`, `control`, or drive names.
+verify *args:
+    .agents/skills/verify-tokctl/verify {{args}}
+
+# Auto-fixers: format in place.
+fix:
+    cargo fmt --all
 
 fmt:
     cargo fmt --all -- --check

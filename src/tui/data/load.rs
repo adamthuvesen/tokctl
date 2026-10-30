@@ -358,5 +358,4 @@ pub fn load_trend(
 }
 
 #[cfg(test)]
-#[path = "load_tests.rs"]
 mod tests;

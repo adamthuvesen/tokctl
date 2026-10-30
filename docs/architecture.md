@@ -91,7 +91,7 @@ Configured source roots also constrain Provider views, sparklines, and every dri
 A displayed row and an activated row therefore have one authoritative identity.
 Copied session keys use `source:id` to avoid provider collisions.
 
-`cache.rs` publishes a complete successful snapshot. Failed refreshes retain the previous data and report its scope and error.
+`data/cache.rs` publishes a complete successful snapshot. Failed refreshes retain the previous data and report its scope and error.
 The cache observes store generation and calendar day. Typed view queries determine when navigation requires new data.
 The event loop polls terminal events directly. Terminal setup and teardown have one owner, including partial setup failure.
 
@@ -114,10 +114,10 @@ Doctor inspects local state without network requests or repair writes.
 | Provider record or token meaning | `sources/`, `types.rs` | `just test sources::`, `cargo test --locked --test ingest_safety` |
 | Store, migration, or query | `store/`, `ingest/` | `just test store::`, `cargo test --locked --test ingest_safety`, `just verify-cli` |
 | Time or pricing | `calendar.rs`, `dates.rs`, `pricing.rs` | `just test calendar::`, `just test pricing::`, `just verify-cli` |
-| TUI behavior | `state/`, `projection.rs`, `cache.rs`, `input.rs` | `just verify-ui` |
+| TUI behavior | `state/`, `projection.rs`, `data/cache.rs`, `input.rs` | `just verify-ui` |
 | Cursor or demo | `cursor_sync.rs`, `demo.rs` | `just test cursor_sync::`, `just test demo::` |
 
-Run `just check` for the fast lane and `just verify` for the slow lane. CI runs both on Linux and macOS, including the declared MSRV.
+Run `just check` for the fast lane, `just slow` for the slow lane, and `just verify` to drive the real binary. CI runs both on Linux and macOS, including the declared MSRV.
 The PTY test launches the actual binary with synthetic data. It checks navigation, resize, exit, and terminal restoration.
 Parser benchmarks measure parsing only. `just bench CACHE_DB` measures query refresh against an explicit nonempty cache.
 The refresh benchmark fails on stale provenance, empty data, or query errors.

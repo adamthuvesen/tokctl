@@ -138,28 +138,52 @@ fn connection_lint_allows_stay_in_store() {
 #[test]
 fn enforced_rules_table_cites_real_enforcers() {
     let agents = fs::read_to_string(Path::new(ROOT).join("AGENTS.md")).unwrap();
-    let sources: String = files_under(&["src", "tests"])
-        .into_iter()
-        .map(|(_, text)| text)
-        .collect();
     let section = agents
-        .split("## Enforced Rules")
+        .split("\n## Enforced Rules\n")
         .nth(1)
         .expect("AGENTS.md needs an `## Enforced Rules` table");
+    let section = section.split("\n## ").next().unwrap();
     let cited = Regex::new(r"`([^`]+)`").unwrap();
-    let mut missing = Vec::new();
-    for row in section.lines().filter(|l| l.starts_with('|')).skip(2) {
+    let rows: Vec<_> = section
+        .lines()
+        .filter(|l| l.starts_with('|'))
+        .skip(2)
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "AGENTS.md Enforced Rules table has no rows"
+    );
+    let mut problems = Vec::new();
+    for row in rows {
         let enforced_by = row.split('|').nth(2).unwrap_or_default();
-        for name in cited.captures_iter(enforced_by).map(|c| c[1].to_string()) {
-            let exists =
-                Path::new(ROOT).join(&name).exists() || sources.contains(&format!("fn {name}("));
-            if !exists {
-                missing.push(name);
+        let names: Vec<_> = cited
+            .captures_iter(enforced_by)
+            .map(|c| c[1].to_string())
+            .collect();
+        if names.is_empty() {
+            problems.push(format!("row cites nothing: {row}"));
+        }
+        for citation in names {
+            let defined = citation.split_once("::").is_some_and(|(file, name)| {
+                fs::read_to_string(Path::new(ROOT).join(file)).is_ok_and(|text| {
+                    text.contains(&format!("fn {name}("))
+                        || text.contains(&format!("def {name}("))
+                        || text.lines().any(|line| {
+                            let rest = line.trim_start().strip_prefix(name).unwrap_or("#");
+                            rest.trim_start().starts_with(['=', ':'])
+                        })
+                })
+            });
+            if !defined {
+                problems.push(format!(
+                    "`{citation}` is not `path::name` defined in that file"
+                ));
             }
         }
     }
     assert!(
-        missing.is_empty(),
-        "AGENTS.md Enforced Rules cites missing paths or test names; fix the row: {missing:?}"
+        problems.is_empty(),
+        "fix the AGENTS.md Enforced Rules rows:\n{}",
+        problems.join("\n")
     );
 }
