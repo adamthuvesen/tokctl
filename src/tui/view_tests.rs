@@ -20,7 +20,7 @@ fn cache() -> DataCache {
             cost: 4.2,
             is_no_repo: false,
             latest_ts: None,
-            source: None,
+            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
         }],
         sessions: vec![SessionRow {
             session_id: "session-abcdef".into(),
@@ -36,6 +36,7 @@ fn cache() -> DataCache {
             freshness: "fresh 1m".into(),
             last_query: Utc::now(),
             mtime_ns: None,
+            generation: 0,
         },
         ..Default::default()
     }
@@ -87,8 +88,10 @@ fn detail_lines_for_drilled_view_show_session_id() {
         key: "tokctl".into(),
         label: "tokctl".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
-    let lines = detail_lines(&state, &cache());
+    let lines = detail_lines(&state, &cache().visible(&state));
     assert!(lines
         .iter()
         .any(|line: &String| line.contains("session-abcdef")));
@@ -107,6 +110,8 @@ fn detail_lines_for_event_drill_show_model_and_when() {
         key: "abc".into(),
         label: "abc".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
     let mut c = cache();
     c.events = vec![EventRow {
@@ -118,7 +123,7 @@ fn detail_lines_for_event_drill_show_model_and_when() {
         cache_write: 0,
         cost: 0.42,
     }];
-    let lines = detail_lines(&state, &c);
+    let lines = detail_lines(&state, &c.visible(&state));
     assert!(lines.iter().any(|l| l.contains("claude-sonnet-4-6")));
     assert!(lines.iter().any(|l| l.starts_with("session: abc")));
 }
@@ -131,7 +136,7 @@ fn footer_messages_include_refresh_error() {
         "no such table: events",
     ));
 
-    let messages = footer_messages(&AppState::default(), &c);
+    let messages = footer_messages(&AppState::default(), &c.visible(&AppState::default()));
 
     assert!(messages.iter().any(|m| {
         m.is_error
@@ -217,6 +222,8 @@ fn breadcrumb_stacks_labels() {
         key: "tokctl".into(),
         label: "tokctl".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
     state.push_drill(crate::tui::state::Drill {
         kind: DrillKind::Events {
@@ -225,6 +232,8 @@ fn breadcrumb_stacks_labels() {
         key: "72a0a659".into(),
         label: "72a0a659".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
     let title = breadcrumb_title(&state);
     assert_eq!(title, "REPOS › tokctl › 72a0a659");
@@ -291,7 +300,7 @@ fn header_cache() -> DataCache {
                 cost: 4.2,
                 is_no_repo: false,
                 latest_ts: None,
-                source: None,
+                selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
             },
             LeftRow {
                 label: "other-repo".into(),
@@ -301,7 +310,7 @@ fn header_cache() -> DataCache {
                 cost: 1.5,
                 is_no_repo: false,
                 latest_ts: None,
-                source: None,
+                selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
             },
         ],
         sessions: vec![
@@ -327,11 +336,11 @@ fn header_cache() -> DataCache {
 }
 
 #[test]
-fn header_scope_default_sums_trend() {
+fn header_scope_default_sums_visible_rows() {
     let state = AppState::default();
-    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
-    assert_eq!(cost, 16.0);
-    assert_eq!(tokens, 1_600);
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache().visible(&state));
+    assert_eq!(cost, 5.7);
+    assert_eq!(tokens, 1_734);
     assert_eq!(suffix, "");
 }
 
@@ -345,8 +354,10 @@ fn header_scope_sessions_drill_sums_sessions_with_label() {
         key: "/dev/tokctl".into(),
         label: "tokctl".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
-    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache().visible(&state));
     assert_eq!(cost, 2.5);
     assert_eq!(tokens, 1_000);
     assert_eq!(suffix, " · tokctl");
@@ -365,6 +376,8 @@ fn header_scope_events_drill_sums_event_token_columns() {
         key: "alpha".into(),
         label: "alpha".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
     let mut c = header_cache();
     c.events = vec![
@@ -387,7 +400,7 @@ fn header_scope_events_drill_sums_event_token_columns() {
             cost: 0.08,
         },
     ];
-    let (cost, tokens, suffix) = header_scope(&state, &c);
+    let (cost, tokens, suffix) = header_scope(&state, &c.visible(&state));
     assert!((cost - 0.50).abs() < 1e-9);
     assert_eq!(tokens, 100 + 50 + 200 + 10 + 1 + 2 + 3 + 4);
     assert_eq!(suffix, " · alpha");
@@ -401,7 +414,7 @@ fn header_scope_fuzzy_filter_on_left_pane_shrinks_total() {
         ..AppState::default()
     };
     state.filter.query = "tokctl".into();
-    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache().visible(&state));
     assert_eq!(cost, 4.2);
     assert_eq!(tokens, 1_234);
     assert_eq!(suffix, " · filter:tokctl");
@@ -420,11 +433,67 @@ fn header_scope_fuzzy_filter_inside_drill_appends_both_suffixes() {
         key: "/dev/tokctl".into(),
         label: "tokctl".into(),
         cursor: 0,
+        scope: Default::default(),
+        parent_filter: Default::default(),
     });
     state.filter.query = "tokctl".into();
-    let (cost, tokens, suffix) = header_scope(&state, &header_cache());
+    let (cost, tokens, suffix) = header_scope(&state, &header_cache().visible(&state));
     // Only the "tokctl"-project session matches.
     assert_eq!(cost, 2.0);
     assert_eq!(tokens, 800);
     assert_eq!(suffix, " · tokctl · filter:tokctl");
+}
+
+#[test]
+fn presentation_totals_support_more_than_u64_tokens() {
+    let tokens = i64::MAX as u64;
+    let mut cache = cache();
+    cache.sessions = (0..3)
+        .map(|index| SessionRow {
+            session_id: format!("session-{index}"),
+            source: crate::types::Source::Claude,
+            latest_ts: Utc::now(),
+            project: None,
+            cost: 1.0,
+            total_tokens: tokens,
+        })
+        .collect();
+    let mut state = AppState {
+        current_section: Section::Sessions,
+        ..AppState::default()
+    };
+    let expected = u128::from(tokens) * 3;
+    assert_eq!(header_scope(&state, &cache.visible(&state)).1, expected);
+    cache.trend = (0..3)
+        .map(|index| TrendRow {
+            bucket: format!("2026-0{}", index + 1),
+            claude_cost: 1.0,
+            codex_cost: 0.0,
+            cursor_cost: 0.0,
+            total_tokens: u128::from(tokens),
+            total_cost: 1.0,
+            is_current: false,
+        })
+        .collect();
+    state.current_section = Section::Provider;
+    assert_eq!(header_scope(&state, &cache.visible(&state)).1, expected);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::view::draw(frame, &state, &cache))
+        .unwrap();
+}
+
+#[test]
+fn resizing_preserves_the_selected_row_identity() {
+    let state = AppState::default();
+    let cache = cache();
+    let expected = crate::tui::input::yank_key(&state, &cache);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+    for (width, height) in [(140, 24), (60, 5), (80, 12), (180, 30)] {
+        terminal.backend_mut().resize(width, height);
+        terminal
+            .draw(|frame| crate::tui::view::draw(frame, &state, &cache))
+            .unwrap();
+        assert_eq!(crate::tui::input::yank_key(&state, &cache), expected);
+    }
 }

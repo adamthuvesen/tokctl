@@ -1,8 +1,40 @@
 use std::fs;
 use std::process::Command;
 
-fn tokctl() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tokctl"))
+struct IsolatedCommand {
+    command: Command,
+    _home: tempfile::TempDir,
+}
+impl std::ops::Deref for IsolatedCommand {
+    type Target = Command;
+    fn deref(&self) -> &Command {
+        &self.command
+    }
+}
+impl std::ops::DerefMut for IsolatedCommand {
+    fn deref_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+}
+
+fn tokctl() -> IsolatedCommand {
+    let home = tempfile::tempdir().expect("isolated CLI environment");
+    let path = home.path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tokctl"));
+    command
+        .env("HOME", path)
+        .env("XDG_CONFIG_HOME", path.join("config"))
+        .env("XDG_DATA_HOME", path.join("data"))
+        .env("TOKCTL_CACHE_DIR", path.join("cache"))
+        .env("TOKCTL_CLAUDE_DIR", path.join("claude"))
+        .env("TOKCTL_CODEX_DIR", path.join("codex"))
+        .env("TOKCTL_CURSOR_DIR", path.join("cursor"))
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME");
+    IsolatedCommand {
+        command,
+        _home: home,
+    }
 }
 
 fn isolated_cache_dir() -> tempfile::TempDir {
@@ -201,4 +233,90 @@ fn no_cache_repo_filter_rejects_ambiguous_display_names() {
     assert!(stderr.contains("repo name 'alpha' is ambiguous"));
     assert!(stderr.contains(left_repo.to_str().expect("utf8 left repo")));
     assert!(stderr.contains(right_repo.to_str().expect("utf8 right repo")));
+}
+
+#[test]
+fn concurrent_processes_replace_changed_snapshots_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let claude = workspace.path().join("claude/project");
+    fs::create_dir_all(&claude).unwrap();
+    let path = claude.join("session.jsonl");
+    let event = |id: &str| {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-04-22T12:00:00Z","sessionId":"same","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"input_tokens":1}}}}}}"#
+        )
+    };
+    fs::write(&path, format!("{}\n", event("a"))).unwrap();
+    let make_command = || {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "claude"])
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+    let mut left = make_command();
+    let mut right = make_command();
+    let left = left.spawn().unwrap();
+    let right = right.spawn().unwrap();
+    assert!(left.wait_with_output().unwrap().status.success());
+    assert!(right.wait_with_output().unwrap().status.success());
+    fs::write(&path, format!("{}\n{}\n", event("a"), event("b"))).unwrap();
+    let mut left = make_command();
+    let mut right = make_command();
+    let left = left.spawn().unwrap();
+    let right = right.spawn().unwrap();
+    assert!(left.wait_with_output().unwrap().status.success());
+    assert!(right.wait_with_output().unwrap().status.success());
+    let conn = rusqlite::Connection::open(workspace.path().join("cache/cache.db")).unwrap();
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    let files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((events, files), (2, 1));
+}
+
+#[test]
+fn invalid_date_order_fails_before_config_or_sync_access() {
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("tokctl")).unwrap();
+    fs::write(
+        home.path().join("tokctl/cursor-credentials.json"),
+        "invalid credentials",
+    )
+    .unwrap();
+    let output = tokctl()
+        .args(["daily", "--since", "2026-04-23", "--until", "2026-04-22"])
+        .env("XDG_CONFIG_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--until must be on or after --since"));
+}
+
+#[test]
+fn noninteractive_ui_fails_before_creating_demo_or_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    for demo in [false, true] {
+        let cache = directory.path().join(if demo { "demo" } else { "normal" });
+        let mut command = tokctl();
+        command.arg("ui").env("TOKCTL_CACHE_DIR", &cache);
+        if demo {
+            command.args(["--demo", "--cache-dir"]).arg(&cache);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal")
+        );
+        assert!(!cache.exists());
+    }
 }

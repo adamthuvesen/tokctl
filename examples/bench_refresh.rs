@@ -1,179 +1,76 @@
-//! End-to-end timing for `DataCache::refresh_for` against a real cache.
-//!
-//! Runs the same cache+state interactions the TUI does on common
-//! navigation paths and prints how long each took. Intended as a manual
-//! sanity check after perf changes — not a CI gate.
-//!
-//! Run with `cargo run --release --example bench_refresh` against the
-//! default cache path (or set `TOKCTL_DB` to override).
+//! Repeated TUI query timings against an explicitly selected, read-only cache.
 
-use std::time::Instant;
-
-use tokctl::{
-    store::open_store,
-    tui::{
-        data::DataCache,
-        state::{AppState, RefreshMask, Section, SourceFilter, TimeWindow, TrendGranularity},
-    },
+use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokctl::store::Store;
+use tokctl::tui::{
+    data::DataCache,
+    state::{AppState, TimeWindow},
 };
 
-fn ms(d: std::time::Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
+const REPETITIONS: usize = 5;
+
+fn verify(cache: &DataCache, expected_events: Option<u64>) -> Result<u64> {
+    if let Some(error) = &cache.refresh_error {
+        bail!("benchmark query failed: {}", error.display_message());
+    }
+    let events = cache.status.event_count;
+    if events == 0 || cache.left.is_empty() {
+        bail!("benchmark requires a nonempty cache and visible all-time rows");
+    }
+    if expected_events.is_some_and(|expected| expected != events) {
+        bail!("cache changed during measurement, rerun against a stable snapshot");
+    }
+    Ok(events)
 }
 
-fn time<F: FnOnce()>(label: &str, f: F) {
-    let t = Instant::now();
-    f();
-    println!("  {:<48} {:>7.2} ms", label, ms(t.elapsed()));
+fn report(label: &str, mut samples: Vec<Duration>) {
+    samples.sort_unstable();
+    println!(
+        "{label}: median={:.3} ms range={:.3}..{:.3} ms runs={}",
+        samples[samples.len() / 2].as_secs_f64() * 1000.0,
+        samples[0].as_secs_f64() * 1000.0,
+        samples[samples.len() - 1].as_secs_f64() * 1000.0,
+        samples.len(),
+    );
 }
 
-fn main() -> anyhow::Result<()> {
-    let path = std::env::var_os("TOKCTL_DB")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(tokctl::store::store_path);
-    println!("cache: {}", path.display());
-    let conn = open_store(&path)?;
-
-    let mut state = AppState {
+fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    let path = PathBuf::from(
+        args.next()
+            .context("usage: cargo run --release --example bench_refresh -- /path/to/cache.db")?,
+    );
+    if args.next().is_some() {
+        bail!("expected one cache.db path");
+    }
+    let store = Store::open_read_only(&path)?;
+    let state = AppState {
         time_window: TimeWindow::All,
-        ..AppState::default()
+        ..Default::default()
     };
-    let mut cache = DataCache::default();
-
-    println!("\n--- cold load (everything) ---");
-    time("refresh_all (Days, all-time)", || {
-        cache.refresh_all(&conn, &state);
-    });
-
-    println!("\n--- section switches with memoization ---");
-    state.current_section = Section::Models;
-    time("Days -> Models  (cold left)", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    state.current_section = Section::Provider;
-    time("Models -> Provider (cold left)", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    state.current_section = Section::Days;
-    time("Provider -> Days (memo hit)", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    state.current_section = Section::Models;
-    time("Days -> Models  (memo hit)", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    println!("\n--- window / source / granularity ---");
-    state.time_window = TimeWindow::Today;
-    time("SetWindow(Today)  -> left+trend+sparkline", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                trend: true,
-                sparkline: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    state.time_window = TimeWindow::All;
-    time("SetWindow(All)  (memo hit on memos pop'd)", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                trend: true,
-                sparkline: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    state.source_filter = SourceFilter::Claude;
-    time("SetSource(Claude) -> cold per-key memo", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                trend: true,
-                sparkline: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    state.source_filter = SourceFilter::All;
-    state.trend_granularity = TrendGranularity::Daily;
-    time("SetGranularity(Daily) -> left+trend cold", || {
-        cache.refresh_for(
-            &conn,
-            &state,
-            RefreshMask {
-                left: true,
-                trend: true,
-                ..Default::default()
-            },
-        );
-    });
-
-    println!("\n--- toggle expand (no refresh) ---");
-    time("ToggleExpand: empty mask", || {
-        cache.refresh_for(&conn, &state, RefreshMask::default());
-    });
-
-    println!("\n--- manual refresh (clears memos, full reload) ---");
-    cache.clear_memos();
-    time("Refresh: cold, all slices", || {
-        cache.refresh_all(&conn, &state);
-    });
-
+    let mut cold = Vec::with_capacity(REPETITIONS);
+    let mut warm = Vec::with_capacity(REPETITIONS);
+    let mut expected = None;
+    for _ in 0..REPETITIONS {
+        let mut cache = DataCache::default();
+        let start = Instant::now();
+        cache.refresh_all(&store, &state);
+        cold.push(start.elapsed());
+        expected = Some(verify(&cache, expected)?);
+        let start = Instant::now();
+        cache.refresh_all(&store, &state);
+        warm.push(start.elapsed());
+        verify(&cache, expected)?;
+    }
     println!(
-        "\nrows resident:  left={} trend={} sparkline={} sessions={} events={}",
-        cache.left.len(),
-        cache.trend.len(),
-        cache.sparkline.len(),
-        cache.sessions.len(),
-        cache.events.len()
+        "cache={} events={} errors=0",
+        path.display(),
+        expected.unwrap()
     );
-    println!(
-        "status: {} events, mtime_ns={:?}",
-        cache.status.event_count, cache.status.mtime_ns
-    );
-
+    report("fresh TUI query cache", cold);
+    report("populated TUI query cache", warm);
+    println!("Excludes source ingestion and terminal drawing. Filesystem and SQLite page caches may be warm.");
     Ok(())
 }

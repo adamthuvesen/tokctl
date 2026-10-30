@@ -13,12 +13,6 @@ pub enum ClaudeParseResult {
     Malformed,
 }
 
-/// Fast substring pre-filter. Lines missing either marker cannot carry usage.
-#[inline]
-pub fn claude_line_has_signal(line: &str) -> bool {
-    line.contains(r#""type":"assistant""#) && line.contains(r#""usage""#)
-}
-
 // Typed views onto a Claude JSONL line. `#[serde(default)]` on every optional
 // field means missing keys decode to `None`/default; unknown keys in the JSON
 // are ignored by serde. This keeps the same forward-compat behaviour as the
@@ -59,9 +53,6 @@ struct ClaudeUsage {
 
 /// Parse a Claude JSONL line, returning the UsageEvent and optional message ID.
 pub fn parse_claude_line_classified(line: &str, project_path: Option<&str>) -> ClaudeParseResult {
-    if !claude_line_has_signal(line) {
-        return ClaudeParseResult::Skipped;
-    }
     let Ok(parsed) = serde_json::from_str::<ClaudeLine>(line) else {
         return ClaudeParseResult::Malformed;
     };
@@ -74,10 +65,17 @@ pub fn parse_claude_line_classified(line: &str, project_path: Option<&str>) -> C
     let Some(usage) = message.usage else {
         return ClaudeParseResult::Skipped;
     };
-    let total = usage.input_tokens
-        + usage.output_tokens
-        + usage.cache_read_input_tokens
-        + usage.cache_creation_input_tokens;
+    let Some(total) = usage
+        .input_tokens
+        .checked_add(usage.output_tokens)
+        .and_then(|n| n.checked_add(usage.cache_read_input_tokens))
+        .and_then(|n| n.checked_add(usage.cache_creation_input_tokens))
+    else {
+        return ClaudeParseResult::Malformed;
+    };
+    if total > i64::MAX as u64 {
+        return ClaudeParseResult::Malformed;
+    }
     if total == 0 {
         return ClaudeParseResult::Skipped;
     }
@@ -125,12 +123,6 @@ mod tests {
     const ASSISTANT_LINE: &str = r#"{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"sess-a","message":{"id":"m1","model":"claude-sonnet-4-6","role":"assistant","usage":{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}"#;
     const USER_LINE: &str = r#"{"type":"user","timestamp":"2026-04-18T09:00:00.000Z","sessionId":"sess-a","message":{"role":"user","content":"hello"}}"#;
     const ZERO_LINE: &str = r#"{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"sess-a","message":{"id":"m9","model":"claude-sonnet-4-6","role":"assistant","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
-
-    #[test]
-    fn signal_filter_rejects_user_lines() {
-        assert!(!claude_line_has_signal(USER_LINE));
-        assert!(claude_line_has_signal(ASSISTANT_LINE));
-    }
 
     #[test]
     fn parses_assistant_line() {

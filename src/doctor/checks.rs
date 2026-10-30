@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
-use super::{CheckSeverity, DoctorCheck};
+use crate::doctor::{CheckSeverity, DoctorCheck};
 
 pub(crate) struct RootSet {
     pub(crate) roots: Vec<PathBuf>,
@@ -168,27 +168,40 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
             )
             .action("run a cached report or tokctl daily --rebuild to refresh the cache"),
         ),
-        Some(v) => checks.push(
-            DoctorCheck::new(
+        Some(v) => {
+            return Err(DoctorCheck::new(
                 "cache",
                 CheckSeverity::Error,
                 format!("cache schema is newer than this tokctl ({v}, current {SCHEMA_VERSION})"),
             )
-            .action("use a newer tokctl binary or rebuild the cache with this version"),
-        ),
-        None => checks.push(
-            DoctorCheck::new(
+            .action("use a newer tokctl binary, preserving this cache"))
+        }
+        None => {
+            return Err(DoctorCheck::new(
                 "cache",
                 CheckSeverity::Error,
                 "cache schema version is missing",
             )
-            .action("run tokctl daily --rebuild"),
-        ),
+            .action(
+                "preserve this cache and set TOKCTL_CACHE_DIR to a new directory before ingesting",
+            ))
+        }
     }
 
-    let file_count = count_table(&conn, "files").unwrap_or(0);
-    let event_count = count_table(&conn, "events").unwrap_or(0);
-    let repo_count = count_table(&conn, "repos").unwrap_or(0);
+    let read_count = |table| {
+        count_table(&conn, table).map_err(|error| {
+            DoctorCheck::new(
+                "cache",
+                CheckSeverity::Error,
+                format!("could not inspect {table} in {}", path.display()),
+            )
+            .details(vec![error.to_string()])
+            .action("preserve this cache and inspect its schema before repair")
+        })
+    };
+    let file_count = read_count("files")?;
+    let event_count = read_count("events")?;
+    let repo_count = read_count("repos")?;
     checks.push(
         DoctorCheck::new(
             "cache",
@@ -250,6 +263,26 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
                 .action("update src/pricing.rs, then run tokctl daily --rebuild"),
             );
         }
+    }
+
+    if schema_version == Some(SCHEMA_VERSION) {
+        let provenance = crate::store::db::provenance_status(&conn).map_err(|error| {
+            DoctorCheck::new(
+                "provenance",
+                CheckSeverity::Error,
+                "could not inspect cache provenance",
+            )
+            .details(vec![error.to_string()])
+        })?;
+        let stale = provenance.legacy_cost_rows > 0
+            || provenance.stale_pricing_rows > 0
+            || provenance.stale_parser_files > 0
+            || provenance.stale_calendar;
+        checks.push(DoctorCheck::new("provenance", if stale { CheckSeverity::Warn } else { CheckSeverity::Ok },
+            if stale { "cached derivations need refresh" } else { "cached derivation provenance is current" })
+            .details(vec![format!("legacy cost rows: {}; stale price rows: {}; stale parser files: {}; stale calendar: {}",
+                provenance.legacy_cost_rows, provenance.stale_pricing_rows, provenance.stale_parser_files, provenance.stale_calendar)])
+            .action("run a cached report with the source files available to refresh stale derivations"));
     }
 
     Ok(CacheInspection {
@@ -351,23 +384,36 @@ pub(crate) fn cursor_sync_check() -> DoctorCheck {
         format!("tokctl credentials: {}", primary.display()),
         format!("legacy credentials: {}", legacy.display()),
     ];
-    if primary.exists() || legacy.exists() {
-        details
-            .push("credentials present; doctor did not validate or sync over the network".into());
-        DoctorCheck::new(
-            "cursor-sync",
-            CheckSeverity::Ok,
-            "Cursor credentials are present locally",
-        )
-        .details(details)
-        .action("run tokctl cursor status or tokctl cursor sync to validate remotely")
-    } else {
-        DoctorCheck::new(
+    match crate::cursor_sync::load_credentials_store() {
+        Ok(Some(store)) if !store.accounts.is_empty() => {
+            details.push(
+                "credentials parsed locally; doctor did not validate or sync over the network"
+                    .into(),
+            );
+            DoctorCheck::new(
+                "cursor-sync",
+                CheckSeverity::Ok,
+                "Cursor credentials are configured locally",
+            )
+            .details(details)
+            .action("run tokctl cursor status or tokctl cursor sync to validate remotely")
+        }
+        Ok(_) => DoctorCheck::new(
             "cursor-sync",
             CheckSeverity::Warn,
             "no Cursor credentials found",
         )
         .details(details)
-        .action("run tokctl cursor login to enable optional Cursor sync")
+        .action("run tokctl cursor login to enable optional Cursor sync"),
+        Err(error) => {
+            details.push(error.to_string());
+            DoctorCheck::new(
+                "cursor-sync",
+                CheckSeverity::Error,
+                "Cursor credential configuration is invalid",
+            )
+            .details(details)
+            .action("repair the local credential file, then run tokctl cursor login")
+        }
     }
 }

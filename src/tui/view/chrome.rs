@@ -9,11 +9,11 @@ use ratatui::{
 };
 
 use super::layout::centered;
-use crate::tui::data::DataCache;
+use crate::tui::data::VisibleRows;
 use crate::tui::format::{fmt_cost, fmt_num};
 use crate::tui::state::{AppState, DrillKind, Section};
 use crate::tui::theme::Palette;
-use crate::tui::widgets::filter::{apply_filter_left, apply_filter_sessions, should_filter};
+use crate::tui::widgets::filter::should_filter;
 
 // -- Header / context -------------------------------------------------------
 
@@ -21,27 +21,36 @@ pub(super) fn draw_header(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
     let clock = Local::now().format("%Y-%m-%d %H:%M").to_string();
-    // Totals reflect the deepest active scope: an events/sessions drill, then
-    // a fuzzy filter, then the bare window+source filter via `cache.trend`.
-    // Drill-scoped caches (`cache.sessions`, `cache.events`) are already
-    // narrowed at load time, so summing them here doesn't double-count.
     let (total_cost, total_tokens, scope_suffix) = header_scope(state, cache);
 
+    let window_label = if cache.refresh_error.is_some() {
+        format!(
+            "snapshot {} · last {}",
+            cache
+                .status
+                .last_query
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M"),
+            state.time_window.as_str()
+        )
+    } else {
+        format!("last {}", state.time_window.as_str())
+    };
     let line1 = Line::from(vec![
         Span::styled("tokctl ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(clock, palette.dim_text()),
         Span::raw("  "),
         Span::styled(
             format!(
-                "last {}{} · {} · {} tok",
-                state.time_window.as_str(),
+                "{}{} · {} · {} tok",
+                window_label,
                 scope_suffix,
                 fmt_cost(total_cost),
-                fmt_num(total_tokens),
+                crate::render::fmt_wide_num(total_tokens),
             ),
             palette.dim_text(),
         ),
@@ -58,59 +67,54 @@ pub(super) fn draw_header(
 /// Pick the totals shown in the header so they match what's actually on screen.
 /// Most-specific scope wins; the returned suffix is appended after the time
 /// window (e.g. " · acme-repo", " · filter:foo", or both).
-pub(crate) fn header_scope(state: &AppState, cache: &DataCache) -> (f64, u64, String) {
-    let filtering = should_filter(state);
-    let filter_suffix = || format!(" · filter:{}", state.filter.query);
-
-    if let Some(drill) = state.deepest_drill() {
-        let drill_suffix = format!(" · {}", drill.label);
-        match drill.kind {
-            DrillKind::Events { .. } => {
-                let (cost, tokens) = cache.events.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
-                    (
-                        c + r.cost,
-                        t + r.input + r.output + r.cache_read + r.cache_write,
-                    )
-                });
-                return (cost, tokens, drill_suffix);
-            }
-            DrillKind::Sessions { .. } => {
-                if filtering {
-                    let (rows, _) = apply_filter_sessions(&cache.sessions, state);
-                    let (cost, tokens) = sum_sessions(&rows);
-                    return (cost, tokens, format!("{}{}", drill_suffix, filter_suffix()));
-                }
-                let (cost, tokens) = sum_sessions(&cache.sessions);
-                return (cost, tokens, drill_suffix);
-            }
+pub(crate) fn header_scope(state: &AppState, cache: &VisibleRows) -> (f64, u128, String) {
+    let suffix = match state.deepest_drill() {
+        Some(drill) => format!(" · {}", drill.label),
+        None => String::new(),
+    };
+    let suffix = if should_filter(state) {
+        format!("{suffix} · filter:{}", state.filter.query)
+    } else {
+        suffix
+    };
+    let (cost, tokens) = match state.deepest_drill().map(|d| d.kind) {
+        Some(DrillKind::Events { .. }) => {
+            cache.events.iter().fold((0.0, 0), |(cost, tokens), row| {
+                (
+                    cost + row.cost,
+                    tokens
+                        + u128::from(row.input)
+                        + u128::from(row.output)
+                        + u128::from(row.cache_read)
+                        + u128::from(row.cache_write),
+                )
+            })
         }
-    }
-
-    if filtering {
-        if state.current_section == Section::Sessions {
-            let (rows, _) = apply_filter_sessions(&cache.sessions, state);
-            let (cost, tokens) = sum_sessions(&rows);
-            return (cost, tokens, filter_suffix());
+        Some(DrillKind::Sessions { .. }) => sum_sessions(&cache.sessions),
+        None if state.current_section == Section::Sessions => sum_sessions(&cache.sessions),
+        None if state.is_provider_view() => {
+            cache.trend.iter().fold((0.0, 0), |(cost, tokens), row| {
+                (cost + row.total_cost, tokens + row.total_tokens)
+            })
         }
-        let (rows, _) = apply_filter_left(&cache.left, state);
-        let (cost, tokens) = rows.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
-            (c + r.cost, t + r.total_tokens)
-        });
-        return (cost, tokens, filter_suffix());
-    }
-
-    let cost = cache.trend.iter().map(|r| r.total_cost).sum::<f64>();
-    let tokens = cache.trend.iter().map(|r| r.total_tokens).sum::<u64>();
-    (cost, tokens, String::new())
+        None => cache.left.iter().fold((0.0, 0), |(cost, tokens), row| {
+            (cost + row.cost, tokens + u128::from(row.total_tokens))
+        }),
+    };
+    (cost, tokens, suffix)
 }
 
-fn sum_sessions(rows: &[crate::tui::data::SessionRow]) -> (f64, u64) {
-    rows.iter().fold((0.0_f64, 0_u64), |(c, t), r| {
-        (c + r.cost, t + r.total_tokens)
+fn sum_sessions(rows: &[crate::tui::data::SessionRow]) -> (f64, u128) {
+    rows.iter().fold((0.0_f64, 0_u128), |(c, t), r| {
+        (c + r.cost, t + u128::from(r.total_tokens))
     })
 }
 
 pub(crate) fn context_text(state: &AppState, width: usize) -> String {
+    let source = match state.deepest_drill().map(|drill| drill.kind) {
+        Some(DrillKind::Events { source }) => source.as_str(),
+        _ => state.source_filter.as_str(),
+    };
     let tab = match state.active_tab_label() {
         Some(label) => format!(" · tab:{}", label.to_ascii_lowercase()),
         None => String::new(),
@@ -125,7 +129,7 @@ pub(crate) fn context_text(state: &AppState, width: usize) -> String {
             "section:{}{tab} · window:{} · source:{} · sort:{}{filter}",
             state.current_section.as_str(),
             state.time_window.as_str(),
-            state.source_filter.as_str(),
+            source,
             state.sort.as_str(),
         ),
         width,
@@ -151,7 +155,7 @@ pub(super) fn draw_footer(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
     let rows = Layout::default()
@@ -162,7 +166,7 @@ pub(super) fn draw_footer(
     if cache.sparkline.iter().copied().fold(0f64, f64::max) <= 0.0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "no data in last 30 days",
+                "no daily costs in this scope",
                 palette.dim_text(),
             ))),
             rows[0],
@@ -243,7 +247,7 @@ pub(crate) struct FooterMessage {
     pub(crate) is_error: bool,
 }
 
-pub(crate) fn footer_messages(state: &AppState, cache: &DataCache) -> Vec<FooterMessage> {
+pub(crate) fn footer_messages(state: &AppState, cache: &VisibleRows) -> Vec<FooterMessage> {
     let mut messages = Vec::new();
     if let Some(flash) = &state.flash {
         messages.push(FooterMessage {
@@ -344,7 +348,7 @@ pub(super) fn draw_detail(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
     let detail_area = centered(area, 76, 14);
@@ -366,7 +370,7 @@ pub(super) fn draw_detail(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub(crate) fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
+pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String> {
     if let Some(d) = state.deepest_drill() {
         return match d.kind {
             DrillKind::Sessions { .. } => cache
@@ -390,7 +394,10 @@ pub(crate) fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
                                 .with_timezone(&Local)
                                 .format("%Y-%m-%d %H:%M:%S")
                         ),
-                        format!("tokens: {}", fmt_num(row.total_tokens)),
+                        format!(
+                            "tokens: {}",
+                            crate::render::fmt_wide_num(u128::from(row.total_tokens))
+                        ),
                         format!("cost: {}", fmt_cost(row.cost)),
                         "copy: y key, Y summary".into(),
                     ]
@@ -424,7 +431,7 @@ pub(crate) fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
         };
     }
     match state.current_section {
-        Section::Provider => cache
+        Section::Provider | Section::Repos if state.is_provider_view() => cache
             .trend
             .get(
                 state
@@ -434,7 +441,7 @@ pub(crate) fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
             .map(|row| {
                 vec![
                     format!("bucket: {}", row.bucket),
-                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!("tokens: {}", crate::render::fmt_wide_num(row.total_tokens)),
                     format!("total: {}", fmt_cost(row.total_cost)),
                     format!("claude: {}", fmt_cost(row.claude_cost)),
                     format!("codex: {}", fmt_cost(row.codex_cost)),
@@ -463,7 +470,10 @@ pub(crate) fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
                             .with_timezone(&Local)
                             .format("%Y-%m-%d %H:%M:%S")
                     ),
-                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!(
+                        "tokens: {}",
+                        crate::render::fmt_wide_num(u128::from(row.total_tokens))
+                    ),
                     format!("cost: {}", fmt_cost(row.cost)),
                     "copy: y key, Y summary".into(),
                 ]
@@ -481,7 +491,10 @@ pub(crate) fn detail_lines(state: &AppState, cache: &DataCache) -> Vec<String> {
                     format!("name: {}", row.label),
                     format!("key: {}", row.key),
                     format!("sessions: {}", fmt_num(row.sessions)),
-                    format!("tokens: {}", fmt_num(row.total_tokens)),
+                    format!(
+                        "tokens: {}",
+                        crate::render::fmt_wide_num(u128::from(row.total_tokens))
+                    ),
                     format!("cost: {}", fmt_cost(row.cost)),
                     "copy: y key, Y summary".into(),
                 ]

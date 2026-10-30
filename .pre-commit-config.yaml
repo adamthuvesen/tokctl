@@ -3,14 +3,14 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --all -- --check
+        entry: just fmt
         language: system
         types: [rust]
         pass_filenames: false
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --locked --all-targets --all-features -- -D warnings
+        entry: just lint
         language: system
-        types: [rust]
+        files: '(^Cargo\.(toml|lock)$|\.rs$)'
         pass_filenames: false

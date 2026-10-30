@@ -3,6 +3,29 @@ use chrono::{DateTime, Utc};
 use crate::tui::state::{Section, SourceFilter, TimeWindow, TrendGranularity};
 use crate::types::Source;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateSelection {
+    Repo(crate::store::queries::RepoFilterSpec),
+    Bucket {
+        granularity: TrendGranularity,
+        since_ms: i64,
+        until_ms: i64,
+    },
+    Model(String),
+}
+
+impl AggregateSelection {
+    pub fn apply_to(&self, scope: &mut crate::store::queries::QueryScope) {
+        match self {
+            Self::Repo(repo) => scope.repo = Some(repo.clone()),
+            Self::Bucket {
+                since_ms, until_ms, ..
+            } => scope.intersect_time(Some(*since_ms), Some(*until_ms)),
+            Self::Model(model) => scope.model = Some(model.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LeftRow {
     /// Primary label shown in the pane.
@@ -17,8 +40,7 @@ pub struct LeftRow {
     /// Most-recent timestamp for this row, when meaningful. Used by the
     /// recent sort for aggregate sections and by the Sessions "when" column.
     pub latest_ts: Option<DateTime<Utc>>,
-    /// Source for this row, when the row maps 1:1 to a single source.
-    pub source: Option<Source>,
+    pub selection: AggregateSelection,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +72,7 @@ pub struct TrendRow {
     pub claude_cost: f64,
     pub codex_cost: f64,
     pub cursor_cost: f64,
-    pub total_tokens: u64,
+    pub total_tokens: u128,
     pub total_cost: f64,
     pub is_current: bool,
 }
@@ -62,6 +84,7 @@ pub struct CacheStatus {
     pub freshness: String,
     pub last_query: DateTime<Utc>,
     pub mtime_ns: Option<i64>,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +116,14 @@ pub struct RefreshError {
     pub message: String,
 }
 
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.display_message())
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
 impl RefreshError {
     pub fn new(scope: RefreshScope, err: impl std::fmt::Display) -> Self {
         Self {
@@ -114,6 +145,7 @@ impl Default for CacheStatus {
             freshness: "unknown".into(),
             last_query: Utc::now(),
             mtime_ns: None,
+            generation: 0,
         }
     }
 }

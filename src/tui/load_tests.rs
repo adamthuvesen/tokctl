@@ -7,7 +7,7 @@ use crate::tui::state::{AppState, TimeWindow, TrendGranularity};
 
 #[test]
 fn day_bounds_parses() {
-    let (a, b) = day_bounds("2026-04-22");
+    let (a, b) = bucket_bounds("2026-04-22", TrendGranularity::Daily).unwrap();
     assert!(a < b);
 }
 
@@ -35,7 +35,7 @@ fn sort_changes_loaded_rows() {
             cost: 2.0,
             is_no_repo: false,
             latest_ts: None,
-            source: None,
+            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
         },
         LeftRow {
             label: "alpha".into(),
@@ -45,7 +45,7 @@ fn sort_changes_loaded_rows() {
             cost: 1.0,
             is_no_repo: false,
             latest_ts: None,
-            source: None,
+            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
         },
     ];
     sort_left_rows(&mut left, Section::Repos, Sort::AlphaAsc);
@@ -88,7 +88,7 @@ fn sessions_section_recent_sort_is_global_across_sources() {
             cost: 100.0,
             is_no_repo: false,
             latest_ts: Some("2026-04-18T09:00:00Z".parse().unwrap()),
-            source: Some(Source::Claude),
+            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
         },
         LeftRow {
             label: "codex-new".into(),
@@ -98,7 +98,7 @@ fn sessions_section_recent_sort_is_global_across_sources() {
             cost: 1.0,
             is_no_repo: false,
             latest_ts: Some("2026-04-19T09:00:00Z".parse().unwrap()),
-            source: Some(Source::Codex),
+            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
         },
     ];
 
@@ -116,7 +116,7 @@ fn left_memo_key(state: &AppState) -> LeftMemoKey {
     )
 }
 
-fn fixture_conn_with_events() -> Connection {
+fn fixture_conn_with_events() -> Store {
     let mut conn = mk_conn();
     let tx = conn.transaction().unwrap();
     insert_events(
@@ -140,7 +140,7 @@ fn left_memo_caches_after_first_refresh() {
         ..AppState::default()
     };
     let mut cache = DataCache::default();
-    cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+    cache.refresh_all(&conn, &state);
     let key = left_memo_key(&state);
     assert!(
         cache.left_memo.contains_key(&key),
@@ -157,13 +157,12 @@ fn clear_memos_drops_everything() {
         ..AppState::default()
     };
     let mut cache = DataCache::default();
-    cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+    cache.refresh_all(&conn, &state);
     assert!(!cache.left_memo.is_empty());
     cache.clear_memos();
     assert!(cache.left_memo.is_empty());
     assert!(cache.trend_memo.is_empty());
     assert!(cache.sparkline_memo.is_none());
-    assert!(cache.memo_mtime_ns.is_none());
 }
 
 #[test]
@@ -175,19 +174,12 @@ fn switching_sections_keeps_both_memos_warm() {
         time_window: TimeWindow::All,
         ..AppState::default()
     };
-    cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+    cache.refresh_all(&conn, &state);
     let days_key = left_memo_key(&state);
 
     // Visit Models — should add a second memo entry without evicting Days.
     state.current_section = Section::Models;
-    cache.refresh_for(
-        &conn,
-        &state,
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
+    cache.refresh_all(&conn, &state);
     let models_key = left_memo_key(&state);
 
     assert!(cache.left_memo.contains_key(&days_key));
@@ -204,7 +196,7 @@ fn trend_memo_survives_section_switch() {
         trend_granularity: TrendGranularity::Daily,
         ..AppState::default()
     };
-    cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
+    cache.refresh_all(&conn, &state);
     let trend_key = TrendMemoKey(
         state.time_window,
         state.source_filter,
@@ -214,47 +206,11 @@ fn trend_memo_survives_section_switch() {
 
     // Switch to Repos and back — the same trend key must still be warm.
     state.current_section = Section::Repos;
-    cache.refresh_for(
-        &conn,
-        &state,
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
+    cache.refresh_all(&conn, &state);
     assert!(
         cache.trend_memo.contains_key(&trend_key),
         "trend memo is keyed without section, so a section switch must not evict it"
     );
-}
-
-#[test]
-fn mtime_change_clears_memos() {
-    let conn = fixture_conn_with_events();
-    let state = AppState {
-        current_section: Section::Days,
-        time_window: TimeWindow::All,
-        ..AppState::default()
-    };
-    let mut cache = DataCache::default();
-    cache.refresh_for(&conn, &state, crate::tui::state::RefreshMask::all());
-    assert!(!cache.left_memo.is_empty());
-
-    // Simulate ingest by advancing the recorded memo mtime so it
-    // differs from the live status on the next refresh — the live
-    // mtime will then reset memo_mtime_ns and clear the memos.
-    cache.memo_mtime_ns = Some(0);
-    cache.refresh_for(
-        &conn,
-        &state,
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
-    // After this refresh the memo is freshly repopulated against the
-    // live mtime; assert the live mtime is what we expect.
-    assert_eq!(cache.memo_mtime_ns, cache.status.mtime_ns);
 }
 
 #[test]
@@ -278,6 +234,8 @@ fn cache_status_reports_event_count() {
             cache_read: 0,
             cache_write: 0,
             cost_usd: 0.0,
+            cost_provenance: "source".into(),
+            explicit_cost_usd: Some(0.0),
         }],
     )
     .unwrap();
@@ -308,6 +266,8 @@ fn model_session_drill_uses_first_non_null_project_path() {
                 cache_read: 0,
                 cache_write: 0,
                 cost_usd: 0.1,
+                cost_provenance: "source".into(),
+                explicit_cost_usd: Some(0.1),
             },
             EventRow {
                 file_path: "/x".into(),
@@ -324,6 +284,8 @@ fn model_session_drill_uses_first_non_null_project_path() {
                 cache_read: 0,
                 cache_write: 0,
                 cost_usd: 0.1,
+                cost_provenance: "source".into(),
+                explicit_cost_usd: Some(0.1),
             },
             EventRow {
                 file_path: "/x".into(),
@@ -340,13 +302,22 @@ fn model_session_drill_uses_first_non_null_project_path() {
                 cache_read: 0,
                 cache_write: 0,
                 cost_usd: 0.1,
+                cost_provenance: "source".into(),
+                explicit_cost_usd: Some(0.1),
             },
         ],
     )
     .unwrap();
     tx.commit().unwrap();
 
-    let rows = load_sessions_by_model(&conn, "model-x", &QueryFilter::default()).unwrap();
+    let rows = load_sessions_for(
+        &conn,
+        QueryScope {
+            model: Some("model-x".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].project.as_deref(), Some("zeta"));
@@ -355,7 +326,8 @@ fn model_session_drill_uses_first_non_null_project_path() {
 
 #[test]
 fn refresh_failure_is_visible_not_empty_data() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = Store::ephemeral().unwrap();
+    conn.execute_batch("DROP TABLE events").unwrap();
     let mut cache = DataCache::default();
 
     cache.refresh_all(&conn, &AppState::default());
@@ -377,28 +349,15 @@ fn valid_empty_refresh_has_no_error() {
 
 #[test]
 fn successful_refresh_clears_prior_error() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = Store::ephemeral().unwrap();
+    conn.execute_batch("DROP TABLE events").unwrap();
     let mut cache = DataCache::default();
 
-    cache.refresh_for(
-        &conn,
-        &AppState::default(),
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
+    cache.refresh_all(&conn, &AppState::default());
     assert!(cache.refresh_error.is_some());
 
     conn.execute_batch(DDL).unwrap();
-    cache.refresh_for(
-        &conn,
-        &AppState::default(),
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
+    cache.refresh_all(&conn, &AppState::default());
 
     assert!(cache.refresh_error.is_none());
 }
@@ -412,32 +371,18 @@ fn refresh_failure_preserves_previous_successful_rows() {
         ..AppState::default()
     };
     let mut cache = DataCache::default();
-    cache.refresh_for(
-        &conn,
-        &state,
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
+    cache.refresh_all(&conn, &state);
     assert!(!cache.left.is_empty());
 
     conn.execute("DROP TABLE events", []).unwrap();
-    cache.refresh_for(
-        &conn,
-        &state,
-        crate::tui::state::RefreshMask {
-            left: true,
-            ..Default::default()
-        },
-    );
+    cache.refresh_all(&conn, &state);
 
     assert!(cache.refresh_error.is_some());
     assert!(!cache.left.is_empty());
 }
 
 #[test]
-fn refresh_does_not_mutate_cache_tables() {
+fn refresh_does_not_ingest_events_or_files() {
     let conn = fixture_conn_with_events();
     let before_events: i64 = conn
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
@@ -465,8 +410,8 @@ fn refresh_does_not_mutate_cache_tables() {
     assert_eq!(after_files, before_files);
 }
 
-fn mk_conn() -> Connection {
-    let c = Connection::open_in_memory().unwrap();
+fn mk_conn() -> Store {
+    let c = Store::ephemeral().unwrap();
     c.execute_batch(DDL).unwrap();
     c
 }
@@ -487,6 +432,8 @@ fn mk_event(ts_ms: i64, day: &str, month: &str, src: Source, cost: f64) -> Event
         cache_read: 0,
         cache_write: 0,
         cost_usd: cost,
+        cost_provenance: "source".into(),
+        explicit_cost_usd: Some(cost),
     }
 }
 
@@ -529,7 +476,7 @@ fn trend_monthly_buckets_by_month() {
         ..AppState::default()
     };
     let now = Utc::now();
-    let rows = load_trend(&conn, &state, now).unwrap();
+    let rows = load_trend(&conn, &state, now, base_filter(&state, now).unwrap()).unwrap();
     let nov = rows
         .iter()
         .find(|r| r.bucket.contains("11"))
@@ -575,7 +522,13 @@ fn trend_source_filter_zeroes_other_column() {
         source_filter: crate::tui::state::SourceFilter::Claude,
         ..AppState::default()
     };
-    let rows = load_trend(&conn, &state, Utc::now()).unwrap();
+    let rows = load_trend(
+        &conn,
+        &state,
+        Utc::now(),
+        base_filter(&state, Utc::now()).unwrap(),
+    )
+    .unwrap();
     let nov = &rows[0];
     assert!((nov.claude_cost - 1.0).abs() < 1e-9);
     assert_eq!(nov.codex_cost, 0.0);
@@ -608,6 +561,7 @@ fn load_events_for_returns_only_matching_session_ordered_chronologically() {
         since_ms: None,
         until_ms: None,
         repo: None,
+        ..Default::default()
     };
     let rows = load_events_for(&conn, Source::Claude, "alpha", filter).unwrap();
     assert_eq!(rows.len(), 2, "only alpha-claude events");
@@ -631,6 +585,7 @@ fn load_events_for_respects_time_window() {
         since_ms: Some(3_000),
         until_ms: None,
         repo: None,
+        ..Default::default()
     };
     let rows = load_events_for(&conn, Source::Claude, "s", filter).unwrap();
     assert_eq!(rows.len(), 1);
@@ -660,7 +615,360 @@ fn trend_daily_marks_today_current() {
         trend_granularity: TrendGranularity::Daily,
         ..AppState::default()
     };
-    let rows = load_trend(&conn, &state, Utc::now()).unwrap();
+    let rows = load_trend(
+        &conn,
+        &state,
+        Utc::now(),
+        base_filter(&state, Utc::now()).unwrap(),
+    )
+    .unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].is_current);
+}
+
+#[test]
+fn all_bucket_drills_preserve_source_time_bounds_and_full_parent_totals() {
+    let calendar = crate::calendar::Calendar::system().unwrap();
+    for (granularity, bucket) in [
+        (TrendGranularity::Daily, "2026-04-22"),
+        (TrendGranularity::Weekly, "2026-W17"),
+        (TrendGranularity::Monthly, "2026-04"),
+        (TrendGranularity::Yearly, "2026"),
+    ] {
+        let (start, end) = bucket_bounds(bucket, granularity).unwrap();
+        let mut store = Store::ephemeral().unwrap();
+        let events = [
+            (start + 1, Source::Claude, 100.0),
+            (start + 20, Source::Claude, 2.0),
+            (end - 1, Source::Claude, 3.0),
+            (end, Source::Claude, 200.0),
+            (start + 30, Source::Codex, 300.0),
+        ]
+        .into_iter()
+        .map(|(ts, source, cost)| {
+            let (day, month) = calendar.local_day_month(Utc.timestamp_millis_opt(ts).unwrap());
+            let mut row = mk_event(ts, &day, &month, source, cost);
+            row.session_id = "repeat".into();
+            row
+        })
+        .collect::<Vec<_>>();
+        let tx = store.transaction().unwrap();
+        insert_events(&tx, &events).unwrap();
+        tx.commit().unwrap();
+        let mut scope = QueryScope {
+            source: Some(Source::Claude),
+            since_ms: Some(start + 10),
+            until_ms: Some(end),
+            ..Default::default()
+        };
+        let rows = load_left_axis(&store, Section::Days, scope.clone(), granularity).unwrap();
+        assert_eq!(rows.len(), 1, "{granularity:?}");
+        assert_eq!(rows[0].key, bucket);
+        rows[0].selection.apply_to(&mut scope);
+        assert_eq!(scope.since_ms, Some(start + 10));
+        assert_eq!(scope.until_ms, Some(end));
+        let sessions = load_sessions_for(&store, scope.clone()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source, Source::Claude);
+        assert_eq!(sessions[0].cost, rows[0].cost);
+        let events =
+            load_events_for(&store, sessions[0].source, &sessions[0].session_id, scope).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "{granularity:?} excludes the next bucket and includes its last millisecond"
+        );
+        assert_eq!(events.iter().map(|row| row.cost).sum::<f64>(), rows[0].cost);
+    }
+}
+
+#[test]
+fn model_and_exact_repo_scopes_survive_session_event_drills() {
+    let mut store = Store::ephemeral().unwrap();
+    let mut events = Vec::new();
+    for (ts, repo, model, source, cost) in [
+        (1000, "/repo", "model-a", Source::Claude, 2.0),
+        (2000, "/repo-child", "model-a", Source::Claude, 20.0),
+        (3000, "/repo", "model-b", Source::Claude, 30.0),
+        (4000, "/repo", "model-a", Source::Codex, 40.0),
+    ] {
+        let mut row = mk_event(ts, "1970-01-01", "1970-01", source, cost);
+        row.repo = Some(repo.into());
+        row.model = model.into();
+        row.session_id = "repeat".into();
+        events.push(row);
+    }
+    let tx = store.transaction().unwrap();
+    insert_events(&tx, &events).unwrap();
+    tx.commit().unwrap();
+    let scope = QueryScope {
+        repo: Some(RepoFilterSpec::KeyExact("/repo".into())),
+        model: Some("model-a".into()),
+        source: Some(Source::Claude),
+        ..Default::default()
+    };
+    let sessions = load_sessions_for(&store, scope.clone()).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].cost, 2.0);
+    let events = load_events_for(&store, sessions[0].source, "repeat", scope).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost, 2.0);
+}
+
+#[test]
+fn calendar_rollover_invalidates_memos_without_data_changes() {
+    let calendar = crate::calendar::Calendar::system().unwrap();
+    let today = NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+    let start = calendar.day_start(today).unwrap();
+    let tomorrow = calendar.day_start(today.succ_opt().unwrap()).unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    let tx = store.transaction().unwrap();
+    insert_events(
+        &tx,
+        &[mk_event(
+            start.timestamp_millis() + 1000,
+            "2026-04-22",
+            "2026-04",
+            Source::Claude,
+            2.0,
+        )],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let state = AppState {
+        time_window: TimeWindow::Today,
+        trend_granularity: TrendGranularity::Daily,
+        ..AppState::default()
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_at(&store, &state, start + chrono::Duration::hours(12));
+    assert_eq!(cache.left.len(), 1);
+    let generation = cache.status.generation;
+    cache.refresh_at(&store, &state, tomorrow + chrono::Duration::hours(12));
+    assert!(cache.refresh_error.is_none());
+    assert!(cache.left.is_empty());
+    assert!(cache.trend.is_empty());
+    assert_eq!(cache.status.generation, generation);
+}
+
+#[test]
+fn generation_changes_invalidate_rows_when_file_mtime_does_not_change() {
+    let store = fixture_conn_with_events();
+    let state = AppState {
+        time_window: TimeWindow::All,
+        ..AppState::default()
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_all(&store, &state);
+    let old_mtime = cache.status.mtime_ns;
+    assert!(!cache.left.is_empty());
+    store.execute_batch("DELETE FROM events; INSERT OR REPLACE INTO meta(key,value) VALUES ('generation','77');").unwrap();
+    cache.refresh_all(&store, &state);
+    assert!(cache.refresh_error.is_none());
+    assert!(cache.left.is_empty());
+    assert_eq!(cache.status.mtime_ns, old_mtime);
+    assert_eq!(cache.status.generation, 77);
+}
+
+#[test]
+fn failed_scope_refresh_keeps_the_data_and_its_previous_scope() {
+    let store = fixture_conn_with_events();
+    let mut state = AppState {
+        current_section: Section::Days,
+        time_window: TimeWindow::All,
+        ..AppState::default()
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_all(&store, &state);
+    let cost = cache.left.iter().map(|row| row.cost).sum::<f64>();
+    store.execute_batch("DROP TABLE events").unwrap();
+    state.current_section = Section::Models;
+    state.time_window = TimeWindow::Today;
+    cache.refresh_all(&store, &state);
+    assert!(cache.refresh_error.is_some());
+    assert_eq!(
+        cache.loaded_state.as_ref().unwrap().current_section,
+        Section::Days
+    );
+    cache.restore_loaded_state(&mut state);
+    assert_eq!(state.current_section, Section::Days);
+    assert_eq!(state.time_window, TimeWindow::All);
+    assert_eq!(cache.left.iter().map(|row| row.cost).sum::<f64>(), cost);
+    assert!(state.flash.as_ref().unwrap().contains("previous scope"));
+}
+
+#[test]
+fn malformed_bucket_labels_return_an_error() {
+    for granularity in [
+        TrendGranularity::Daily,
+        TrendGranularity::Weekly,
+        TrendGranularity::Monthly,
+        TrendGranularity::Yearly,
+    ] {
+        assert!(bucket_bounds("invalid", granularity).is_err());
+    }
+}
+
+#[test]
+fn widening_the_global_window_keeps_the_bucket_and_releases_the_previous_window() {
+    let calendar = crate::calendar::Calendar::system().unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    let mut events = Vec::new();
+    for (day, cost) in [
+        ("2026-04-01", 1.0),
+        ("2026-04-22", 2.0),
+        ("2026-04-30", 3.0),
+        ("2026-05-01", 50.0),
+    ] {
+        let date = NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap();
+        let ts = calendar.day_start(date).unwrap().timestamp_millis() + 1000;
+        let mut row = mk_event(ts, day, &day[..7], Source::Claude, cost);
+        row.session_id = "repeat".into();
+        events.push(row);
+    }
+    let tx = store.transaction().unwrap();
+    insert_events(&tx, &events).unwrap();
+    tx.commit().unwrap();
+    let now = calendar
+        .day_start(NaiveDate::from_ymd_opt(2026, 4, 22).unwrap())
+        .unwrap();
+    let mut state = AppState {
+        time_window: TimeWindow::Today,
+        trend_granularity: TrendGranularity::Monthly,
+        sort: Sort::AlphaAsc,
+        ..AppState::default()
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(cache.visible(&state).left[0].key, "2026-04");
+    let drill = crate::tui::input::drill_target_for_current(&state, &cache).unwrap();
+    state.push_drill(drill);
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(cache.sessions[0].cost, 5.0);
+    state.apply(crate::tui::state::Action::SetWindow(TimeWindow::All));
+    cache.refresh_at(&store, &state, now);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(cache.sessions[0].cost, 6.0);
+}
+
+#[test]
+fn failed_rollover_preserves_resolved_scope_and_does_not_retry_every_tick() {
+    let calendar = crate::calendar::Calendar::system().unwrap();
+    let date = NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+    let start = calendar.day_start(date).unwrap();
+    let tomorrow = calendar.day_start(date.succ_opt().unwrap()).unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    let tx = store.transaction().unwrap();
+    insert_events(
+        &tx,
+        &[mk_event(
+            start.timestamp_millis() + 1000,
+            "2026-04-22",
+            "2026-04",
+            Source::Claude,
+            2.0,
+        )],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let state = AppState {
+        time_window: TimeWindow::Today,
+        ..AppState::default()
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_at(&store, &state, start);
+    let scope = cache.loaded_scope.clone();
+    store.execute_batch("DROP TABLE events").unwrap();
+    assert!(cache.calendar_changed(tomorrow));
+    cache.refresh_at(&store, &state, tomorrow);
+    assert!(cache.refresh_error.is_some());
+    assert_eq!(cache.loaded_scope, scope);
+    assert_eq!(cache.status.last_query, start);
+    assert!(!cache.calendar_changed(tomorrow + chrono::Duration::seconds(1)));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::view::draw(frame, &state, &cache))
+        .unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("snapshot 2026-04-22"));
+}
+
+#[test]
+fn configured_roots_scope_root_rows_provider_totals_and_session_event_drills() {
+    let calendar = crate::calendar::Calendar::system().unwrap();
+    let now = calendar
+        .day_start(NaiveDate::from_ymd_opt(2026, 4, 22).unwrap())
+        .unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    let events = [
+        ("/configured/session.jsonl", 2.0),
+        ("/outside/session.jsonl", 20.0),
+        ("/configured-other/session.jsonl", 200.0),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (path, cost))| {
+        let mut row = mk_event(
+            now.timestamp_millis() + index as i64 + 1,
+            "2026-04-22",
+            "2026-04",
+            Source::Claude,
+            cost,
+        );
+        row.file_path = path.into();
+        row.session_id = "repeat".into();
+        row
+    })
+    .collect::<Vec<_>>();
+    let tx = store.transaction().unwrap();
+    insert_events(&tx, &events).unwrap();
+    tx.commit().unwrap();
+    let mut state = AppState {
+        time_window: TimeWindow::All,
+        ..AppState::default()
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(cache.left.iter().map(|row| row.cost).sum::<f64>(), 222.0);
+    cache.source_roots = Some(vec!["/configured".into()]);
+    cache.refresh_at(&store, &state, now);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(cache.left.iter().map(|row| row.cost).sum::<f64>(), 2.0);
+    assert_eq!(
+        cache.trend.iter().map(|row| row.total_cost).sum::<f64>(),
+        2.0
+    );
+    assert_eq!(cache.sparkline.iter().sum::<f64>(), 2.0);
+    let drill = crate::tui::input::drill_target_for_current(&state, &cache).unwrap();
+    state.push_drill(drill);
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(cache.sessions.len(), 1);
+    assert_eq!(cache.sessions[0].cost, 2.0);
+    let drill = crate::tui::input::drill_target_for_current(&state, &cache).unwrap();
+    state.push_drill(drill);
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(cache.events.len(), 1);
+    assert_eq!(cache.events[0].cost, 2.0);
+    assert_eq!(
+        cache.loaded_scope.as_ref().unwrap().roots,
+        cache.source_roots
+    );
+    state.apply(crate::tui::state::Action::JumpToSection(Section::Provider));
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(
+        cache.trend.iter().map(|row| row.total_cost).sum::<f64>(),
+        2.0
+    );
+    cache.source_roots = None;
+    cache.refresh_at(&store, &state, now);
+    assert_eq!(
+        cache.trend.iter().map(|row| row.total_cost).sum::<f64>(),
+        222.0
+    );
 }

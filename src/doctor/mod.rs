@@ -1,12 +1,10 @@
-mod checks;
+use crate::store::inspection as checks;
 mod render;
 
-use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoverOpts};
+use crate::discovery::{discover_claude, discover_codex, discover_cursor};
 use crate::store::store_path;
 use crate::types::Source;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 pub use render::{render_human, render_json};
 
@@ -116,26 +114,9 @@ pub fn run() -> DoctorReport {
     checks::push_root_check(&mut checks, Source::Codex, &codex);
     checks::push_root_check(&mut checks, Source::Cursor, &cursor);
 
-    let discover_opts = DiscoverOpts {
-        safety_window_ms: 60 * 60 * 1000,
-        now_ms: chrono::Utc::now().timestamp_millis(),
-    };
-    let manifest: HashMap<PathBuf, crate::store::FileManifestRow> = HashMap::new();
-    let claude_discovery = discover_claude(
-        &checks::existing_roots(&claude.roots),
-        &manifest,
-        discover_opts,
-    );
-    let codex_discovery = discover_codex(
-        &checks::existing_roots(&codex.roots),
-        &manifest,
-        discover_opts,
-    );
-    let cursor_discovery = discover_cursor(
-        &checks::existing_roots(&cursor.roots),
-        &manifest,
-        discover_opts,
-    );
+    let claude_discovery = discover_claude(&checks::existing_roots(&claude.roots));
+    let codex_discovery = discover_codex(&checks::existing_roots(&codex.roots));
+    let cursor_discovery = discover_cursor(&checks::existing_roots(&cursor.roots));
     checks.push(checks::discovery_check(
         Source::Claude,
         claude_discovery.files.len(),
@@ -151,6 +132,23 @@ pub fn run() -> DoctorReport {
         cursor_discovery.files.len(),
         cursor.roots.is_empty(),
     ));
+
+    let discovery_errors: Vec<String> = [&claude_discovery, &codex_discovery, &cursor_discovery]
+        .into_iter()
+        .flat_map(|discovery| &discovery.errors)
+        .map(|error| format!("{}: {}", error.path.display(), error.reason))
+        .collect();
+    if !discovery_errors.is_empty() {
+        checks.push(
+            DoctorCheck::new(
+                "discovery",
+                CheckSeverity::Warn,
+                "some source paths could not be read",
+            )
+            .details(discovery_errors)
+            .action("check source path permissions, then run tokctl doctor again"),
+        );
+    }
 
     let mut summary = DoctorSummary {
         cache_path: cache_path.display().to_string(),
@@ -242,13 +240,31 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let inspected = checks::inspect_cache(&path).unwrap();
-        let schema = inspected
-            .checks
+        let error = checks::inspect_cache(&path).unwrap_err();
+        assert!(error.message.contains("newer"));
+        assert_eq!(error.severity, CheckSeverity::Error);
+    }
+
+    #[test]
+    fn missing_table_is_an_inspection_error_not_zero_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(DDL).unwrap();
+        conn.execute(
+            "INSERT INTO meta VALUES('schema_version', ?)",
+            [crate::store::schema::SCHEMA_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE events;").unwrap();
+        drop(conn);
+        let error = checks::inspect_cache(&path).unwrap_err();
+        assert_eq!(error.severity, CheckSeverity::Error);
+        assert!(error.message.contains("could not inspect events"));
+        assert!(error
+            .details
             .iter()
-            .find(|check| check.message.contains("newer"))
-            .unwrap();
-        assert_eq!(schema.severity, CheckSeverity::Error);
+            .any(|detail| detail.contains("no such table")));
     }
 
     #[test]

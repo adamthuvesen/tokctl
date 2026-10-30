@@ -8,21 +8,21 @@ use ratatui::{
 };
 
 use super::layout::{BAR_WIDTH, LEFT_NAME_WIDTH, SESSION_PROJECT_WIDTH};
-use crate::tui::data::{sort_session_rows, DataCache, EventRow, LeftRow, SessionRow, TrendRow};
+use crate::tui::data::{EventRow, LeftRow, SessionRow, TrendRow, VisibleRows};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, session_when};
-use crate::tui::state::{AppState, Focus, Sort, SourceFilter};
+use crate::tui::state::{AppState, Focus, SourceFilter};
 use crate::tui::theme::Palette;
-use crate::tui::widgets::filter::{apply_filter_left, apply_filter_sessions};
+
 // -- Section: left-row table (Days, Models, Sessions, Repos Costs tab) ------------
 
 pub(super) fn draw_left_table(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
-    let (rows, _) = apply_filter_left(&cache.left, state);
+    let rows = &cache.left;
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -45,9 +45,9 @@ pub(super) fn draw_left_table(
     let active = state.focus == Focus::Main;
 
     if state.expanded {
-        draw_left_expanded(frame, area, selected, active, &rows, max_cost, palette);
+        draw_left_expanded(frame, area, selected, active, rows, max_cost, palette);
     } else {
-        draw_left_compact(frame, area, selected, active, &rows, max_cost, palette);
+        draw_left_compact(frame, area, selected, active, rows, max_cost, palette);
     }
 }
 
@@ -215,7 +215,7 @@ pub(super) fn draw_sessions_table(
         return;
     }
 
-    let filtered = display_session_rows(rows, state);
+    let filtered = rows;
     let max_cost = filtered
         .iter()
         .map(|r| r.cost)
@@ -297,14 +297,6 @@ pub(super) fn draw_sessions_table(
     let mut ts = TableState::default();
     ts.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut ts);
-}
-
-pub(crate) fn display_session_rows(rows: &[SessionRow], state: &AppState) -> Vec<SessionRow> {
-    let (mut filtered, scores) = apply_filter_sessions(rows, state);
-    if scores.is_empty() {
-        sort_session_rows(&mut filtered, state.sort);
-    }
-    filtered
 }
 
 // -- Events table (deepest drill) -------------------------------------------
@@ -426,10 +418,10 @@ pub(super) fn draw_trend_table(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
-    let rows = display_trend_rows(&cache.trend, state.sort);
+    let rows = &cache.trend;
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -483,8 +475,8 @@ pub(super) fn draw_trend_table(
         .map(|r| trend_row(r, max_total, show_claude, show_codex, show_cursor, palette))
         .collect();
 
-    let (cc_sum, xc_sum, uc_sum, tok_sum, tot_sum): (f64, f64, f64, u64, f64) =
-        rows.iter().fold((0.0, 0.0, 0.0, 0u64, 0.0), |acc, r| {
+    let (cc_sum, xc_sum, uc_sum, tok_sum, tot_sum): (f64, f64, f64, u128, f64) =
+        rows.iter().fold((0.0, 0.0, 0.0, 0u128, 0.0), |acc, r| {
             (
                 acc.0 + r.claude_cost,
                 acc.1 + r.codex_cost,
@@ -536,27 +528,12 @@ pub(super) fn draw_trend_table(
     constraints.push(Constraint::Length(10));
     constraints.push(Constraint::Min(BAR_WIDTH as u16 + 2));
 
-    let table = Table::new(body, constraints).header(header);
-    frame.render_widget(table, area);
-}
-
-pub(crate) fn display_trend_rows(rows: &[TrendRow], sort: Sort) -> Vec<TrendRow> {
-    let mut out = rows.to_vec();
-    out.sort_by(|a, b| match sort {
-        Sort::CostDesc => b
-            .total_cost
-            .partial_cmp(&a.total_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.bucket.cmp(&a.bucket)),
-        Sort::CostAsc => a
-            .total_cost
-            .partial_cmp(&b.total_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.bucket.cmp(&a.bucket)),
-        Sort::RecentDesc | Sort::AlphaDesc => b.bucket.cmp(&a.bucket),
-        Sort::RecentAsc | Sort::AlphaAsc => a.bucket.cmp(&b.bucket),
-    });
-    out
+    let table = Table::new(body, constraints)
+        .header(header)
+        .highlight_style(palette.selected_row());
+    let mut selection = TableState::default();
+    selection.select(Some(state.current_index().min(rows.len() - 1)));
+    frame.render_stateful_widget(table, area, &mut selection);
 }
 
 fn trend_row<'a>(

@@ -1,10 +1,9 @@
-use super::refresh::{refresh_mask_for, Action, ApplyOutcome};
+use super::refresh::{Action, ApplyOutcome};
 use super::types::*;
 
 impl AppState {
     pub fn apply(&mut self, action: Action) -> ApplyOutcome {
         let mut out = ApplyOutcome::default();
-        let section_before = self.current_section;
         // Most actions clear a stale flash. Filter-mode chars and movement
         // keep it; we just clear unconditionally for simplicity — a flash
         // is a one-shot anyway.
@@ -81,15 +80,14 @@ impl AppState {
             }
             Action::Drill => {
                 // The actual Drill is constructed in mod.rs after it reads
-                // the focused row, then pushed via `push_drill`. The mask
-                // derivation below picks up `next_drill_kind_hint`.
+                // the focused row, then pushed via `push_drill`.
                 if self.next_drill_kind_hint().is_some() {
                     out.dirty = true;
                 }
             }
             Action::PopDrill => {
                 if self.drill_active() {
-                    self.drill_stack.pop();
+                    self.pop_drill();
                     self.source_filter_hint_fired = false;
                     self.focus = Focus::Main;
                     out.dirty = true;
@@ -110,7 +108,7 @@ impl AppState {
                     self.help_open = false;
                     out.dirty = true;
                 } else if self.drill_active() {
-                    self.drill_stack.pop();
+                    self.pop_drill();
                     self.source_filter_hint_fired = false;
                     self.focus = Focus::Main;
                     out.dirty = true;
@@ -199,11 +197,6 @@ impl AppState {
             }
         }
 
-        // Centralized refresh-mask derivation. One match, exhaustively
-        // declared, no scattered `out.refresh.X = true` lines.
-        out.refresh = refresh_mask_for(&action, section_before, self);
-        out.needs_refresh = out.refresh.any();
-
         out
     }
 
@@ -250,39 +243,31 @@ impl AppState {
     /// [`AppState::next_drill_kind_hint`] / [`AppState::can_push_drill`]).
     pub fn push_drill(&mut self, mut drill: Drill) {
         drill.cursor = 0;
+        drill.parent_filter = std::mem::take(&mut self.filter);
         self.drill_stack.push(drill);
         self.source_filter_hint_fired = false;
         self.focus = Focus::Main;
+    }
+
+    fn pop_drill(&mut self) {
+        if let Some(drill) = self.drill_stack.pop() {
+            self.filter = drill.parent_filter;
+        }
     }
 
     /// What kind of drill the next `Action::Drill` *would* push, given the
     /// current section and stack top. Returns `None` for "no drill possible
     /// from here", which lets the dispatcher both gate the push and pre-flag
     /// which cache slice needs refetching.
-    pub fn next_drill_kind_hint(&self) -> Option<DrillKind> {
-        match self.deepest_drill() {
-            None => {
-                if self.current_section == Section::Sessions {
-                    // Source comes from the focused row; mod.rs fills it in.
-                    Some(DrillKind::Events {
-                        source: crate::types::Source::Claude,
-                    })
-                } else if self.current_section.rows_drill_to_sessions() {
-                    Some(DrillKind::Sessions {
-                        from_section: self.current_section,
-                    })
-                } else {
-                    None
-                }
-            }
-            Some(d) => match d.kind {
-                // Sessions drill: rows are sessions → push events.
-                DrillKind::Sessions { .. } => Some(DrillKind::Events {
-                    source: crate::types::Source::Claude,
-                }),
-                // Events drill: terminal level.
-                DrillKind::Events { .. } => None,
-            },
+    pub fn next_drill_kind_hint(&self) -> Option<NextDrill> {
+        if self.is_provider_view() {
+            return None;
+        }
+        match self.deepest_drill().map(|d| d.kind) {
+            None if self.current_section == Section::Sessions => Some(NextDrill::Events),
+            None if self.current_section.rows_drill_to_sessions() => Some(NextDrill::Sessions),
+            Some(DrillKind::Sessions { .. }) => Some(NextDrill::Events),
+            _ => None,
         }
     }
 

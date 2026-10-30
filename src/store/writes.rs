@@ -1,4 +1,3 @@
-use crate::discovery::ManifestLike;
 use crate::types::Source;
 use anyhow::Result;
 use rusqlite::{params, types::Type, Connection, Transaction};
@@ -19,16 +18,6 @@ pub struct FileManifestRow {
     pub model: Option<String>,
 }
 
-impl ManifestLike for FileManifestRow {
-    fn mtime_ns(&self) -> i64 {
-        self.mtime_ns
-    }
-
-    fn size(&self) -> u64 {
-        self.size
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct EventRow {
     pub file_path: String,
@@ -45,6 +34,8 @@ pub struct EventRow {
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost_usd: f64,
+    pub explicit_cost_usd: Option<f64>,
+    pub cost_provenance: String,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +128,14 @@ pub fn delete_file_and_events(tx: &Transaction<'_>, file_path: &str) -> Result<(
         params![file_path],
     )?;
     tx.execute("DELETE FROM files WHERE path = ?1", params![file_path])?;
+    tx.execute(
+        "DELETE FROM parser_provenance WHERE path = ?1",
+        params![file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM ingest_diagnostics WHERE file_path = ?1",
+        params![file_path],
+    )?;
     Ok(())
 }
 
@@ -147,11 +146,27 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
     let mut stmt = tx.prepare(
         r#"INSERT INTO events
              (file_path, source, ts, day, month, session_id, project_path, repo, model,
-              input, output, cache_read, cache_write, cost_usd)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
+              input, output, cache_read, cache_write, cost_usd, explicit_cost_usd, cost_provenance)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
     )?;
     let mut n = 0usize;
     for r in rows {
+        anyhow::ensure!(
+            r.cost_usd.is_finite() && r.cost_usd >= 0.0,
+            "event cost must be finite and nonnegative"
+        );
+        anyhow::ensure!(
+            r.explicit_cost_usd
+                .is_none_or(|cost| cost.is_finite() && cost >= 0.0),
+            "explicit event cost must be finite and nonnegative"
+        );
+        let total = [r.input, r.output, r.cache_read, r.cache_write]
+            .into_iter()
+            .try_fold(0u64, u64::checked_add);
+        anyhow::ensure!(
+            total.is_some_and(|value| value <= i64::MAX as u64),
+            "event token total exceeds SQLite integer range"
+        );
         stmt.execute(params![
             r.file_path,
             r.source.as_str(),
@@ -167,6 +182,8 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
             r.cache_read as i64,
             r.cache_write as i64,
             r.cost_usd,
+            r.explicit_cost_usd,
+            r.cost_provenance,
         ])?;
         n += 1;
     }
@@ -200,6 +217,8 @@ mod tests {
             cache_read: 3,
             cache_write: 4,
             cost_usd: 0.5,
+            explicit_cost_usd: None,
+            cost_provenance: crate::pricing::signature(),
         }
     }
 

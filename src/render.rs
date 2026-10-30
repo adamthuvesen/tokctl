@@ -5,6 +5,10 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
 pub fn fmt_num(n: u64) -> String {
+    fmt_wide_num(u128::from(n))
+}
+
+pub fn fmt_wide_num(n: u128) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -122,13 +126,13 @@ pub fn render_table(rows: &[AggregateRow], kind: ReportKind, show_source: bool) 
     }
 
     if !rows.is_empty() {
-        let mut totals = (0u64, 0u64, 0u64, 0u64, 0u64, 0f64);
+        let mut totals = (0u128, 0u128, 0u128, 0u128, 0u128, 0f64);
         for r in rows {
-            totals.0 += r.input_tokens;
-            totals.1 += r.output_tokens;
-            totals.2 += r.cache_read_tokens;
-            totals.3 += r.cache_write_tokens;
-            totals.4 += r.total_tokens;
+            totals.0 += u128::from(r.input_tokens);
+            totals.1 += u128::from(r.output_tokens);
+            totals.2 += u128::from(r.cache_read_tokens);
+            totals.3 += u128::from(r.cache_write_tokens);
+            totals.4 += u128::from(r.total_tokens);
             totals.5 += r.cost_usd;
         }
         let total_cells: Vec<Cell> = match kind {
@@ -137,30 +141,30 @@ pub fn render_table(rows: &[AggregateRow], kind: ReportKind, show_source: bool) 
                 Cell::new(""),
                 Cell::new(""),
                 Cell::new(""),
-                Cell::new(fmt_num(totals.0)),
-                Cell::new(fmt_num(totals.1)),
-                Cell::new(fmt_num(totals.2)),
-                Cell::new(fmt_num(totals.3)),
-                Cell::new(fmt_num(totals.4)),
+                Cell::new(fmt_wide_num(totals.0)),
+                Cell::new(fmt_wide_num(totals.1)),
+                Cell::new(fmt_wide_num(totals.2)),
+                Cell::new(fmt_wide_num(totals.3)),
+                Cell::new(fmt_wide_num(totals.4)),
                 Cell::new(fmt_cost(totals.5)),
             ],
             _ if show_source => vec![
                 Cell::new("TOTAL"),
                 Cell::new(""),
-                Cell::new(fmt_num(totals.0)),
-                Cell::new(fmt_num(totals.1)),
-                Cell::new(fmt_num(totals.2)),
-                Cell::new(fmt_num(totals.3)),
-                Cell::new(fmt_num(totals.4)),
+                Cell::new(fmt_wide_num(totals.0)),
+                Cell::new(fmt_wide_num(totals.1)),
+                Cell::new(fmt_wide_num(totals.2)),
+                Cell::new(fmt_wide_num(totals.3)),
+                Cell::new(fmt_wide_num(totals.4)),
                 Cell::new(fmt_cost(totals.5)),
             ],
             _ => vec![
                 Cell::new("TOTAL"),
-                Cell::new(fmt_num(totals.0)),
-                Cell::new(fmt_num(totals.1)),
-                Cell::new(fmt_num(totals.2)),
-                Cell::new(fmt_num(totals.3)),
-                Cell::new(fmt_num(totals.4)),
+                Cell::new(fmt_wide_num(totals.0)),
+                Cell::new(fmt_wide_num(totals.1)),
+                Cell::new(fmt_wide_num(totals.2)),
+                Cell::new(fmt_wide_num(totals.3)),
+                Cell::new(fmt_wide_num(totals.4)),
                 Cell::new(fmt_cost(totals.5)),
             ],
         };
@@ -265,24 +269,24 @@ pub fn render_repo_table(rows: &[RepoAggregateRow]) -> String {
     }
 
     if !sorted.is_empty() {
-        let mut totals = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0f64);
+        let mut totals = (0u128, 0u128, 0u128, 0u128, 0u128, 0u128, 0f64);
         for r in &sorted {
-            totals.0 += r.sessions;
-            totals.1 += r.input_tokens;
-            totals.2 += r.output_tokens;
-            totals.3 += r.cache_read_tokens;
-            totals.4 += r.cache_write_tokens;
-            totals.5 += r.total_tokens;
+            totals.0 += u128::from(r.sessions);
+            totals.1 += u128::from(r.input_tokens);
+            totals.2 += u128::from(r.output_tokens);
+            totals.3 += u128::from(r.cache_read_tokens);
+            totals.4 += u128::from(r.cache_write_tokens);
+            totals.5 += u128::from(r.total_tokens);
             totals.6 += r.cost_usd;
         }
         table.add_row(Row::from(vec![
             Cell::new("TOTAL"),
-            Cell::new(fmt_num(totals.0)),
-            Cell::new(fmt_num(totals.1)),
-            Cell::new(fmt_num(totals.2)),
-            Cell::new(fmt_num(totals.3)),
-            Cell::new(fmt_num(totals.4)),
-            Cell::new(fmt_num(totals.5)),
+            Cell::new(fmt_wide_num(totals.0)),
+            Cell::new(fmt_wide_num(totals.1)),
+            Cell::new(fmt_wide_num(totals.2)),
+            Cell::new(fmt_wide_num(totals.3)),
+            Cell::new(fmt_wide_num(totals.4)),
+            Cell::new(fmt_wide_num(totals.5)),
             Cell::new(fmt_cost(totals.6)),
         ]));
     }
@@ -393,6 +397,16 @@ mod tests {
         assert_eq!(fmt_num(1_234_567), "1,234,567");
         assert_eq!(fmt_num(0), "0");
         assert_eq!(fmt_num(999), "999");
+    }
+
+    #[test]
+    fn table_totals_do_not_wrap_across_valid_groups() {
+        let mut row = aggr("one");
+        row.input_tokens = i64::MAX as u64;
+        row.total_tokens = i64::MAX as u64;
+        let rows = vec![row.clone(), row.clone(), row];
+        let table = render_table(&rows, ReportKind::Daily, false);
+        assert!(table.contains("27,670,116,110,564,327,421"));
     }
 
     #[test]

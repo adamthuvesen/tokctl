@@ -1,8 +1,6 @@
-use crate::discovery::{
-    discover_claude, discover_codex, discover_cursor, DiscoverOpts, DiscoveredFile,
-};
+use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoveredFile};
 use crate::ingest::file_range::{
-    ingest_claude_range, ingest_codex_range, ingest_cursor_range, RangeResult,
+    parse_claude_file, parse_codex_file, parse_cursor_file, ParseResult,
 };
 use crate::ingest::plan::{plan_ingest, IngestPlan, PlanInput};
 use crate::pricing::cost_of;
@@ -13,48 +11,33 @@ use crate::store::writes::{
 };
 use crate::types::{IngestStats, Source, UsageEvent};
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Local, Utc};
+use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct RunIngestOptions<'a> {
-    pub conn: &'a mut Connection,
+pub struct RunIngestOptions {
     pub claude_roots: Vec<PathBuf>,
     pub codex_roots: Vec<PathBuf>,
     pub cursor_roots: Vec<PathBuf>,
-    pub include_claude: bool,
-    pub include_codex: bool,
-    pub include_cursor: bool,
-    pub safety_window_ms: i64,
-    pub now_ms: i64,
+    pub source: Option<Source>,
 }
 
 /// YYYY-MM-DD bucket key in the user's local timezone (matches what humans
 /// see in their session logs, not UTC).
 pub fn local_day(ts: &DateTime<Utc>) -> String {
-    let local = ts.with_timezone(&Local);
-    format!(
-        "{:04}-{:02}-{:02}",
-        local.year(),
-        local.month(),
-        local.day()
-    )
+    crate::calendar::Calendar::system()
+        .expect("calendar resolved before ingest")
+        .local_day_month(*ts)
+        .0
 }
 
-/// YYYY-MM bucket key in the user's local timezone.
 pub fn local_month(ts: &DateTime<Utc>) -> String {
-    let local = ts.with_timezone(&Local);
-    format!("{:04}-{:02}", local.year(), local.month())
-}
-
-fn system_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::calendar::Calendar::system()
+        .expect("calendar resolved before ingest")
+        .local_day_month(*ts)
+        .1
 }
 
 /// Convert a parsed UsageEvent to a row ready for SQLite insert. Costs the
@@ -77,6 +60,8 @@ fn event_to_row(ev: &UsageEvent, file_path: &str, unknown: &mut HashSet<String>)
         cache_read: ev.cache_read_tokens,
         cache_write: ev.cache_write_tokens,
         cost_usd: cost,
+        explicit_cost_usd: ev.explicit_cost_usd,
+        cost_provenance: crate::pricing::provenance(ev),
     }
 }
 
@@ -93,15 +78,25 @@ struct ParsedFile {
 
 /// Parse a full or partial file range and produce insertable rows.
 /// Runs on a rayon worker — no SQLite access here.
-fn parse_file(file: DiscoveredFile, from_offset: u64) -> Result<ParsedFile> {
+fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
+    let metadata = std::fs::metadata(&file.path)?;
+    anyhow::ensure!(
+        metadata.len() == file.size && crate::discovery::mtime_ns(&metadata) == file.mtime_ns,
+        "{} changed before parsing",
+        file.path.display()
+    );
     let range = match file.source {
-        Source::Claude => {
-            ingest_claude_range(&file.path, file.project.as_deref(), from_offset, file.size)?
-        }
-        Source::Codex => ingest_codex_range(&file.path, from_offset, file.size)?,
-        Source::Cursor => ingest_cursor_range(&file.path)?,
+        Source::Claude => parse_claude_file(&file.path, file.project.as_deref())?,
+        Source::Codex => parse_codex_file(&file.path)?,
+        Source::Cursor => parse_cursor_file(&file.path)?,
     };
-    let RangeResult {
+    let metadata = std::fs::metadata(&file.path)?;
+    anyhow::ensure!(
+        metadata.len() == file.size && crate::discovery::mtime_ns(&metadata) == file.mtime_ns,
+        "{} changed during parsing",
+        file.path.display()
+    );
+    let ParseResult {
         events,
         skipped_lines,
         ..
@@ -126,83 +121,95 @@ fn parse_file(file: DiscoveredFile, from_offset: u64) -> Result<ParsedFile> {
     })
 }
 
-fn included_sources(
-    include_claude: bool,
-    include_codex: bool,
-    include_cursor: bool,
-) -> HashSet<Source> {
-    let mut sources = HashSet::new();
-    if include_claude {
-        sources.insert(Source::Claude);
-    }
-    if include_codex {
-        sources.insert(Source::Codex);
-    }
-    if include_cursor {
-        sources.insert(Source::Cursor);
-    }
-    sources
-}
-
-pub fn run_ingest(opts: RunIngestOptions<'_>) -> Result<IngestStats> {
+pub fn run_ingest(store: &mut crate::store::Store, opts: RunIngestOptions) -> Result<IngestStats> {
+    let _ingest_lock = store
+        .path()
+        .map(crate::store::acquire_ingest_lock)
+        .transpose()?;
+    let conn = store.connection_mut();
     let RunIngestOptions {
-        conn,
         claude_roots,
         codex_roots,
         cursor_roots,
-        include_claude,
-        include_codex,
-        include_cursor,
-        safety_window_ms,
-        now_ms,
+        source,
     } = opts;
 
-    let now_ms = if now_ms > 0 { now_ms } else { system_now_ms() };
-
+    crate::calendar::Calendar::system()?;
+    crate::store::db::reproject(conn, &crate::calendar::Calendar::system()?)?;
+    conn.execute("DELETE FROM meta WHERE key='demo_marker'", [])?;
     let manifest = load_file_manifest(conn)?;
-    let sources = included_sources(include_claude, include_codex, include_cursor);
+    let signatures: HashMap<PathBuf, String> = {
+        let mut statement = conn.prepare("SELECT path,signature FROM parser_provenance")?;
+        let values = statement
+            .query_map([], |row| {
+                Ok((PathBuf::from(row.get::<_, String>(0)?), row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        values
+    };
+    let sources: HashSet<_> = [Source::Claude, Source::Codex, Source::Cursor]
+        .into_iter()
+        .filter(|candidate| source.is_none_or(|selected| selected == *candidate))
+        .collect();
     let planned_manifest: HashMap<PathBuf, FileManifestRow> = manifest
         .iter()
         .filter(|(_, row)| sources.contains(&row.source))
         .map(|(path, row)| (path.clone(), row.clone()))
         .collect();
 
-    let discover_opts = DiscoverOpts {
-        safety_window_ms,
-        now_ms,
-    };
-
     let mut all = crate::discovery::Discovery::default();
-    if include_claude {
-        let d = discover_claude(&claude_roots, &manifest, discover_opts);
+    if sources.contains(&Source::Claude) {
+        let d = discover_claude(&claude_roots);
         all.files.extend(d.files);
-        for p in d.unchanged_paths {
-            all.unchanged_paths.insert(p);
-        }
+        all.complete_roots.extend(d.complete_roots);
+        all.errors.extend(d.errors);
     }
-    if include_codex {
-        let d = discover_codex(&codex_roots, &manifest, discover_opts);
+    if sources.contains(&Source::Codex) {
+        let d = discover_codex(&codex_roots);
         all.files.extend(d.files);
-        for p in d.unchanged_paths {
-            all.unchanged_paths.insert(p);
-        }
+        all.complete_roots.extend(d.complete_roots);
+        all.errors.extend(d.errors);
     }
-    if include_cursor {
-        let d = discover_cursor(&cursor_roots, &manifest, discover_opts);
+    if sources.contains(&Source::Cursor) {
+        let d = discover_cursor(&cursor_roots);
         all.files.extend(d.files);
-        for p in d.unchanged_paths {
-            all.unchanged_paths.insert(p);
-        }
+        all.complete_roots.extend(d.complete_roots);
+        all.errors.extend(d.errors);
     }
 
-    let plan = plan_ingest(PlanInput {
+    let mut plan = plan_ingest(PlanInput {
         manifest: &planned_manifest,
         discovery: &all,
-        safety_window_ms,
-        now_ms,
     });
 
-    execute_plan(conn, plan, planned_manifest)
+    let stale_paths: HashSet<_> = plan
+        .to_skip
+        .iter()
+        .filter(|path| {
+            planned_manifest.get(*path).is_some_and(|row| {
+                signatures.get(*path).map(String::as_str)
+                    != Some(crate::store::db::parser_signature(row.source).as_str())
+            })
+        })
+        .cloned()
+        .collect();
+    plan.to_skip.retain(|path| !stale_paths.contains(path));
+    for file in &all.files {
+        if stale_paths.contains(&file.path) {
+            plan.to_full_parse.push(file.clone());
+        }
+    }
+    let discovery_errors = all.errors.len();
+    for error in &all.errors {
+        eprintln!(
+            "warning: scanning {}: {}",
+            error.path.display(),
+            error.reason
+        );
+    }
+    let mut stats = execute_plan(conn, plan)?;
+    stats.file_errors += discovery_errors;
+    Ok(stats)
 }
 
 /// Apply the repo resolver to a batch of event rows, returning the set of
@@ -239,172 +246,88 @@ fn stamp_repos(
     }
 }
 
-fn execute_plan(
-    conn: &mut Connection,
-    plan: IngestPlan,
-    manifest: HashMap<PathBuf, FileManifestRow>,
-) -> Result<IngestStats> {
+fn execute_plan(conn: &mut Connection, plan: IngestPlan) -> Result<IngestStats> {
     let mut stats = IngestStats {
-        files_scanned: plan.to_skip.len()
-            + plan.to_tail.len()
-            + plan.to_full_parse.len()
-            + plan.to_purge.len(),
+        files_scanned: plan.to_skip.len() + plan.to_full_parse.len() + plan.to_purge.len(),
         files_skipped: plan.to_skip.len(),
         ..Default::default()
     };
 
-    // ---- Purge (serial, fast) ----
-    for p in &plan.to_purge {
+    for path in &plan.to_purge {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        delete_file_and_events(&tx, path.to_string_lossy().as_ref())?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('generation','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [])?;
+        tx.commit()?;
         stats.files_purged += 1;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        delete_file_and_events(&tx, p.to_string_lossy().as_ref())?;
-        tx.commit()?;
     }
 
-    // ---- Parse phase (parallel) ----
-    // rayon's par_iter spreads file parsing across worker threads. Each returns
-    // a ParsedFile containing rows + thread-local unknown-model set + skipped
-    // line count. No SQLite access happens on these threads.
-    let full_results: Vec<Result<ParsedFile>> = plan
-        .to_full_parse
-        .into_par_iter()
-        .map(|file| parse_file(file, 0))
-        .collect();
-
-    let tail_results: Vec<Result<(ParsedFile, u64)>> = plan
-        .to_tail
-        .into_par_iter()
-        .map(|item| {
-            let from = item.from_offset;
-            parse_file(item.file, from).map(|p| (p, from))
-        })
-        .collect();
-
-    let mut full_parsed = Vec::new();
-    for result in full_results {
-        match result {
-            Ok(parsed) => full_parsed.push(parsed),
-            Err(_) => stats.file_errors += 1,
-        }
-    }
-
-    let mut tail_parsed = Vec::new();
-    for result in tail_results {
-        match result {
-            Ok(parsed) => tail_parsed.push(parsed),
-            Err(_) => stats.file_errors += 1,
-        }
-    }
-
-    // ---- Fold thread-local stats into the run-wide IngestStats ----
-    for p in &full_parsed {
-        stats.skipped_lines += p.skipped_lines;
-        stats
-            .unknown_models
-            .extend(p.unknown_models.iter().cloned());
-    }
-    for (p, _) in &tail_parsed {
-        stats.skipped_lines += p.skipped_lines;
-        stats
-            .unknown_models
-            .extend(p.unknown_models.iter().cloned());
-    }
-
-    // ---- Resolve repo identity for every row in the serial phase ----
-    // Parallel parsing doesn't touch the filesystem beyond the JSONL reads,
-    // so we resolve here where we also write to SQLite. One Resolver per
-    // run memoizes across files.
     let mut resolver = Resolver::new();
-    let mut first_seen: HashMap<String, i64> = HashMap::new();
-
-    // ---- Write phase (serial, per-file transactions) ----
-    for mut parsed in full_parsed {
-        stats.files_full_parsed += 1;
-        let path_str = parsed.file.path.to_string_lossy().into_owned();
-        let n_events = parsed.rows.len() as u64;
-
-        stamp_repos(
-            &mut parsed.rows,
-            &mut resolver,
-            &mut first_seen,
-            &mut stats.events_no_repo,
-        );
-
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if manifest.contains_key(&parsed.file.path) {
-            delete_file_and_events(&tx, &path_str)?;
-        }
-        let inserted = insert_events(&tx, &parsed.rows)?;
-        stats.events_inserted += inserted;
-        upsert_file_manifest(
-            &tx,
-            &FileManifestRow {
-                path: parsed.file.path.clone(),
-                source: parsed.file.source,
-                project: parsed.file.project.clone(),
-                size: parsed.file.size,
-                mtime_ns: parsed.file.mtime_ns,
-                last_offset: parsed.file.size,
-                n_events,
-                session_id: parsed.first_session,
-                model: parsed.first_model,
-            },
-        )?;
-        tx.commit()?;
-    }
-
-    for (mut parsed, _) in tail_parsed {
-        stats.files_tailed += 1;
-        let n_events_added = parsed.rows.len() as u64;
-        let prev_n = manifest
-            .get(&parsed.file.path)
-            .map(|r| r.n_events)
-            .unwrap_or(0);
-
-        stamp_repos(
-            &mut parsed.rows,
-            &mut resolver,
-            &mut first_seen,
-            &mut stats.events_no_repo,
-        );
-
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let inserted = insert_events(&tx, &parsed.rows)?;
-        stats.events_inserted += inserted;
-        upsert_file_manifest(
-            &tx,
-            &FileManifestRow {
-                path: parsed.file.path.clone(),
-                source: parsed.file.source,
-                project: parsed.file.project.clone(),
-                size: parsed.file.size,
-                mtime_ns: parsed.file.mtime_ns,
-                last_offset: parsed.file.size,
-                n_events: prev_n + n_events_added,
-                session_id: parsed.first_session,
-                model: parsed.first_model,
-            },
-        )?;
-        tx.commit()?;
-    }
-
-    // ---- Upsert repos in a single final transaction ----
-    if !first_seen.is_empty() {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (key, id) in resolver.resolved_repos() {
-            let ts = first_seen.get(key).copied().unwrap_or(0);
-            upsert_repo(
+    // Limit retained parse results to one worker-sized batch.
+    let batch_size = rayon::current_num_threads().max(1);
+    for batch in plan.to_full_parse.chunks(batch_size) {
+        let results: Vec<_> = batch
+            .par_iter()
+            .map(|file| parse_file(file.clone()))
+            .collect();
+        for (file, result) in batch.iter().zip(results) {
+            let mut parsed = match result {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    eprintln!("warning: parsing {}: {error:#}", file.path.display());
+                    stats.file_errors += 1;
+                    continue;
+                }
+            };
+            stats.skipped_lines += parsed.skipped_lines;
+            stats
+                .unknown_models
+                .extend(parsed.unknown_models.iter().cloned());
+            let mut first_seen = HashMap::new();
+            stamp_repos(
+                &mut parsed.rows,
+                &mut resolver,
+                &mut first_seen,
+                &mut stats.events_no_repo,
+            );
+            let path = parsed.file.path.to_string_lossy().into_owned();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // Replacement is unconditional after a coherent full read.
+            delete_file_and_events(&tx, &path)?;
+            stats.events_inserted += insert_events(&tx, &parsed.rows)?;
+            upsert_file_manifest(
                 &tx,
-                &RepoRow {
-                    key: key.to_owned(),
-                    display_name: id.display_name.clone(),
-                    origin_url: id.origin_url.clone(),
-                    first_seen: ts,
+                &FileManifestRow {
+                    path: parsed.file.path.clone(),
+                    source: parsed.file.source,
+                    project: parsed.file.project.clone(),
+                    size: parsed.file.size,
+                    mtime_ns: parsed.file.mtime_ns,
+                    last_offset: parsed.file.size,
+                    n_events: parsed.rows.len() as u64,
+                    session_id: parsed.first_session,
+                    model: parsed.first_model,
                 },
             )?;
-            stats.repos_resolved += 1;
+            for (key, identity) in resolver.resolved_repos() {
+                if let Some(first_seen) = first_seen.get(key) {
+                    upsert_repo(
+                        &tx,
+                        &RepoRow {
+                            key: key.to_owned(),
+                            display_name: identity.display_name.clone(),
+                            origin_url: identity.origin_url.clone(),
+                            first_seen: *first_seen,
+                        },
+                    )?;
+                    stats.repos_resolved += 1;
+                }
+            }
+            tx.execute("INSERT INTO parser_provenance(path,signature) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature", rusqlite::params![path, crate::store::db::parser_signature(parsed.file.source)])?;
+            tx.execute("INSERT INTO ingest_diagnostics(file_path,skipped_records) VALUES(?1,?2) ON CONFLICT(file_path) DO UPDATE SET skipped_records=excluded.skipped_records", rusqlite::params![path, parsed.skipped_lines as i64])?;
+            tx.execute("INSERT INTO meta(key,value) VALUES('generation','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [])?;
+            tx.commit()?;
+            stats.files_full_parsed += 1;
         }
-        tx.commit()?;
     }
 
     Ok(stats)
@@ -413,7 +336,6 @@ fn execute_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema::DDL;
 
     #[test]
     fn local_day_month_formats() {
@@ -452,6 +374,8 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             cost_usd: 0.0,
+            explicit_cost_usd: None,
+            cost_provenance: "legacy".into(),
         }
     }
 
@@ -486,10 +410,9 @@ mod tests {
             ],
             ..IngestPlan::default()
         };
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(DDL).unwrap();
+        let mut conn = crate::store::Store::ephemeral().unwrap();
 
-        let stats = execute_plan(&mut conn, plan, HashMap::new()).unwrap();
+        let stats = execute_plan(conn.connection_mut(), plan).unwrap();
 
         assert_eq!(stats.file_errors, 1);
         assert_eq!(stats.events_inserted, 1);
@@ -505,8 +428,7 @@ mod tests {
 
     #[test]
     fn source_limited_ingest_only_purges_included_sources() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(DDL).unwrap();
+        let mut conn = crate::store::Store::ephemeral().unwrap();
         let tx = conn.transaction().unwrap();
         upsert_file_manifest(&tx, &manifest_row("/claude.jsonl", Source::Claude)).unwrap();
         upsert_file_manifest(&tx, &manifest_row("/cursor.csv", Source::Cursor)).unwrap();
@@ -521,17 +443,15 @@ mod tests {
         tx.commit().unwrap();
 
         let cursor_root = tempfile::tempdir().unwrap();
-        run_ingest(RunIngestOptions {
-            conn: &mut conn,
-            claude_roots: Vec::new(),
-            codex_roots: Vec::new(),
-            cursor_roots: vec![cursor_root.path().to_path_buf()],
-            include_claude: false,
-            include_codex: false,
-            include_cursor: true,
-            safety_window_ms: 3_600_000,
-            now_ms: 1_777_000_000_000,
-        })
+        run_ingest(
+            &mut conn,
+            RunIngestOptions {
+                claude_roots: Vec::new(),
+                codex_roots: Vec::new(),
+                cursor_roots: vec![cursor_root.path().to_path_buf()],
+                source: Some(Source::Cursor),
+            },
+        )
         .unwrap();
 
         let claude_files: i64 = conn
@@ -557,6 +477,6 @@ mod tests {
             .unwrap();
         assert_eq!(claude_files, 1);
         assert_eq!(claude_events, 1);
-        assert_eq!(cursor_files, 0);
+        assert_eq!(cursor_files, 1);
     }
 }

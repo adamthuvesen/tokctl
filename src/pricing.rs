@@ -1,4 +1,5 @@
 use crate::types::UsageEvent;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -482,6 +483,22 @@ pub fn cost_of(event: &UsageEvent, unknown: Option<&mut HashSet<String>>) -> f64
         + (event.output_tokens as f64 * p.output) / M
         + (event.cache_read_tokens as f64 * p.cache_read) / M
         + (event.cache_write_tokens as f64 * p.cache_write) / M
+}
+
+/// Fingerprint the price catalog and the rules that interpret it.
+pub fn signature() -> String {
+    static SIGNATURE: OnceLock<String> = OnceLock::new();
+    SIGNATURE
+        .get_or_init(|| format!("{:x}", Sha256::digest(include_bytes!("pricing.rs"))))
+        .clone()
+}
+
+pub fn provenance(event: &UsageEvent) -> String {
+    if event.explicit_cost_usd.is_some() {
+        "source".to_owned()
+    } else {
+        signature()
+    }
 }
 
 #[cfg(test)]

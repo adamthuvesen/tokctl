@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -33,7 +33,19 @@ CREATE TABLE IF NOT EXISTS events (
   output       INTEGER NOT NULL,
   cache_read   INTEGER NOT NULL,
   cache_write  INTEGER NOT NULL,
-  cost_usd     REAL NOT NULL
+  cost_usd     REAL NOT NULL,
+  explicit_cost_usd REAL,
+  cost_provenance TEXT NOT NULL DEFAULT 'legacy'
+);
+
+CREATE TABLE IF NOT EXISTS parser_provenance (
+  path TEXT PRIMARY KEY,
+  signature TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ingest_diagnostics (
+  file_path TEXT PRIMARY KEY,
+  skipped_records INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS repos (

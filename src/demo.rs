@@ -1,12 +1,15 @@
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Utc};
-use rusqlite::Connection;
+#[cfg(test)]
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 use crate::pricing;
-use crate::store::db::open_store;
-use crate::store::writes::{insert_events, upsert_file_manifest, upsert_repo, EventRow};
-use crate::store::{writes::RepoRow, FileManifestRow};
+#[cfg(test)]
+use crate::store::db::{is_demo_cache, open_store};
+use crate::store::EventRow;
+use crate::store::Store;
+use crate::store::{FileManifestRow, RepoRow};
 use crate::types::{Source, UsageEvent};
 
 #[derive(Debug, Clone)]
@@ -103,54 +106,46 @@ pub struct DemoSeedResult {
 }
 
 pub fn seed_demo_cache(cache_dir: &Path, overwrite: bool) -> Result<DemoSeedResult> {
+    seed_demo_cache_at(cache_dir, overwrite, Utc::now())
+}
+
+fn seed_demo_cache_at(
+    cache_dir: &Path,
+    overwrite: bool,
+    now: DateTime<Utc>,
+) -> Result<DemoSeedResult> {
     let cache_path = cache_dir.join("cache.db");
-    if cache_path.exists() && !overwrite {
-        bail!(
-            "{} already exists; pass --overwrite to replace this demo cache",
-            cache_path.display()
-        );
-    }
-
-    let mut conn = open_store(&cache_path)?;
-    clear_demo_cache(&conn)?;
-    let events = build_demo_events();
-    let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-
-    let tx = conn.transaction()?;
-    for repo in REPOS {
-        upsert_repo(
-            &tx,
-            &RepoRow {
-                key: repo.key.to_owned(),
-                display_name: repo.name.to_owned(),
-                origin_url: Some(repo.origin.to_owned()),
-                first_seen: events
-                    .iter()
-                    .filter(|event| event.repo.as_deref() == Some(repo.key))
-                    .map(|event| event.ts)
-                    .min()
-                    .unwrap_or_else(|| Utc::now().timestamp_millis()),
-            },
-        )?;
-    }
-    for source in [Source::Claude, Source::Codex, Source::Cursor] {
-        upsert_file_manifest(
-            &tx,
-            &FileManifestRow {
-                path: PathBuf::from(format!("/demo/logs/{}.jsonl", source.as_str())),
-                source,
-                project: Some("demo".to_owned()),
-                size: 384_000,
-                mtime_ns: now_ns,
-                last_offset: 384_000,
-                n_events: events.iter().filter(|event| event.source == source).count() as u64,
-                session_id: None,
-                model: None,
-            },
-        )?;
-    }
-    let event_count = insert_events(&tx, &events)?;
-    tx.commit()?;
+    let events = build_demo_events(now);
+    let now_ns = now.timestamp_nanos_opt().unwrap_or(0);
+    let repos: Vec<RepoRow> = REPOS
+        .iter()
+        .map(|repo| RepoRow {
+            key: repo.key.to_owned(),
+            display_name: repo.name.to_owned(),
+            origin_url: Some(repo.origin.to_owned()),
+            first_seen: events
+                .iter()
+                .filter(|event| event.repo.as_deref() == Some(repo.key))
+                .map(|event| event.ts)
+                .min()
+                .unwrap_or_else(|| now.timestamp_millis()),
+        })
+        .collect();
+    let files: Vec<FileManifestRow> = [Source::Claude, Source::Codex, Source::Cursor]
+        .into_iter()
+        .map(|source| FileManifestRow {
+            path: PathBuf::from(format!("/demo/logs/{}.jsonl", source.as_str())),
+            source,
+            project: Some("demo".to_owned()),
+            size: 384_000,
+            mtime_ns: now_ns,
+            last_offset: 384_000,
+            n_events: events.iter().filter(|event| event.source == source).count() as u64,
+            session_id: None,
+            model: None,
+        })
+        .collect();
+    let event_count = Store::seed_demo(&cache_path, overwrite, &events, &repos, &files)?;
 
     Ok(DemoSeedResult {
         cache_dir: cache_dir.to_path_buf(),
@@ -160,19 +155,8 @@ pub fn seed_demo_cache(cache_dir: &Path, overwrite: bool) -> Result<DemoSeedResu
     })
 }
 
-fn clear_demo_cache(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM events", [])
-        .context("clearing demo events")?;
-    conn.execute("DELETE FROM files", [])
-        .context("clearing demo file manifest")?;
-    conn.execute("DELETE FROM repos", [])
-        .context("clearing demo repo rows")?;
-    Ok(())
-}
-
-fn build_demo_events() -> Vec<EventRow> {
-    let today = Local::now().date_naive();
-    let now = Utc::now();
+fn build_demo_events(now: DateTime<Utc>) -> Vec<EventRow> {
+    let today = now.with_timezone(&Local).date_naive();
     let mut rows = Vec::new();
     let mut session_counter = 1000_u64;
 
@@ -287,6 +271,12 @@ fn demo_event(
         cache_read,
         cache_write,
         cost_usd: cost,
+        explicit_cost_usd: (source.source == Source::Cursor).then_some(cost),
+        cost_provenance: if source.source == Source::Cursor {
+            "source".to_owned()
+        } else {
+            pricing::signature()
+        },
     }
 }
 
@@ -360,5 +350,69 @@ mod tests {
         let err = seed_demo_cache(dir.path(), false).unwrap_err();
 
         assert!(err.to_string().contains("--overwrite"));
+    }
+    #[test]
+    fn overwrite_refuses_normal_cache_without_changing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = open_store(&path).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('private', 'preserved')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let err = seed_demo_cache(dir.path(), true).unwrap_err();
+        assert!(err.to_string().contains("unmarked cache"));
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'private'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "preserved");
+        assert!(!is_demo_cache(&path).unwrap());
+    }
+
+    #[test]
+    fn failed_reseed_rolls_back_clear_and_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = seed_demo_cache(dir.path(), false).unwrap();
+        let conn = open_store(&first.cache_path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_demo_insert BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'injected seed failure'); END;").unwrap();
+        drop(conn);
+        assert!(seed_demo_cache(dir.path(), true).is_err());
+        let conn = Connection::open_with_flags(&first.cache_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let events: usize = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let repos: usize = conn
+            .query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, first.events);
+        assert_eq!(repos, first.repos);
+        assert!(is_demo_cache(&first.cache_path).unwrap());
+    }
+
+    #[test]
+    fn injected_time_makes_seed_deterministic() {
+        let now = DateTime::parse_from_rfc3339("2026-04-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let dir = tempfile::tempdir().unwrap();
+        let first = seed_demo_cache_at(dir.path(), false, now).unwrap();
+        let first_rows = build_demo_events(now);
+        let second = seed_demo_cache_at(dir.path(), true, now).unwrap();
+        let second_rows = build_demo_events(now);
+        assert_eq!(first.events, second.events);
+        assert_eq!(first_rows.len(), second_rows.len());
+        assert_eq!(
+            first_rows.iter().map(|row| row.ts).collect::<Vec<_>>(),
+            second_rows.iter().map(|row| row.ts).collect::<Vec<_>>()
+        );
+        assert!(second_rows
+            .iter()
+            .all(|row| row.ts <= now.timestamp_millis()));
     }
 }

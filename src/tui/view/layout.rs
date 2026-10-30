@@ -1,6 +1,6 @@
 use ratatui::layout::Rect;
 
-use crate::tui::data::DataCache;
+use crate::tui::data::VisibleRows;
 use crate::tui::state::{AppState, DrillKind, Section, SourceFilter};
 pub(crate) const BAR_WIDTH: usize = 20;
 pub(super) const LEFT_NAME_WIDTH: u16 = 28;
@@ -17,7 +17,7 @@ const PANEL_CHROME_HEIGHT: u16 = 3;
 /// Returns the (width, height) the main bordered panel "wants" given the
 /// currently active section and the data in the cache. The caller clamps
 /// these to the available terminal size.
-pub(crate) fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16, u16) {
+pub(crate) fn main_panel_dimensions(state: &AppState, cache: &VisibleRows) -> (u16, u16) {
     let bar_w = BAR_WIDTH as u16 + 2;
 
     // Drilled view always renders with a 1-row breadcrumb; pick columns
@@ -66,7 +66,7 @@ fn events_column_widths(bar_w: u16) -> Vec<u16> {
     vec![10, 16, 7, 7, 9, 9, 10, bar_w]
 }
 
-fn left_panel_size(state: &AppState, cache: &DataCache) -> (u16, u16) {
+fn left_panel_size(state: &AppState, cache: &VisibleRows) -> (u16, u16) {
     let bar_w = BAR_WIDTH as u16 + 2;
     let rows = cache.left.len() as u16;
     let cells: &[u16] = if state.expanded {
@@ -89,7 +89,7 @@ fn chrome((w, h): (u16, u16)) -> (u16, u16) {
     (w + PANEL_BORDER, h + PANEL_CHROME_HEIGHT)
 }
 
-fn active_provider_count(state: &AppState, cache: &DataCache) -> u16 {
+fn active_provider_count(state: &AppState, cache: &VisibleRows) -> u16 {
     let rows = &cache.trend;
     let show_claude = rows.iter().any(|r| r.claude_cost > 0.001)
         && !matches!(

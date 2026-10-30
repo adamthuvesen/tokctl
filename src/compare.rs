@@ -1,14 +1,12 @@
-use crate::ingest::run::local_day;
-use crate::pricing::cost_of;
-use crate::repo::RepoIdentity;
-use crate::store::queries::{QueryFilter, RepoFilterSpec, NO_REPO_SENTINEL};
-use crate::types::{Source, UsageEvent};
+use crate::store::queries::{comparison_rows, ComparisonRow as EventRow};
+use crate::store::queries::{QueryFilter, NO_REPO_SENTINEL};
+use crate::store::Store;
+use crate::types::Source;
 use anyhow::{Context, Result};
-use chrono::{Datelike, Duration, Local, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use comfy_table::{presets::UTF8_FULL, Cell, ContentArrangement, Row, Table};
-use rusqlite::{params_from_iter, types::Value, Connection};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareDimension {
@@ -38,12 +36,6 @@ pub struct CompareWindow {
     pub end: String,
 }
 
-impl CompareWindow {
-    fn contains_day(&self, day: &str) -> bool {
-        self.start.as_str() <= day && day <= self.end.as_str()
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct UsageTotals {
     pub input: u64,
@@ -55,13 +47,26 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add_row(&mut self, row: &EventRow) {
-        self.input += row.input;
-        self.output += row.output;
-        self.cache_read += row.cache_read;
-        self.cache_write += row.cache_write;
-        self.total_tokens += row.input + row.output + row.cache_read + row.cache_write;
+    fn add_row(&mut self, row: &EventRow) -> Result<()> {
+        let add = |left: u64, right: u64| {
+            left.checked_add(right)
+                .context("comparison token total exceeds supported range")
+        };
+        self.input = add(self.input, row.input)?;
+        self.output = add(self.output, row.output)?;
+        self.cache_read = add(self.cache_read, row.cache_read)?;
+        self.cache_write = add(self.cache_write, row.cache_write)?;
+        let total = add(
+            add(row.input, row.output)?,
+            add(row.cache_read, row.cache_write)?,
+        )?;
+        self.total_tokens = add(self.total_tokens, total)?;
         self.cost_usd += row.cost_usd;
+        anyhow::ensure!(
+            self.cost_usd.is_finite(),
+            "comparison cost total must be finite"
+        );
+        Ok(())
     }
 }
 
@@ -124,7 +129,7 @@ pub fn resolve_windows(
     baseline: Option<&str>,
     now: chrono::DateTime<Utc>,
 ) -> Result<CompareWindows> {
-    let local_today = now.with_timezone(&Local).date_naive();
+    let local_today = crate::calendar::Calendar::system()?.local_date(now);
     match (current, baseline) {
         (None, None) => {
             let current = month_to_date_window(local_today, "this-month");
@@ -253,139 +258,21 @@ fn window(label: &str, start: NaiveDate, end: NaiveDate) -> CompareWindow {
 }
 
 pub fn compare_from_db(
-    conn: &Connection,
+    conn: &Store,
     windows: CompareWindows,
     filter: QueryFilter,
     dimensions: &[CompareDimension],
     top: usize,
 ) -> Result<CompareReport> {
-    let current = load_rows(conn, &windows.current, &filter)?;
-    let baseline = load_rows(conn, &windows.baseline, &filter)?;
-    Ok(build_report_from_rows(
-        windows, &current, &baseline, dimensions, top,
-    ))
+    conn.read_snapshot(|conn| {
+        let current = load_rows(conn, &windows.current, &filter)?;
+        let baseline = load_rows(conn, &windows.baseline, &filter)?;
+        build_report_from_rows(windows, &current, &baseline, dimensions, top)
+    })
 }
 
-pub fn compare_from_events(
-    resolved: &[(UsageEvent, RepoIdentity)],
-    windows: CompareWindows,
-    repo_filter: &Option<RepoFilterSpec>,
-    dimensions: &[CompareDimension],
-    top: usize,
-    unknown: &mut HashSet<String>,
-) -> CompareReport {
-    let mut current = Vec::new();
-    let mut baseline = Vec::new();
-    for (event, repo) in resolved {
-        if !matches_repo(repo, repo_filter) {
-            continue;
-        }
-        let day = local_day(&event.timestamp);
-        let cost = cost_of(event, Some(unknown));
-        let row = EventRow {
-            source: event.source,
-            session_id: event.session_id.clone(),
-            repo_key: repo.key.clone(),
-            repo_label: repo.display_name.clone(),
-            model: event.model.clone(),
-            input: event.input_tokens,
-            output: event.output_tokens,
-            cache_read: event.cache_read_tokens,
-            cache_write: event.cache_write_tokens,
-            cost_usd: cost,
-        };
-        match (
-            windows.current.contains_day(&day),
-            windows.baseline.contains_day(&day),
-        ) {
-            (true, true) => {
-                current.push(row.clone());
-                baseline.push(row);
-            }
-            (true, false) => current.push(row),
-            (false, true) => baseline.push(row),
-            (false, false) => {}
-        }
-    }
-    build_report_from_rows(windows, &current, &baseline, dimensions, top)
-}
-
-#[derive(Debug, Clone)]
-struct EventRow {
-    source: Source,
-    session_id: String,
-    repo_key: Option<String>,
-    repo_label: String,
-    model: String,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    cost_usd: f64,
-}
-
-fn load_rows(
-    conn: &Connection,
-    window: &CompareWindow,
-    filter: &QueryFilter,
-) -> Result<Vec<EventRow>> {
-    let repo_clause = match &filter.repo {
-        None => "",
-        Some(RepoFilterSpec::NoRepo) => "AND e.repo IS NULL",
-        Some(RepoFilterSpec::DisplayName(_)) => {
-            "AND e.repo IN (SELECT key FROM repos WHERE display_name = ?)"
-        }
-        Some(RepoFilterSpec::KeyPrefix(_)) => "AND e.repo IS NOT NULL AND e.repo LIKE ?",
-    };
-    let source_clause = if filter.source.is_some() {
-        "AND e.source = ?"
-    } else {
-        ""
-    };
-    let sql = format!(
-        r#"SELECT e.source, e.session_id, e.repo,
-                  COALESCE(r.display_name, '{no_repo}'),
-                  e.model, e.input, e.output, e.cache_read, e.cache_write, e.cost_usd
-             FROM events e
-             LEFT JOIN repos r ON r.key = e.repo
-             WHERE e.day >= ? AND e.day <= ? {source_clause} {repo_clause}"#,
-        no_repo = RepoIdentity::NO_REPO_DISPLAY,
-    );
-    let mut params = vec![
-        Value::Text(window.start.clone()),
-        Value::Text(window.end.clone()),
-    ];
-    if let Some(source) = filter.source {
-        params.push(Value::Text(source.as_str().to_owned()));
-    }
-    match &filter.repo {
-        None | Some(RepoFilterSpec::NoRepo) => {}
-        Some(RepoFilterSpec::DisplayName(name)) => params.push(Value::Text(name.clone())),
-        Some(RepoFilterSpec::KeyPrefix(prefix)) => params.push(Value::Text(format!("{prefix}%"))),
-    }
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-        let source_raw: String = row.get(0)?;
-        let source = source_raw.parse::<Source>().map_err(|err| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                err,
-            )))
-        })?;
-        Ok(EventRow {
-            source,
-            session_id: row.get(1)?,
-            repo_key: row.get(2)?,
-            repo_label: row.get(3)?,
-            model: row.get(4)?,
-            input: row.get::<_, i64>(5)? as u64,
-            output: row.get::<_, i64>(6)? as u64,
-            cache_read: row.get::<_, i64>(7)? as u64,
-            cache_write: row.get::<_, i64>(8)? as u64,
-            cost_usd: row.get(9)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+fn load_rows(conn: &Store, window: &CompareWindow, filter: &QueryFilter) -> Result<Vec<EventRow>> {
+    comparison_rows(conn, &window.start, &window.end, filter)
 }
 
 fn build_report_from_rows(
@@ -394,30 +281,30 @@ fn build_report_from_rows(
     baseline_rows: &[EventRow],
     dimensions: &[CompareDimension],
     top: usize,
-) -> CompareReport {
-    let current_total = totals_for_rows(current_rows);
-    let baseline_total = totals_for_rows(baseline_rows);
+) -> Result<CompareReport> {
+    let current_total = totals_for_rows(current_rows)?;
+    let baseline_total = totals_for_rows(baseline_rows)?;
     let summary = DeltaTotals::new(current_total, baseline_total);
     let mut breakdowns = BTreeMap::new();
     for dimension in dimensions {
         breakdowns.insert(
             dimension.as_str().to_owned(),
-            build_breakdown(*dimension, current_rows, baseline_rows, top),
+            build_breakdown(*dimension, current_rows, baseline_rows, top)?,
         );
     }
-    CompareReport {
+    Ok(CompareReport {
         windows,
         summary,
         breakdowns,
-    }
+    })
 }
 
-fn totals_for_rows(rows: &[EventRow]) -> UsageTotals {
+fn totals_for_rows(rows: &[EventRow]) -> Result<UsageTotals> {
     let mut totals = UsageTotals::default();
     for row in rows {
-        totals.add_row(row);
+        totals.add_row(row)?;
     }
-    totals
+    Ok(totals)
 }
 
 fn build_breakdown(
@@ -425,7 +312,7 @@ fn build_breakdown(
     current_rows: &[EventRow],
     baseline_rows: &[EventRow],
     top: usize,
-) -> Breakdown {
+) -> Result<Breakdown> {
     let mut buckets: HashMap<String, (String, Option<Source>, UsageTotals, UsageTotals)> =
         HashMap::new();
     for row in current_rows {
@@ -441,7 +328,7 @@ fn build_breakdown(
                 )
             })
             .2
-            .add_row(row);
+            .add_row(row)?;
     }
     for row in baseline_rows {
         let (key, label, source) = dimension_key(dimension, row);
@@ -456,7 +343,7 @@ fn build_breakdown(
                 )
             })
             .3
-            .add_row(row);
+            .add_row(row)?;
     }
 
     let mut rows: Vec<BreakdownRow> = buckets
@@ -486,11 +373,11 @@ fn build_breakdown(
         .filter(|row| row.delta.cost_delta < 0.0)
         .take(top)
         .collect();
-    Breakdown {
+    Ok(Breakdown {
         dimension: dimension.as_str().to_owned(),
         positive,
         negative,
-    }
+    })
 }
 
 fn dimension_key(dimension: CompareDimension, row: &EventRow) -> (String, String, Option<Source>) {
@@ -513,18 +400,6 @@ fn dimension_key(dimension: CompareDimension, row: &EventRow) -> (String, String
             format!("{}:{}", row.source.as_str(), short_id(&row.session_id)),
             Some(row.source),
         ),
-    }
-}
-
-fn matches_repo(repo: &RepoIdentity, filter: &Option<RepoFilterSpec>) -> bool {
-    match filter {
-        None => true,
-        Some(RepoFilterSpec::NoRepo) => repo.key.is_none(),
-        Some(RepoFilterSpec::DisplayName(name)) => repo.key.is_some() && repo.display_name == *name,
-        Some(RepoFilterSpec::KeyPrefix(prefix)) => repo
-            .key
-            .as_deref()
-            .is_some_and(|key| key.starts_with(prefix)),
     }
 }
 
@@ -648,7 +523,6 @@ fn fmt_pct(value: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema::DDL;
     use chrono::TimeZone;
 
     #[test]
@@ -681,8 +555,7 @@ mod tests {
 
     #[test]
     fn db_compare_ranks_source_delta() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(DDL).unwrap();
+        let conn = Store::ephemeral().unwrap();
         conn.execute(
             "INSERT INTO events
              (file_path, source, ts, day, month, session_id, project_path, repo, model,
@@ -732,7 +605,8 @@ mod tests {
                 parse_day("2026-03-01").unwrap(),
             ),
         };
-        let report = build_report_from_rows(windows, &[], &[], &[CompareDimension::Source], 5);
+        let report =
+            build_report_from_rows(windows, &[], &[], &[CompareDimension::Source], 5).unwrap();
         let json = render_json(&report);
         assert!(json.contains("\"windows\""));
     }

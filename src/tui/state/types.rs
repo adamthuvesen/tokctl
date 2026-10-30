@@ -103,23 +103,23 @@ impl TimeWindow {
         }
     }
     /// Millisecond lower-bound for this window, computed against local `now`.
-    pub fn since_ms(self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
-        use chrono::{Duration, Local, NaiveTime, TimeZone};
-        let local = now.with_timezone(&Local);
-        let start_of_day = local
-            .date_naive()
-            .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-        let start_local = Local
-            .from_local_datetime(&start_of_day)
-            .single()
-            .unwrap_or(local);
-        match self {
-            TimeWindow::Today => Some(start_local.timestamp_millis()),
-            TimeWindow::Week => Some((start_local - Duration::days(6)).timestamp_millis()),
-            TimeWindow::Month => Some((start_local - Duration::days(29)).timestamp_millis()),
-            TimeWindow::Year => Some((start_local - Duration::days(364)).timestamp_millis()),
-            TimeWindow::All => None,
+    pub fn since_ms(self, now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Option<i64>> {
+        if self == Self::All {
+            return Ok(None);
         }
+        let calendar = crate::calendar::Calendar::system()?;
+        let days = match self {
+            Self::Today => 0,
+            Self::Week => 6,
+            Self::Month => 29,
+            Self::Year => 364,
+            Self::All => unreachable!(),
+        };
+        let date = calendar
+            .local_date(now)
+            .checked_sub_signed(chrono::Duration::days(days))
+            .ok_or_else(|| anyhow::anyhow!("time window exceeds calendar range"))?;
+        Ok(Some(calendar.day_start(date)?.timestamp_millis()))
     }
 }
 
@@ -232,6 +232,12 @@ pub enum DrillKind {
     Events { source: crate::types::Source },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextDrill {
+    Sessions,
+    Events,
+}
+
 /// One level on the drill stack. `key` is the stable identifier of the row
 /// that was drilled into (repo key, day bucket, session id, …); `label` is
 /// the human-readable breadcrumb chunk; `cursor` is the row-cursor inside
@@ -243,9 +249,11 @@ pub struct Drill {
     pub key: String,
     pub label: String,
     pub cursor: usize,
+    pub scope: crate::store::queries::QueryScope,
+    pub parent_filter: FilterState,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilterState {
     pub active: bool,
     pub query: String,
@@ -310,6 +318,11 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn is_provider_view(&self) -> bool {
+        !self.drill_active()
+            && (self.current_section == Section::Provider
+                || (self.current_section == Section::Repos && self.active_tab_index() != 0))
+    }
     pub fn active_tab_index(&self) -> u8 {
         *self
             .tab_per_section

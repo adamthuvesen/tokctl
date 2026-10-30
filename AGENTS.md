@@ -1,61 +1,42 @@
-# AGENTS.md — tokctl
+# AGENTS.md: tokctl
 
-`tokctl` is a local-only Rust CLI (edition 2021) that reads Claude/Codex JSONL
-session logs and prints token/cost reports, backed by a SQLite cache with an
-optional `--no-cache` in-memory path and a `tokctl ui` ratatui dashboard.
+`tokctl` is a Rust CLI and ratatui dashboard for Claude, Codex, and Cursor usage.
+Read [docs/architecture.md](docs/architecture.md) before changing a subsystem.
 
-User-level guidance (tone, principles, git etiquette) lives in `~/.claude/CLAUDE.md`
-and `~/dotfiles/agents/AGENTS.md` and is *not* duplicated here. This file is for
-project-specific facts.
+## Find the owner
 
-## Layout
+- Source formats and token meaning: `src/sources/`, `src/types.rs`.
+- Discovery and file replacement: `src/discovery.rs`, `src/ingest/`.
+- Connection ownership, transactions, migrations, and all SQL: `src/store/`.
+- Date boundaries and prices: `src/calendar.rs`, `src/pricing.rs`.
+- CLI requests and output: `src/cli/`, `src/compare.rs`, `src/render.rs`.
+- Dashboard state, visible selection, and refresh: `src/tui/`.
+- Cursor network adapter: `src/cursor_sync.rs`. Doctor remains read-only and offline.
 
-```
-src/
-├── cli/        clap parser, routing, command handlers, pipeline
-├── sources/    Claude + Codex JSONL parsers
-├── ingest/     ingest plan, byte-range reads, parallel runner
-├── store/      SQLite schema, writes, queries
-├── tui/        ratatui dashboard
-└── reports/    in-memory aggregations for --no-cache
-```
-
-Full module-by-module map is in [docs/architecture.md](docs/architecture.md).
-
-## Quickstart
+## Verify
 
 ```sh
-cargo build           # debug build
-cargo build --release # optimized binary at target/release/tokctl
-cargo test            # unit + integration tests
-cargo clippy          # lint (CI runs with -D warnings)
-cargo fmt             # format
-cargo bench           # parser benches
+just                    # discover commands
+just test sources::     # focused test name filter
+just verify-cli         # CLI and report contracts
+just verify-ui          # TUI behavior and actual PTY interaction
+just check              # format, lint, both feature sets, release build
 ```
 
-## Critical Conventions
+Rustup reads the pinned toolchain from `rust-toolchain.toml`. The supported minimum is in `Cargo.toml`.
+Use locked dependencies. CI runs `just check` on Linux and macOS.
 
-Non-obvious rules; verify against the code before relying on them.
+Tests must use synthetic logs, isolated homes, and temporary caches.
+Keep real credentials and usage logs out of fixtures and benchmark output.
+Use `tokctl ui --demo --cache-dir PATH` for public-safe application checks.
+Demo overwrite requires a cache still marked as synthetic.
 
-- **Parse in parallel, write serially.** rusqlite connections are not `Sync`;
-  the split is in [src/ingest/run.rs](src/ingest/run.rs).
-- **mmap safety window.** mmap (for files ≥ 1 MB) is only safe because the
-  ingest plan routes recently-modified files to full-parse. Changing that
-  invariant means auditing [src/ingest/file_range.rs](src/ingest/file_range.rs)
-  (`map_file`).
-- **Smallest diff that satisfies the requirement.** Match existing patterns in `src/`.
-- **No network.** The cache path is local only; never commit secrets, `.env`, or AI-attribution lines.
+## Contracts that need judgment
 
-## Read The Docs First
+Keep provider token semantics, explicit Cursor costs, and public JSON fields stable unless a change explicitly migrates them.
+The architecture owns mechanical guarantees. Do not restore a separate in-memory report implementation or append-only parser path.
+A pricing or parser change derives its fingerprint automatically. A schema change still needs a transactional migration.
+Preserve the last valid file snapshot when a source fails. Missing roots must not authorize deletion.
+Read related tests and the architecture notes before changing these contracts.
 
-Before editing a subsystem, read the matching doc:
-
-- **Architecture / module map** → [docs/architecture.md](docs/architecture.md)
-- **Ingest / mmap invariant** → [docs/architecture.md#ingest](docs/architecture.md#ingest)
-- **TUI dashboard** → [docs/architecture.md#tui](docs/architecture.md#tui)
-
-If a doc disagrees with code, fix the doc in the same change.
-
-## Index
-
-Start in [docs/architecture.md](docs/architecture.md).
+Report local verification separately from live Cursor, clipboard, host-terminal, and remote CI evidence.

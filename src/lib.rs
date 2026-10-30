@@ -1,5 +1,5 @@
 #[cfg(any(test, feature = "test-fixtures"))]
-pub mod test_support;
+pub use store::test_support;
 
 pub mod cli;
 pub mod compare;
@@ -13,8 +13,9 @@ pub mod paths;
 pub mod pricing;
 pub mod render;
 pub mod repo;
-pub mod reports;
 pub mod sources;
 pub mod store;
 pub mod tui;
 pub mod types;
+
+pub mod calendar;

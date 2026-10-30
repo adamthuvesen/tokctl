@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::compare::CompareDimension;
 use crate::store::store_path;
-use crate::types::{ReportKind, Source, SourceLabel};
+use crate::types::{ReportKind, Source};
 
 mod pipeline;
 mod workflows;
@@ -258,25 +258,8 @@ impl SourceArg {
         }
     }
 
-    fn include_claude(self) -> bool {
-        matches!(self, SourceArg::Claude | SourceArg::All)
-    }
-    fn include_codex(self) -> bool {
-        matches!(self, SourceArg::Codex | SourceArg::All)
-    }
-    fn include_cursor(self) -> bool {
-        matches!(self, SourceArg::Cursor | SourceArg::All)
-    }
     fn show_source(self) -> bool {
         matches!(self, SourceArg::All)
-    }
-    fn label(self) -> SourceLabel {
-        match self {
-            SourceArg::All => SourceLabel::All,
-            SourceArg::Claude => SourceLabel::Source(Source::Claude),
-            SourceArg::Codex => SourceLabel::Source(Source::Codex),
-            SourceArg::Cursor => SourceLabel::Source(Source::Cursor),
-        }
     }
 }
 
@@ -321,7 +304,8 @@ pub fn run() -> Result<()> {
         Commands::Doctor(a) => workflows::run_doctor(a),
         Commands::Compare(a) => workflows::run_compare(a),
         Commands::ExportDb => {
-            println!("{}", store_path().display());
+            use std::io::Write;
+            writeln!(std::io::stdout().lock(), "{}", store_path().display())?;
             Ok(())
         }
         Commands::Cursor(a) => workflows::run_cursor(a),

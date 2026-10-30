@@ -1,21 +1,30 @@
-use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use chrono::{DateTime, NaiveDate, Utc};
 use std::collections::BTreeMap;
 
 use super::load::{
-    base_filter, left_selected_key, load_cache_status, load_events_for, load_left_axis,
-    load_sessions_for, load_sparkline, load_trend, sort_event_rows, sort_left_rows,
-    sort_session_rows,
+    base_filter, load_cache_status, load_events_for, load_left_axis, load_sessions_for, load_trend,
 };
 use super::rows::{
     CacheStatus, EventRow, LeftMemoKey, LeftRow, RefreshError, RefreshScope, SessionRow,
     TrendMemoKey, TrendRow,
 };
-use crate::store::queries::QueryFilter;
-use crate::tui::state::{AppState, DrillKind, Section};
+use crate::store::queries::{scoped_sparkline, QueryScope};
+use crate::store::Store;
+use crate::tui::state::{AppState, DrillKind, Section, TrendGranularity};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ViewQuery {
+    Repos(QueryScope),
+    Buckets(QueryScope, TrendGranularity),
+    Models(QueryScope),
+    Sessions(QueryScope),
+    Events(QueryScope),
+    Provider(QueryScope, TrendGranularity),
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct DataCache {
+    pub source_roots: Option<Vec<std::path::PathBuf>>,
     pub left: Vec<LeftRow>,
     pub sessions: Vec<SessionRow>,
     pub events: Vec<EventRow>,
@@ -23,232 +32,216 @@ pub struct DataCache {
     pub trend: Vec<TrendRow>,
     pub status: CacheStatus,
     pub refresh_error: Option<RefreshError>,
+    pub loaded_state: Option<AppState>,
+    pub loaded_scope: Option<QueryScope>,
     pub(crate) left_memo: BTreeMap<LeftMemoKey, Vec<LeftRow>>,
     pub(crate) trend_memo: BTreeMap<TrendMemoKey, Vec<TrendRow>>,
     pub(crate) sparkline_memo: Option<Vec<f64>>,
-    pub(crate) memo_mtime_ns: Option<i64>,
+    pub(crate) memo_generation: Option<u64>,
+    pub(crate) memo_day: Option<NaiveDate>,
+    pub(crate) last_attempt_day: Option<NaiveDate>,
+    pub(crate) sparkline_scope: Option<QueryScope>,
 }
 
 impl DataCache {
-    pub fn refresh_all(&mut self, conn: &Connection, state: &AppState) {
-        self.refresh_for(conn, state, crate::tui::state::RefreshMask::all());
+    pub(crate) fn query_for(
+        &self,
+        state: &AppState,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<ViewQuery> {
+        let mut scope = self.scope_for(state, now)?;
+        Ok(match state.deepest_drill().map(|drill| drill.kind) {
+            Some(DrillKind::Events { source }) => {
+                scope.session = Some(crate::store::queries::SessionKey {
+                    source,
+                    id: state.deepest_drill().unwrap().key.clone(),
+                });
+                ViewQuery::Events(scope)
+            }
+            Some(DrillKind::Sessions { .. }) => ViewQuery::Sessions(scope),
+            None if state.is_provider_view() => ViewQuery::Provider(scope, state.trend_granularity),
+            None => match state.current_section {
+                Section::Repos => ViewQuery::Repos(scope),
+                Section::Days => ViewQuery::Buckets(scope, state.trend_granularity),
+                Section::Models => ViewQuery::Models(scope),
+                Section::Sessions => ViewQuery::Sessions(scope),
+                Section::Provider => unreachable!(),
+            },
+        })
+    }
+    pub fn refresh_all(&mut self, store: &Store, state: &AppState) {
+        self.refresh_at(store, state, Utc::now());
     }
 
     pub fn clear_memos(&mut self) {
         self.left_memo.clear();
         self.trend_memo.clear();
         self.sparkline_memo = None;
-        self.memo_mtime_ns = None;
+        self.sparkline_scope = None;
+        self.memo_generation = None;
+        self.memo_day = None;
     }
 
-    fn set_refresh_error(&mut self, scope: RefreshScope, err: impl std::fmt::Display) {
-        self.refresh_error = Some(RefreshError::new(scope, err));
-    }
-
-    fn clear_refresh_error(&mut self, scope: RefreshScope) {
-        if self
-            .refresh_error
-            .as_ref()
-            .is_some_and(|e| e.scope == scope)
-        {
-            self.refresh_error = None;
-        }
-    }
-
-    pub fn refresh_for(
-        &mut self,
-        conn: &Connection,
+    pub(crate) fn scope_for(
+        &self,
         state: &AppState,
-        mask: crate::tui::state::RefreshMask,
-    ) {
-        let now = Utc::now();
-        let filter = base_filter(state, now);
-
-        self.refresh_status(conn, now);
-        self.invalidate_memos_if_source_files_changed();
-
-        if mask.left {
-            self.refresh_left(conn, state, &filter);
-        }
-        if mask.sessions {
-            self.refresh_sessions(conn, state, &filter);
-        }
-        if mask.events {
-            self.refresh_events(conn, state, &filter);
-        }
-        if mask.sparkline {
-            self.refresh_sparkline(conn);
-        }
-        if mask.trend {
-            self.refresh_trend(conn, state, now);
-        }
-    }
-
-    fn refresh_status(&mut self, conn: &Connection, now: DateTime<Utc>) {
-        match load_cache_status(conn, now) {
-            Ok(status) => {
-                self.status = status;
-                self.clear_refresh_error(RefreshScope::Status);
-            }
-            Err(err) => self.set_refresh_error(RefreshScope::Status, err),
-        }
-    }
-
-    fn invalidate_memos_if_source_files_changed(&mut self) {
-        if self.memo_mtime_ns != self.status.mtime_ns {
-            self.left_memo.clear();
-            self.trend_memo.clear();
-            self.sparkline_memo = None;
-            self.memo_mtime_ns = self.status.mtime_ns;
-        }
-    }
-
-    fn refresh_left(&mut self, conn: &Connection, state: &AppState, filter: &QueryFilter) {
-        // Sessions section at root shows `SessionRow` data in the main pane, not `LeftRow`.
-        if state.current_section == Section::Sessions && !state.drill_active() {
-            match load_sessions_for(conn, Section::Sessions, None, filter.clone()) {
-                Ok(rows) => {
-                    self.sessions = rows;
-                    sort_session_rows(&mut self.sessions, state.sort);
-                    self.left.clear();
-                    self.clear_refresh_error(RefreshScope::Sessions);
-                    self.clear_refresh_error(RefreshScope::Left);
-                }
-                Err(err) => self.set_refresh_error(RefreshScope::Sessions, err),
-            }
-            return;
-        }
-
-        let key = LeftMemoKey(
-            state.current_section,
-            state.time_window,
-            state.source_filter,
-            state.trend_granularity,
-        );
-        if let Some(cached) = self.left_memo.get(&key) {
-            self.left = cached.clone();
-            sort_left_rows(&mut self.left, state.current_section, state.sort);
-            self.clear_refresh_error(RefreshScope::Left);
-            return;
-        }
-
-        match load_left_axis(
-            conn,
-            state.current_section,
-            filter.clone(),
-            state.trend_granularity,
-        ) {
-            Ok(rows) => {
-                self.left = rows;
-                self.left_memo.insert(key, self.left.clone());
-                sort_left_rows(&mut self.left, state.current_section, state.sort);
-                self.clear_refresh_error(RefreshScope::Left);
-            }
-            Err(err) => self.set_refresh_error(RefreshScope::Left, err),
-        }
-    }
-
-    fn refresh_sessions(&mut self, conn: &Connection, state: &AppState, filter: &QueryFilter) {
-        if matches!(
-            state.deepest_drill().map(|d| d.kind),
-            Some(DrillKind::Events { .. })
-        ) {
-            return;
-        }
-
-        if state.current_section == Section::Sessions && !state.drill_active() {
-            return;
-        }
-
-        let (scope_section, sel_key): (Section, Option<String>) = match state.deepest_drill() {
-            Some(d) => match d.kind {
-                DrillKind::Sessions { from_section } => (from_section, Some(d.key.clone())),
-                DrillKind::Events { .. } => {
-                    (state.current_section, left_selected_key(state, &self.left))
-                }
-            },
-            None => (state.current_section, left_selected_key(state, &self.left)),
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<QueryScope> {
+        let mut current = base_filter(state, now)?;
+        current.roots = self.source_roots.clone();
+        let Some(drill) = state.deepest_drill() else {
+            return Ok(current);
         };
+        let mut scope = drill.scope.clone();
+        scope.roots = current.roots;
+        scope.intersect_time(current.since_ms, current.until_ms);
+        if !matches!(drill.kind, DrillKind::Events { .. }) {
+            scope.source = current.source;
+        }
+        Ok(scope)
+    }
 
-        match load_sessions_for(conn, scope_section, sel_key.as_deref(), filter.clone()) {
-            Ok(rows) => {
-                self.sessions = rows;
-                sort_session_rows(&mut self.sessions, state.sort);
-                self.clear_refresh_error(RefreshScope::Sessions);
+    /// Publish a complete snapshot only after every query for the view succeeds.
+    pub(crate) fn refresh_at(&mut self, store: &Store, state: &AppState, now: DateTime<Utc>) {
+        match crate::calendar::Calendar::system() {
+            Ok(calendar) => self.last_attempt_day = Some(calendar.local_date(now)),
+            Err(error) => {
+                self.refresh_error = Some(RefreshError::new(RefreshScope::Status, error));
+                return;
             }
-            Err(err) => self.set_refresh_error(RefreshScope::Sessions, err),
+        }
+        let mut next = self.clone();
+        match store.read_snapshot(|store| {
+            next.load_snapshot(store, state, now)
+                .map_err(anyhow::Error::new)
+        }) {
+            Ok(()) => {
+                next.loaded_state = Some(state.clone());
+                next.refresh_error = None;
+                *self = next;
+            }
+            Err(error) => {
+                self.refresh_error = Some(
+                    error
+                        .downcast_ref::<RefreshError>()
+                        .cloned()
+                        .unwrap_or_else(|| RefreshError::new(RefreshScope::Status, error)),
+                );
+            }
         }
     }
 
-    fn refresh_events(&mut self, conn: &Connection, state: &AppState, filter: &QueryFilter) {
-        match state.deepest_drill() {
-            Some(d) => match d.kind {
-                DrillKind::Events { source } => {
-                    match load_events_for(conn, source, &d.key, filter.clone()) {
-                        Ok(rows) => {
-                            self.events = rows;
-                            sort_event_rows(&mut self.events, state.sort);
-                            self.clear_refresh_error(RefreshScope::Events);
-                        }
-                        Err(err) => self.set_refresh_error(RefreshScope::Events, err),
-                    }
-                }
-                _ => {
-                    self.events.clear();
-                    self.clear_refresh_error(RefreshScope::Events);
-                }
-            },
+    pub(crate) fn calendar_changed(&self, now: DateTime<Utc>) -> bool {
+        crate::calendar::Calendar::system()
+            .is_ok_and(|calendar| self.last_attempt_day != Some(calendar.local_date(now)))
+    }
+
+    pub(crate) fn restore_loaded_state(&self, state: &mut AppState) {
+        if let (Some(error), Some(loaded)) = (&self.refresh_error, &self.loaded_state) {
+            *state = loaded.clone();
+            state.flash = Some(format!(
+                "{} · showing previous scope",
+                error.display_message()
+            ));
+        }
+    }
+
+    pub(crate) fn remember_state(&mut self, state: &AppState) {
+        if self.loaded_state.is_some() || self.refresh_error.is_none() {
+            self.loaded_state = Some(state.clone());
+        }
+    }
+
+    fn load_snapshot(
+        &mut self,
+        store: &Store,
+        state: &AppState,
+        now: DateTime<Utc>,
+    ) -> Result<(), RefreshError> {
+        let status = load_cache_status(store, now)
+            .map_err(|e| RefreshError::new(RefreshScope::Status, e))?;
+        let day = crate::calendar::Calendar::system()
+            .map_err(|e| RefreshError::new(RefreshScope::Status, e))?
+            .local_date(now);
+        if self.memo_generation != Some(status.generation)
+            || self.memo_day != Some(day)
+            || self
+                .loaded_scope
+                .as_ref()
+                .is_some_and(|scope| scope.roots != self.source_roots)
+        {
+            self.clear_memos();
+        }
+        self.memo_generation = Some(status.generation);
+        self.memo_day = Some(day);
+        self.status = status;
+        let scope = self
+            .scope_for(state, now)
+            .map_err(|e| RefreshError::new(RefreshScope::Left, e))?;
+        self.loaded_scope = Some(scope.clone());
+        match state.deepest_drill().map(|d| d.kind) {
+            Some(DrillKind::Events { source }) => {
+                let drill = state.deepest_drill().unwrap();
+                self.events = load_events_for(store, source, &drill.key, scope.clone())
+                    .map_err(|e| RefreshError::new(RefreshScope::Events, e))?;
+            }
+            Some(DrillKind::Sessions { .. }) => {
+                self.sessions = load_sessions_for(store, scope.clone())
+                    .map_err(|e| RefreshError::new(RefreshScope::Sessions, e))?;
+            }
+            None if state.current_section == Section::Sessions => {
+                self.sessions = load_sessions_for(store, scope.clone())
+                    .map_err(|e| RefreshError::new(RefreshScope::Sessions, e))?;
+                self.left.clear();
+            }
+            None if state.is_provider_view() => {}
             None => {
-                self.events.clear();
-                self.clear_refresh_error(RefreshScope::Events);
+                let key = LeftMemoKey(
+                    state.current_section,
+                    state.time_window,
+                    state.source_filter,
+                    state.trend_granularity,
+                );
+                self.left = match self.left_memo.get(&key) {
+                    Some(rows) => rows.clone(),
+                    None => {
+                        let rows = load_left_axis(
+                            store,
+                            state.current_section,
+                            scope.clone(),
+                            state.trend_granularity,
+                        )
+                        .map_err(|e| RefreshError::new(RefreshScope::Left, e))?;
+                        self.left_memo.insert(key, rows.clone());
+                        rows
+                    }
+                };
             }
         }
-    }
-
-    fn refresh_sparkline(&mut self, conn: &Connection) {
-        self.sparkline = match self.sparkline_memo.as_ref() {
-            Some(cached) => {
-                let rows = cached.clone();
-                self.clear_refresh_error(RefreshScope::Sparkline);
-                rows
-            }
-            None => match load_sparkline(conn, 30) {
-                Ok(fresh) => {
-                    self.sparkline_memo = Some(fresh.clone());
-                    self.clear_refresh_error(RefreshScope::Sparkline);
-                    fresh
-                }
-                Err(err) => {
-                    self.set_refresh_error(RefreshScope::Sparkline, err);
-                    self.sparkline.clone()
-                }
-            },
-        };
-    }
-
-    fn refresh_trend(&mut self, conn: &Connection, state: &AppState, now: DateTime<Utc>) {
         let key = TrendMemoKey(
             state.time_window,
             state.source_filter,
             state.trend_granularity,
         );
         self.trend = match self.trend_memo.get(&key) {
-            Some(cached) => {
-                let rows = cached.clone();
-                self.clear_refresh_error(RefreshScope::Trend);
+            Some(rows) => rows.clone(),
+            None => {
+                let mut trend_scope = base_filter(state, now)
+                    .map_err(|e| RefreshError::new(RefreshScope::Trend, e))?;
+                trend_scope.roots = self.source_roots.clone();
+                let rows = load_trend(store, state, now, trend_scope)
+                    .map_err(|e| RefreshError::new(RefreshScope::Trend, e))?;
+                self.trend_memo.insert(key, rows.clone());
                 rows
             }
-            None => match load_trend(conn, state, now) {
-                Ok(fresh) => {
-                    self.trend_memo.insert(key, fresh.clone());
-                    self.clear_refresh_error(RefreshScope::Trend);
-                    fresh
-                }
-                Err(err) => {
-                    self.set_refresh_error(RefreshScope::Trend, err);
-                    self.trend.clone()
-                }
-            },
         };
+        if self.sparkline_scope.as_ref() != Some(&scope) || self.sparkline_memo.is_none() {
+            let rows = scoped_sparkline(store, scope.clone(), 30)
+                .map_err(|e| RefreshError::new(RefreshScope::Sparkline, e))?;
+            self.sparkline_memo = Some(rows);
+            self.sparkline_scope = Some(scope);
+        }
+        self.sparkline = self.sparkline_memo.clone().unwrap_or_default();
+        Ok(())
     }
 }
