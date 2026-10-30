@@ -190,8 +190,6 @@ pub fn run() -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema::DDL;
-    use rusqlite::Connection;
 
     #[test]
     fn severity_status_uses_highest_check() {
@@ -217,72 +215,6 @@ mod tests {
             },
         };
         assert_eq!(report.status, CheckSeverity::Warn);
-    }
-
-    #[test]
-    fn missing_cache_is_warning_and_not_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.db");
-        let err = checks::inspect_cache(&path).unwrap_err();
-        assert_eq!(err.severity, CheckSeverity::Warn);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn newer_schema_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '999');",
-        )
-        .unwrap();
-        drop(conn);
-
-        let error = checks::inspect_cache(&path).unwrap_err();
-        assert!(error.message.contains("newer"));
-        assert_eq!(error.severity, CheckSeverity::Error);
-    }
-
-    #[test]
-    fn missing_table_is_an_inspection_error_not_zero_events() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(DDL).unwrap();
-        conn.execute(
-            "INSERT INTO meta VALUES('schema_version', ?)",
-            [crate::store::schema::SCHEMA_VERSION.to_string()],
-        )
-        .unwrap();
-        conn.execute_batch("DROP TABLE events;").unwrap();
-        drop(conn);
-        let error = checks::inspect_cache(&path).unwrap_err();
-        assert_eq!(error.severity, CheckSeverity::Error);
-        assert!(error.message.contains("could not inspect events"));
-        assert!(error
-            .details
-            .iter()
-            .any(|detail| detail.contains("no such table")));
-    }
-
-    #[test]
-    fn unknown_priced_models_ignore_cursor() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(DDL).unwrap();
-        conn.execute(
-            "INSERT INTO events
-             (file_path, source, ts, day, month, session_id, project_path, repo, model,
-              input, output, cache_read, cache_write, cost_usd)
-             VALUES
-             ('/a', 'claude', 1, '2026-04-01', '2026-04', 's1', NULL, NULL, 'mystery', 1, 0, 0, 0, 0),
-             ('/b', 'cursor', 1, '2026-04-01', '2026-04', 's2', NULL, NULL, 'composer-1', 1, 0, 0, 0, 1)",
-            [],
-        )
-        .unwrap();
-        let unknown = checks::unknown_priced_models(&conn).unwrap();
-        assert_eq!(unknown, vec!["mystery"]);
     }
 
     #[test]

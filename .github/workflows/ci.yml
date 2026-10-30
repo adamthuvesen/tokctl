@@ -52,7 +52,11 @@ jobs:
 
       - name: Install just
         run: cargo install just --locked --version 1.45.0
-      - name: Verify
+      - name: Check
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.rust-version.outputs.version }}
         run: just check
+      - name: Verify
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.rust-version.outputs.version }}
+        run: just verify

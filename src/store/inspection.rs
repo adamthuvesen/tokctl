@@ -1,3 +1,4 @@
+use super::Store;
 use crate::paths::{
     cursor_credentials_path, default_claude_roots, default_codex_roots, default_cursor_roots,
     resolve_roots, tokscale_cursor_credentials_path, ResolveInput,
@@ -6,7 +7,7 @@ use crate::pricing;
 use crate::store::schema::SCHEMA_VERSION;
 use crate::types::Source;
 use anyhow::Result;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 use crate::doctor::{CheckSeverity, DoctorCheck};
@@ -142,18 +143,18 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
         .action("run tokctl daily or another cached report to create the cache"));
     }
 
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|err| {
-            DoctorCheck::new(
-                "cache",
-                CheckSeverity::Error,
-                format!("could not open cache at {}", path.display()),
-            )
-            .details(vec![err.to_string()])
-        })?;
+    let store = Store::open_for_inspection(path).map_err(|err| {
+        DoctorCheck::new(
+            "cache",
+            CheckSeverity::Error,
+            format!("could not open cache at {}", path.display()),
+        )
+        .details(vec![err.to_string()])
+    })?;
+    let conn = store.connection();
 
     let mut checks = Vec::new();
-    let schema_version = read_schema_version(&conn);
+    let schema_version = read_schema_version(conn);
     match schema_version {
         Some(SCHEMA_VERSION) => checks.push(DoctorCheck::new(
             "cache",
@@ -189,7 +190,7 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
     }
 
     let read_count = |table| {
-        count_table(&conn, table).map_err(|error| {
+        count_table(conn, table).map_err(|error| {
             DoctorCheck::new(
                 "cache",
                 CheckSeverity::Error,
@@ -221,7 +222,7 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
         }),
     );
 
-    if let Some(max_mtime) = max_file_mtime_ns(&conn) {
+    if let Some(max_mtime) = max_file_mtime_ns(conn) {
         checks.push(DoctorCheck::new(
             "cache",
             CheckSeverity::Ok,
@@ -232,7 +233,7 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
         ));
     }
 
-    if !table_exists(&conn, "events") {
+    if !table_exists(conn, "events") {
         checks.push(
             DoctorCheck::new(
                 "pricing",
@@ -242,7 +243,7 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
             .action("run tokctl daily --rebuild"),
         );
     } else {
-        let unknown = unknown_priced_models(&conn)?;
+        let unknown = unknown_priced_models(conn)?;
         if unknown.is_empty() {
             checks.push(DoctorCheck::new(
                 "pricing",
@@ -266,7 +267,7 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
     }
 
     if schema_version == Some(SCHEMA_VERSION) {
-        let provenance = crate::store::db::provenance_status(&conn).map_err(|error| {
+        let provenance = crate::store::db::provenance_status(conn).map_err(|error| {
             DoctorCheck::new(
                 "provenance",
                 CheckSeverity::Error,
@@ -415,5 +416,77 @@ pub(crate) fn cursor_sync_check() -> DoctorCheck {
             .details(details)
             .action("repair the local credential file, then run tokctl cursor login")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::schema::DDL;
+
+    #[test]
+    fn missing_cache_is_warning_and_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let err = inspect_cache(&path).unwrap_err();
+        assert_eq!(err.severity, CheckSeverity::Warn);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn newer_schema_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '999');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = inspect_cache(&path).unwrap_err();
+        assert!(error.message.contains("newer"));
+        assert_eq!(error.severity, CheckSeverity::Error);
+    }
+
+    #[test]
+    fn missing_table_is_an_inspection_error_not_zero_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(DDL).unwrap();
+        conn.execute(
+            "INSERT INTO meta VALUES('schema_version', ?)",
+            [crate::store::schema::SCHEMA_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE events;").unwrap();
+        drop(conn);
+        let error = inspect_cache(&path).unwrap_err();
+        assert_eq!(error.severity, CheckSeverity::Error);
+        assert!(error.message.contains("could not inspect events"));
+        assert!(error
+            .details
+            .iter()
+            .any(|detail| detail.contains("no such table")));
+    }
+
+    #[test]
+    fn unknown_priced_models_ignore_cursor() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        conn.execute(
+            "INSERT INTO events
+             (file_path, source, ts, day, month, session_id, project_path, repo, model,
+              input, output, cache_read, cache_write, cost_usd)
+             VALUES
+             ('/a', 'claude', 1, '2026-04-01', '2026-04', 's1', NULL, NULL, 'mystery', 1, 0, 0, 0, 0),
+             ('/b', 'cursor', 1, '2026-04-01', '2026-04', 's2', NULL, NULL, 'composer-1', 1, 0, 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        let unknown = unknown_priced_models(&conn).unwrap();
+        assert_eq!(unknown, vec!["mystery"]);
     }
 }

@@ -30,10 +30,19 @@ fn same_snapshot(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
-fn read_snapshot<T>(path: &Path, parse: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
+fn read_snapshot<T>(
+    path: &Path,
+    expected: Option<&crate::discovery::DiscoveredFile>,
+    parse: impl FnOnce(&mut File) -> Result<T>,
+) -> Result<T> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "{} is not a regular file", path.display());
+    anyhow::ensure!(
+        expected.is_none_or(|expected| expected.matches_metadata(&before)),
+        "{} changed since discovery",
+        path.display()
+    );
     let result = parse(&mut file).with_context(|| format!("reading {}", path.display()))?;
     let after = file.metadata()?;
     let current =
@@ -44,6 +53,20 @@ fn read_snapshot<T>(path: &Path, parse: impl FnOnce(&mut File) -> Result<T>) -> 
         path.display()
     );
     Ok(result)
+}
+
+pub fn parse_discovered_file(file: &crate::discovery::DiscoveredFile) -> Result<ParseResult> {
+    read_snapshot(&file.path, Some(file), |reader| match file.source {
+        crate::types::Source::Claude => parse_jsonl(reader, file.project.as_deref(), false),
+        crate::types::Source::Codex => parse_jsonl(reader, None, true),
+        crate::types::Source::Cursor => {
+            let (events, skipped_lines) = parse_cursor_reader(reader, &file.path)?;
+            Ok(ParseResult {
+                events,
+                skipped_lines,
+            })
+        }
+    })
 }
 
 fn parse_jsonl(reader: impl Read, project: Option<&str>, codex: bool) -> Result<ParseResult> {
@@ -103,15 +126,15 @@ fn parse_jsonl(reader: impl Read, project: Option<&str>, codex: bool) -> Result<
 }
 
 pub fn parse_claude_file(path: &Path, project: Option<&str>) -> Result<ParseResult> {
-    read_snapshot(path, |file| parse_jsonl(file, project, false))
+    read_snapshot(path, None, |file| parse_jsonl(file, project, false))
 }
 
 pub fn parse_codex_file(path: &Path) -> Result<ParseResult> {
-    read_snapshot(path, |file| parse_jsonl(file, None, true))
+    read_snapshot(path, None, |file| parse_jsonl(file, None, true))
 }
 
 pub fn parse_cursor_file(path: &Path) -> Result<ParseResult> {
-    read_snapshot(path, |file| {
+    read_snapshot(path, None, |file| {
         let (events, skipped_lines) = parse_cursor_reader(file, path)?;
         Ok(ParseResult {
             events,

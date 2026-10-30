@@ -56,6 +56,7 @@ Use `tokctl demo --cache-dir /tmp/tokctl-demo --overwrite` to seed the same synt
 
 - Prices come from a static table in `src/pricing.rs`; unknown Claude/Codex models are shown as `$0` with a warning.
 - Cursor costs come from local CSV exports when present.
+- Codex reports use cumulative counter deltas to avoid counting repeated notifications. Legacy records without counters use latest-request values.
 - Repo attribution depends on paths in local logs and nearest `.git` directories.
 - `--demo` and the README screenshot use synthetic data only. They do not read personal logs.
 
@@ -101,7 +102,7 @@ tokctl cursor status   # check what's cached and when it was synced
 tokctl cursor sync     # pull latest CSVs into the local cache
 ```
 
-Normal reports and UI runs refresh Cursor automatically when credentials are configured and Cursor is included. `--source claude` or `--source codex` skips Cursor sync. If sync fails, a warning explains the failure and ingest uses the last valid local exports. Downloads must pass CSV validation before they replace cached files.
+Normal reports and UI runs refresh Cursor automatically when credentials are configured and Cursor is included. `--source claude` or `--source codex` skips Cursor sync. If sync fails, a warning explains the failure and ingest uses the last valid local exports. The dashboard retains this warning during navigation. Downloads must pass CSV validation before they replace cached files.
 
 ---
 
@@ -180,15 +181,17 @@ just                    # list commands
 just test sources::     # focused tests
 just verify-cli         # CLI and query contracts
 just verify-ui          # TUI tests and a real PTY run
-just check              # same complete check used by CI
+just check              # fast lane, same as pre-commit and the first CI step
+just verify             # slow lane: no-default-features tests, release build
 just bench /path/to/cache.db
 ```
 
 CI runs on Linux and macOS, including the declared minimum Rust version.
-`just check` runs formatting, strict clippy, tests with and without clipboard support, and a release build.
+`just check` runs formatting, strict clippy for both feature sets, and the test suite. `just verify` adds tests without clipboard support and a release build.
 `--no-cache` avoids the persistent report database. Configured Cursor sync can still update its local CSV export cache.
 
 The refresh benchmark requires an explicit nonempty cache with current provenance. Query errors fail the benchmark.
 
+Read [the latest verification report](docs/review/excellence-reassessment.md) for evidence and remaining limits.
 Read [the architecture guide](docs/architecture.md) for ownership, compatibility, and change navigation.
 Tests isolate home directories and use synthetic data. They do not verify live Cursor access or physical clipboard behavior.

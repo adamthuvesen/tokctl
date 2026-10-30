@@ -1,3 +1,6 @@
+// These tests corrupt or observe caches from outside, like another process would.
+#![allow(clippy::disallowed_types)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokctl::ingest::run::{run_ingest, RunIngestOptions};
@@ -331,4 +334,217 @@ fn normal_ingestion_and_rebuild_remove_demo_overwrite_authority() {
             .unwrap();
         assert_eq!(markers, 0);
     }
+}
+
+#[test]
+fn complete_other_provider_root_cannot_purge_unavailable_source() {
+    let workspace = tempfile::tempdir().unwrap();
+    let shared = root(&workspace, "shared");
+    let claude_root = shared.join("claude");
+    fs::create_dir(&claude_root).unwrap();
+    fs::write(claude_root.join("a.jsonl"), claude("a", 7)).unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    run_ingest(&mut store, options(&claude_root, Source::Claude)).unwrap();
+    fs::rename(&claude_root, workspace.path().join("offline")).unwrap();
+    let mut opts = options(&claude_root, Source::Claude);
+    opts.source = None;
+    opts.cursor_roots = vec![shared];
+    let stats = run_ingest(&mut store, opts).unwrap();
+    assert_eq!(stats.files_purged, 0);
+    assert_eq!(
+        event_rows(&store, QueryScope::default()).unwrap()[0].input,
+        7
+    );
+}
+
+#[test]
+fn conflicting_provider_claims_fail_before_any_ingest_mutation() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "shared");
+    let file = root.join("a.jsonl");
+    fs::write(&file, claude("a", 7)).unwrap();
+    let db = workspace.path().join("cache.db");
+    let mut store = Store::open(&db).unwrap();
+    let observer = rusqlite::Connection::open(&db).unwrap();
+    let mut opts = options(&root, Source::Claude);
+    opts.source = None;
+    opts.codex_roots = vec![root.clone()];
+    assert!(run_ingest(&mut store, opts).is_err());
+    let files: i64 = observer
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(files, 0);
+    run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    observer
+        .execute(
+            "INSERT INTO meta(key,value) VALUES('demo_marker','synthetic')",
+            [],
+        )
+        .unwrap();
+    observer
+        .execute(
+            "UPDATE meta SET value='stale' WHERE key='pricing_signature'",
+            [],
+        )
+        .unwrap();
+    let before: String = observer.query_row("SELECT group_concat(key || '=' || value, '|') FROM (SELECT key,value FROM meta ORDER BY key)", [], |r| r.get(0)).unwrap();
+    let error = run_ingest(&mut store, options(&root, Source::Codex))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(file.to_str().unwrap()), "{error}");
+    assert!(
+        error.contains("claude") && error.contains("codex"),
+        "{error}"
+    );
+    assert!(error.contains("rebuild"), "{error}");
+    let after: String = observer.query_row("SELECT group_concat(key || '=' || value, '|') FROM (SELECT key,value FROM meta ORDER BY key)", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, after);
+    let input: i64 = observer
+        .query_row("SELECT input FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(input, 7);
+}
+
+#[test]
+fn malformed_only_replacement_preserves_nonempty_valid_snapshot() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "claude");
+    let file = root.join("a.jsonl");
+    fs::write(&file, claude("a", 7)).unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    fs::write(&file, "{malformed}\n").unwrap();
+    let stats = run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    assert_eq!(stats.file_errors, 1);
+    assert_eq!(stats.files_full_parsed, 0);
+    assert_eq!(
+        event_rows(&store, QueryScope::default()).unwrap()[0].input,
+        7
+    );
+    assert_eq!(
+        run_ingest(&mut store, options(&root, Source::Claude))
+            .unwrap()
+            .file_errors,
+        1
+    );
+}
+
+#[test]
+fn atomic_equal_size_equal_mtime_replacement_reparses() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "claude");
+    let file = root.join("a.jsonl");
+    fs::write(&file, claude("a", 3)).unwrap();
+    let modified = fs::metadata(&file).unwrap().modified().unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    let replacement = root.join("replacement");
+    fs::write(&replacement, claude("a", 7)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    fs::rename(replacement, &file).unwrap();
+    let stats = run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    assert_eq!(stats.files_full_parsed, 1);
+    assert_eq!(
+        event_rows(&store, QueryScope::default()).unwrap()[0].input,
+        7
+    );
+}
+
+#[test]
+fn discovered_snapshot_cannot_publish_a_different_equal_mtime_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "claude");
+    let file = root.join("a.jsonl");
+    fs::write(&file, claude("a", 3)).unwrap();
+    let modified = fs::metadata(&file).unwrap().modified().unwrap();
+    let discovered = tokctl::discovery::discover_claude(std::slice::from_ref(&root))
+        .files
+        .remove(0);
+    let replacement = root.join("replacement");
+    fs::write(&replacement, claude("a", 7)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    fs::rename(replacement, &file).unwrap();
+    assert!(tokctl::ingest::file_range::parse_discovered_file(&discovered).is_err());
+}
+
+#[test]
+fn schema_seven_snapshots_reparse_when_identity_is_unknown() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "claude");
+    fs::write(root.join("a.jsonl"), claude("a", 3)).unwrap();
+    let db = workspace.path().join("cache.db");
+    let mut store = Store::open(&db).unwrap();
+    run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    drop(store);
+    let legacy = rusqlite::Connection::open(&db).unwrap();
+    legacy.execute_batch("ALTER TABLE files DROP COLUMN file_identity; ALTER TABLE files DROP COLUMN ctime_ns; DROP TABLE source_roots; UPDATE meta SET value='7' WHERE key='schema_version';").unwrap();
+    drop(legacy);
+    let mut store = Store::open(&db).unwrap();
+    assert_eq!(
+        event_rows(&store, QueryScope::default()).unwrap()[0].input,
+        3
+    );
+    let stats = run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    assert_eq!(stats.files_full_parsed, 1);
+    assert_eq!(
+        run_ingest(&mut store, options(&root, Source::Claude))
+            .unwrap()
+            .files_skipped,
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn persisted_symlink_roots_keep_offline_reports_in_the_original_scope() {
+    let workspace = tempfile::tempdir().unwrap();
+    let actual = root(&workspace, "actual");
+    fs::write(actual.join("a.jsonl"), claude("a", 7)).unwrap();
+    let alias = workspace.path().join("alias");
+    std::os::unix::fs::symlink(&actual, &alias).unwrap();
+    let db = workspace.path().join("cache.db");
+    let mut store = Store::open(&db).unwrap();
+    let resolved = store
+        .resolve_source_roots(Source::Claude, std::slice::from_ref(&alias))
+        .unwrap();
+    assert_eq!(resolved, vec![actual.clone()]);
+    run_ingest(&mut store, options(&resolved[0], Source::Claude)).unwrap();
+    drop(store);
+    fs::rename(&actual, workspace.path().join("offline")).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let resolved = store
+        .resolve_source_roots(Source::Claude, std::slice::from_ref(&alias))
+        .unwrap();
+    assert_eq!(resolved, vec![actual]);
+    let stats = run_ingest(&mut store, options(&resolved[0], Source::Claude)).unwrap();
+    assert_eq!(stats.file_errors, 1);
+    assert_eq!(stats.files_purged, 0);
+    assert_eq!(
+        event_rows(
+            &store,
+            QueryScope {
+                roots: Some(resolved),
+                ..Default::default()
+            }
+        )
+        .unwrap()[0]
+            .input,
+        7
+    );
+    assert_eq!(
+        store
+            .resolve_source_roots(Source::Codex, std::slice::from_ref(&alias))
+            .unwrap(),
+        vec![alias]
+    );
 }

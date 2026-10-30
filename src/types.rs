@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,7 +86,6 @@ pub struct IngestStats {
     pub file_errors: usize,
     pub events_inserted: usize,
     pub skipped_lines: usize,
-    pub unknown_models: HashSet<String>,
     /// Distinct repo keys upserted during the run.
     pub repos_resolved: usize,
     /// Events inserted with `repo IS NULL` (no resolvable git ancestor).

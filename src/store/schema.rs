@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS files (
   project     TEXT,
   size        INTEGER NOT NULL,
   mtime_ns    INTEGER NOT NULL,
+  file_identity TEXT,
+  ctime_ns    INTEGER,
   last_offset INTEGER NOT NULL DEFAULT 0,
   n_events    INTEGER NOT NULL DEFAULT 0,
   session_id  TEXT,
@@ -46,6 +48,13 @@ CREATE TABLE IF NOT EXISTS parser_provenance (
 CREATE TABLE IF NOT EXISTS ingest_diagnostics (
   file_path TEXT PRIMARY KEY,
   skipped_records INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_roots (
+  source TEXT NOT NULL,
+  requested_path TEXT NOT NULL,
+  canonical_path TEXT NOT NULL,
+  PRIMARY KEY(source, requested_path)
 );
 
 CREATE TABLE IF NOT EXISTS repos (

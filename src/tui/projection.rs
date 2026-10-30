@@ -13,6 +13,8 @@ pub struct VisibleRows {
     pub trend: Vec<TrendRow>,
     pub sparkline: Vec<f64>,
     pub status: CacheStatus,
+    pub diagnostics: crate::store::queries::ReportDiagnostics,
+    pub cursor_sync_failure: Option<String>,
     pub refresh_error: Option<RefreshError>,
 }
 
@@ -21,6 +23,8 @@ impl DataCache {
     pub fn visible(&self, state: &AppState) -> VisibleRows {
         let mut visible = VisibleRows {
             status: self.status.clone(),
+            diagnostics: self.diagnostics.clone(),
+            cursor_sync_failure: self.cursor_sync_failure.clone(),
             refresh_error: self.refresh_error.clone(),
             sparkline: self.sparkline.clone(),
             ..VisibleRows::default()

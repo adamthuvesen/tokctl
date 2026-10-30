@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use std::io::{self, Write};
 
 use super::pipeline::{
-    finish_cached_warnings, maybe_sync_cursor, prepare_run, query_scope, resolve_root_dirs,
-    sync_cursor_if_needed, CachedRun, SourceScope,
+    prepare_run, query_scope, resolve_root_dirs, sync_cursor_if_needed, CachedRun, SourceScope,
 };
 use super::{
     CompareArgs, CursorArgs, CursorCommands, CursorLoginArgs, DemoArgs, DoctorArgs, GroupBy,
@@ -21,8 +19,9 @@ use crate::render::{
     render_json, render_repo_json, render_repo_table, render_table, render_warnings,
 };
 use crate::store::queries::{
-    daily_report, monthly_report, repo_report,
+    daily_report, monthly_report, repo_report, report_diagnostics, report_diagnostics_for_scopes,
     resolve_repo_filter_scoped as resolve_repo_filter_cached, session_report, QueryFilter,
+    ReportDiagnostics,
 };
 use crate::types::{AggregateRow, ReportKind};
 
@@ -53,12 +52,14 @@ pub(super) fn run_report(kind: ReportKind, args: ReportArgs) -> Result<()> {
     let source = SourceArg::parse(&args.source)?;
     let scope = source_scope(source);
     validate_date_range(args.since.as_deref(), args.until.as_deref())?;
-    sync_cursor_if_needed(scope, args.cursor_dir.as_deref())?;
+    if let Some(warning) = sync_cursor_if_needed(scope, args.cursor_dir.as_deref())? {
+        eprintln!("warning: {warning}");
+    }
     let roots = resolve_root_dirs(
         args.claude_dir.as_deref(),
         args.codex_dir.as_deref(),
         args.cursor_dir.as_deref(),
-    );
+    )?;
 
     run_report_cached(group, source, scope, roots, args)
 }
@@ -79,29 +80,44 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
         chrono::Utc::now(),
     )?;
     let dimensions = args.by.dimensions();
-    sync_cursor_if_needed(scope, args.cursor_dir.as_deref())?;
-    let roots = resolve_root_dirs(
+    if let Some(warning) = sync_cursor_if_needed(scope, args.cursor_dir.as_deref())? {
+        eprintln!("warning: {warning}");
+    }
+    let mut roots = resolve_root_dirs(
         args.claude_dir.as_deref(),
         args.codex_dir.as_deref(),
         args.cursor_dir.as_deref(),
-    );
+    )?;
 
-    let CachedRun { conn, stats } = prepare_run(scope, &roots, args.rebuild, args.no_cache)?;
-    let mut filter = query_scope(scope, &roots);
-    filter.repo = args
-        .repo
-        .as_deref()
-        .map(|name| resolve_repo_filter_cached(&conn, name, &query_scope(scope, &roots)))
-        .transpose()?;
-    let report = compare::compare_from_db(&conn, windows, filter.clone(), &dimensions, args.top)?;
-    let (unknown, skipped, errors) = finish_cached_warnings(&conn, &stats, filter)?;
-    emit_warnings(&unknown, skipped, errors);
-
-    let body = if args.json {
-        compare::render_json(&report)
-    } else {
-        compare::render_human(&report)
-    };
+    let CachedRun { conn, stats } = prepare_run(scope, &mut roots, args.rebuild, args.no_cache)?;
+    let (body, diagnostics) = conn.read_snapshot(|conn| {
+        let mut filter = query_scope(scope, &roots);
+        filter.repo = args
+            .repo
+            .as_deref()
+            .map(|name| resolve_repo_filter_cached(conn, name, &filter))
+            .transpose()?;
+        let diagnostic_scopes = [&windows.current, &windows.baseline]
+            .into_iter()
+            .map(|window| {
+                Ok(QueryFilter {
+                    since_ms: parse_since(Some(&window.start))?.map(|date| date.timestamp_millis()),
+                    until_ms: parse_until(Some(&window.end))?.map(|date| date.timestamp_millis()),
+                    ..filter.clone()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let report = compare::compare_from_db(conn, windows, filter, &dimensions, args.top)?;
+        let mut diagnostics = report_diagnostics_for_scopes(conn, &diagnostic_scopes)?;
+        diagnostics.current_file_errors = stats.file_errors;
+        let body = if args.json {
+            compare::render_json(&report)
+        } else {
+            compare::render_human(&report)
+        };
+        Ok((body, diagnostics))
+    })?;
+    emit_warnings(&diagnostics);
     writeln!(io::stdout().lock(), "{body}")?;
     Ok(())
 }
@@ -113,17 +129,16 @@ pub(super) fn run_ui(args: UiArgs) -> Result<()> {
         return crate::tui::run_with_store_path(&result.cache_path, None);
     }
 
-    maybe_sync_cursor(None)?;
-    let roots = resolve_root_dirs(None, None, None);
     let scope = SourceScope { filter: None };
-    let CachedRun { conn, stats } = prepare_run(scope, &roots, false, false)?;
-    let (unknown, skipped, errors) =
-        finish_cached_warnings(&conn, &stats, query_scope(scope, &roots))?;
-    emit_warnings(&unknown, skipped, errors);
+    let cursor_sync_failure = sync_cursor_if_needed(scope, None)?;
+    let mut roots = resolve_root_dirs(None, None, None)?;
+    let CachedRun { conn, stats } = prepare_run(scope, &mut roots, false, false)?;
     drop(conn);
-    crate::tui::run_with_store_path(
+    crate::tui::run_with_store_path_and_warnings(
         &crate::store::store_path(),
         query_scope(scope, &roots).roots,
+        stats.file_errors,
+        cursor_sync_failure,
     )
 }
 
@@ -229,39 +244,38 @@ pub(super) fn run_repo(args: RepoArgs) -> Result<()> {
     validate_date_range(args.since.as_deref(), args.until.as_deref())?;
     let since = parse_since(args.since.as_deref())?;
     let until = parse_until(args.until.as_deref())?;
-    sync_cursor_if_needed(scope, args.cursor_dir.as_deref())?;
-    let roots = resolve_root_dirs(
+    if let Some(warning) = sync_cursor_if_needed(scope, args.cursor_dir.as_deref())? {
+        eprintln!("warning: {warning}");
+    }
+    let mut roots = resolve_root_dirs(
         args.claude_dir.as_deref(),
         args.codex_dir.as_deref(),
         args.cursor_dir.as_deref(),
-    );
+    )?;
 
-    let CachedRun { conn, stats } = prepare_run(scope, &roots, args.rebuild, args.no_cache)?;
-    let mut filter = QueryFilter {
-        ..query_scope(scope, &roots)
-    };
-    filter.since_ms = since.map(|t| t.timestamp_millis());
-    filter.until_ms = until.map(|t| t.timestamp_millis());
-
-    match args.name.as_deref() {
-        None => {
-            let rows = repo_report(&conn, filter)?;
-            emit_repo(&rows, args.json)?;
+    let CachedRun { conn, stats } = prepare_run(scope, &mut roots, args.rebuild, args.no_cache)?;
+    let (body, diagnostics) = conn.read_snapshot(|conn| {
+        let mut filter = QueryFilter {
+            since_ms: since.map(|date| date.timestamp_millis()),
+            until_ms: until.map(|date| date.timestamp_millis()),
+            ..query_scope(scope, &roots)
+        };
+        if let Some(name) = args.name.as_deref() {
+            filter.repo = Some(resolve_repo_filter_cached(conn, name, &filter)?);
         }
-        Some(name) => {
-            filter.repo = Some(resolve_repo_filter_cached(
-                &conn,
-                name,
-                &query_scope(scope, &roots),
-            )?);
-            let rows = session_report(&conn, filter)?;
-            emit(&rows, ReportKind::Session, source, args.json)?;
-        }
-    }
-
-    let (unknown, skipped, errors) =
-        finish_cached_warnings(&conn, &stats, query_scope(scope, &roots))?;
-    emit_warnings(&unknown, skipped, errors);
+        let body = if args.name.is_some() {
+            let rows = session_report(conn, filter.clone())?;
+            render_report(&rows, ReportKind::Session, source, args.json)
+        } else {
+            let rows = repo_report(conn, filter.clone())?;
+            render_repos(&rows, args.json)
+        };
+        let mut diagnostics = report_diagnostics(conn, &filter)?;
+        diagnostics.current_file_errors = stats.file_errors;
+        Ok((body, diagnostics))
+    })?;
+    emit_warnings(&diagnostics);
+    writeln!(io::stdout().lock(), "{body}")?;
     Ok(())
 }
 
@@ -283,83 +297,101 @@ fn run_report_cached(
     group: GroupBy,
     source: SourceArg,
     scope: SourceScope,
-    roots: super::pipeline::RootDirs,
+    mut roots: super::pipeline::RootDirs,
     args: ReportArgs,
 ) -> Result<()> {
     validate_date_range(args.since.as_deref(), args.until.as_deref())?;
     let since = parse_since(args.since.as_deref())?;
     let until = parse_until(args.until.as_deref())?;
-    let CachedRun { conn, stats } = prepare_run(scope, &roots, args.rebuild, args.no_cache)?;
+    let CachedRun { conn, stats } = prepare_run(scope, &mut roots, args.rebuild, args.no_cache)?;
 
-    let repo_spec = match args.repo.as_deref() {
-        Some(name) => Some(resolve_repo_filter_cached(
-            &conn,
-            name,
-            &query_scope(scope, &roots),
-        )?),
-        None => None,
-    };
-
-    let filter = QueryFilter {
-        since_ms: since.map(|t| t.timestamp_millis()),
-        until_ms: until.map(|t| t.timestamp_millis()),
-        repo: repo_spec,
-        ..query_scope(scope, &roots)
-    };
-
-    match group {
-        GroupBy::Day => {
-            let rows = daily_report(&conn, filter)?;
-            emit(&rows, ReportKind::Daily, source, args.json)?;
-        }
-        GroupBy::Month => {
-            let rows = monthly_report(&conn, filter)?;
-            emit(&rows, ReportKind::Monthly, source, args.json)?;
-        }
-        GroupBy::Session => {
-            let rows = session_report(&conn, filter)?;
-            emit(&rows, ReportKind::Session, source, args.json)?;
-        }
-        GroupBy::Repo => {
-            let rows = repo_report(&conn, filter)?;
-            emit_repo(&rows, args.json)?;
-        }
-    }
-
-    let (unknown, skipped, errors) =
-        finish_cached_warnings(&conn, &stats, query_scope(scope, &roots))?;
-    emit_warnings(&unknown, skipped, errors);
+    let (body, diagnostics) = conn.read_snapshot(|conn| {
+        let mut filter = QueryFilter {
+            since_ms: since.map(|date| date.timestamp_millis()),
+            until_ms: until.map(|date| date.timestamp_millis()),
+            ..query_scope(scope, &roots)
+        };
+        filter.repo = args
+            .repo
+            .as_deref()
+            .map(|name| resolve_repo_filter_cached(conn, name, &filter))
+            .transpose()?;
+        let body = match group {
+            GroupBy::Day => render_report(
+                &daily_report(conn, filter.clone())?,
+                ReportKind::Daily,
+                source,
+                args.json,
+            ),
+            GroupBy::Month => render_report(
+                &monthly_report(conn, filter.clone())?,
+                ReportKind::Monthly,
+                source,
+                args.json,
+            ),
+            GroupBy::Session => render_report(
+                &session_report(conn, filter.clone())?,
+                ReportKind::Session,
+                source,
+                args.json,
+            ),
+            GroupBy::Repo => render_repos(&repo_report(conn, filter.clone())?, args.json),
+        };
+        let mut diagnostics = report_diagnostics(conn, &filter)?;
+        diagnostics.current_file_errors = stats.file_errors;
+        Ok((body, diagnostics))
+    })?;
+    emit_warnings(&diagnostics);
+    writeln!(io::stdout().lock(), "{body}")?;
     Ok(())
 }
 
-fn emit(rows: &[AggregateRow], kind: ReportKind, source: SourceArg, as_json: bool) -> Result<()> {
-    let show_source = source.show_source();
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let body = if as_json {
-        render_json(rows, kind, show_source)
+fn render_report(
+    rows: &[AggregateRow],
+    kind: ReportKind,
+    source: SourceArg,
+    as_json: bool,
+) -> String {
+    if as_json {
+        render_json(rows, kind, source.show_source())
     } else {
-        render_table(rows, kind, show_source)
-    };
-    writeln!(lock, "{body}")?;
-    Ok(())
+        render_table(rows, kind, source.show_source())
+    }
 }
 
-fn emit_repo(rows: &[crate::store::queries::RepoAggregateRow], as_json: bool) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let body = if as_json {
+fn render_repos(rows: &[crate::store::queries::RepoAggregateRow], as_json: bool) -> String {
+    if as_json {
         render_repo_json(rows)
     } else {
         render_repo_table(rows)
-    };
-    writeln!(lock, "{body}")?;
-    Ok(())
+    }
 }
 
-fn emit_warnings(unknown: &HashSet<String>, skipped_lines: usize, file_errors: usize) {
-    for warning in render_warnings(unknown, skipped_lines, file_errors) {
+fn emit_warnings(diagnostics: &ReportDiagnostics) {
+    for warning in render_warnings(
+        &diagnostics.unknown_models,
+        diagnostics.skipped_records,
+        diagnostics.current_file_errors,
+    ) {
         eprintln!("{warning}");
+    }
+    if diagnostics.legacy_cost_rows > 0 {
+        eprintln!(
+            "warning: retained {} legacy cost row(s) without recoverable cost provenance; restore source roots to refresh",
+            diagnostics.legacy_cost_rows
+        );
+    }
+    if diagnostics.stale_pricing_rows > 0 {
+        eprintln!(
+            "warning: retained {} cost row(s) with stale pricing; restore source roots to refresh",
+            diagnostics.stale_pricing_rows
+        );
+    }
+    if diagnostics.stale_parser_files > 0 {
+        eprintln!(
+            "warning: retained {} file snapshot(s) from a stale parser; restore source roots to refresh",
+            diagnostics.stale_parser_files
+        );
     }
 }
 

@@ -111,6 +111,15 @@ pub fn run_with_store_path(
     cache_path: &std::path::Path,
     roots: Option<Vec<std::path::PathBuf>>,
 ) -> Result<()> {
+    run_with_store_path_and_warnings(cache_path, roots, 0, None)
+}
+
+pub(crate) fn run_with_store_path_and_warnings(
+    cache_path: &std::path::Path,
+    roots: Option<Vec<std::path::PathBuf>>,
+    current_file_errors: usize,
+    cursor_sync_failure: Option<String>,
+) -> Result<()> {
     require_terminal()?;
     crate::calendar::Calendar::system()?;
 
@@ -133,7 +142,15 @@ pub fn run_with_store_path(
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).context("terminal init")?;
     terminal.clear().context("clearing terminal")?;
 
-    let result = event_loop(&mut terminal, conn, state, state_path.clone(), roots);
+    let result = event_loop(
+        &mut terminal,
+        conn,
+        state,
+        state_path.clone(),
+        roots,
+        current_file_errors,
+        cursor_sync_failure,
+    );
     drop(terminal);
     drop(_guard);
     if let Ok(Some(warning)) = &result {
@@ -148,10 +165,14 @@ fn event_loop(
     mut state: AppState,
     state_path: std::path::PathBuf,
     roots: Option<Vec<std::path::PathBuf>>,
+    current_file_errors: usize,
+    cursor_sync_failure: Option<String>,
 ) -> Result<Option<String>> {
     let dirty_state_initial = state.flash.is_some();
     let mut cache = data::DataCache {
         source_roots: roots,
+        current_file_errors,
+        cursor_sync_failure,
         ..Default::default()
     };
     cache.refresh_all(&conn, &state);

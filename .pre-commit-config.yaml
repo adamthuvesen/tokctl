@@ -1,16 +1,9 @@
 repos:
   - repo: local
     hooks:
-      - id: cargo-fmt
-        name: cargo fmt
-        entry: just fmt
+      - id: just-check
+        name: just check
+        entry: just check
         language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy
-        entry: just lint
-        language: system
-        files: '(^Cargo\.(toml|lock)$|\.rs$)'
+        files: '(^Cargo\.(toml|lock)$|\.rs$|^AGENTS\.md$|^justfile$)'
         pass_filenames: false

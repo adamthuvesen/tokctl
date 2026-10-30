@@ -497,3 +497,57 @@ fn resizing_preserves_the_selected_row_identity() {
         assert_eq!(crate::tui::input::yank_key(&state, &cache), expected);
     }
 }
+
+#[test]
+fn stale_values_remain_visible_after_flash_messages_expire() {
+    let state = AppState {
+        flash: None,
+        ..AppState::default()
+    };
+    let mut cache = cache();
+    cache.diagnostics.legacy_cost_rows = 2;
+    cache.diagnostics.stale_parser_files = 1;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::view::draw(frame, &state, &cache))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+    assert!(text.contains("retained stale: 2 cost rows, 1 parser files"));
+}
+
+#[test]
+fn cursor_sync_failure_remains_visible_with_filters_and_other_warnings() {
+    let state = AppState {
+        flash: Some("another message".into()),
+        source_filter: SourceFilter::Codex,
+        ..AppState::default()
+    };
+    let mut cache = cache();
+    cache.cursor_sync_failure =
+        Some("Cursor sync failed. Using cached exports: synthetic failure".into());
+    cache.diagnostics.legacy_cost_rows = 2;
+    cache.refresh_error = Some(RefreshError::new(
+        RefreshScope::Status,
+        "synthetic refresh error",
+    ));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::view::draw(frame, &state, &cache))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        text.contains("Cursor sync failed. Using cached exports"),
+        "{text}"
+    );
+    assert!(text.contains("retained stale: 2 cost rows"), "{text}");
+    let messages = footer_messages(&state, &cache.visible(&state));
+    assert!(messages[0].is_error);
+    assert_eq!(messages[0].text, cache.cursor_sync_failure.unwrap());
+}

@@ -972,3 +972,70 @@ fn configured_roots_scope_root_rows_provider_totals_and_session_event_drills() {
         222.0
     );
 }
+
+#[test]
+fn retained_provenance_diagnostics_follow_the_loaded_dashboard_scope() {
+    let mut store = Store::ephemeral().unwrap();
+    let tx = store.transaction().unwrap();
+    insert_events(
+        &tx,
+        &[crate::test_support::event_row(
+            1,
+            "old",
+            None,
+            1,
+            2.0,
+            Source::Claude,
+        )],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO files(path,source,size,mtime_ns) VALUES('/old.jsonl','claude',1,1)",
+        [],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let mut state = AppState {
+        time_window: TimeWindow::All,
+        ..AppState::default()
+    };
+    let mut cache = DataCache {
+        current_file_errors: 1,
+        ..DataCache::default()
+    };
+    cache.refresh_all(&store, &state);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(cache.diagnostics.legacy_cost_rows, 1);
+    assert_eq!(cache.diagnostics.stale_parser_files, 1);
+    assert_eq!(cache.diagnostics.current_file_errors, 1);
+    state.source_filter = crate::tui::state::SourceFilter::Codex;
+    cache.refresh_all(&store, &state);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(cache.diagnostics.legacy_cost_rows, 0);
+    assert_eq!(cache.diagnostics.stale_parser_files, 0);
+    assert_eq!(cache.diagnostics.current_file_errors, 1);
+}
+
+#[test]
+fn refresh_and_scope_changes_preserve_cursor_sync_failure() {
+    let store = Store::ephemeral().unwrap();
+    let mut state = AppState {
+        time_window: TimeWindow::All,
+        ..AppState::default()
+    };
+    let failure = "Cursor sync failed. Using cached exports: synthetic failure";
+    let mut cache = DataCache {
+        cursor_sync_failure: Some(failure.into()),
+        ..DataCache::default()
+    };
+    cache.refresh_all(&store, &state);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(cache.cursor_sync_failure.as_deref(), Some(failure));
+    state.source_filter = crate::tui::state::SourceFilter::Claude;
+    cache.refresh_all(&store, &state);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(
+        cache.visible(&state).cursor_sync_failure.as_deref(),
+        Some(failure)
+    );
+}

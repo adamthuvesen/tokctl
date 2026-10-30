@@ -163,7 +163,12 @@ pub(super) fn draw_footer(
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
-    if cache.sparkline.iter().copied().fold(0f64, f64::max) <= 0.0 {
+    if let Some(status) = diagnostic_status(&cache.diagnostics) {
+        frame.render_widget(
+            Paragraph::new(Span::styled(status, palette.warn_text())),
+            rows[0],
+        );
+    } else if cache.sparkline.iter().copied().fold(0f64, f64::max) <= 0.0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no daily costs in this scope",
@@ -242,6 +247,35 @@ pub(super) fn draw_footer(
     frame.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
 }
 
+pub(crate) fn diagnostic_status(
+    diagnostics: &crate::store::queries::ReportDiagnostics,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    let stale_cost_rows = diagnostics.legacy_cost_rows + diagnostics.stale_pricing_rows;
+    if stale_cost_rows > 0 || diagnostics.stale_parser_files > 0 {
+        parts.push(format!(
+            "retained stale: {stale_cost_rows} cost rows, {} parser files",
+            diagnostics.stale_parser_files
+        ));
+    }
+    if diagnostics.skipped_records > 0 {
+        parts.push(format!("{} malformed records", diagnostics.skipped_records));
+    }
+    if diagnostics.current_file_errors > 0 {
+        parts.push(format!(
+            "{} input failures",
+            diagnostics.current_file_errors
+        ));
+    }
+    if !diagnostics.unknown_models.is_empty() {
+        parts.push(format!(
+            "{} models without prices",
+            diagnostics.unknown_models.len()
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 pub(crate) struct FooterMessage {
     pub(crate) text: String,
     pub(crate) is_error: bool,
@@ -249,6 +283,12 @@ pub(crate) struct FooterMessage {
 
 pub(crate) fn footer_messages(state: &AppState, cache: &VisibleRows) -> Vec<FooterMessage> {
     let mut messages = Vec::new();
+    if let Some(failure) = &cache.cursor_sync_failure {
+        messages.push(FooterMessage {
+            text: failure.clone(),
+            is_error: true,
+        });
+    }
     if let Some(flash) = &state.flash {
         messages.push(FooterMessage {
             text: flash.clone(),

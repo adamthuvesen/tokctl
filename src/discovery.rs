@@ -11,12 +11,14 @@ pub struct DiscoveredFile {
     pub project: Option<String>,
     pub size: u64,
     pub mtime_ns: i64,
+    pub file_identity: Option<String>,
+    pub ctime_ns: Option<i64>,
 }
 
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub files: Vec<DiscoveredFile>,
-    pub complete_roots: Vec<PathBuf>,
+    pub complete_roots: Vec<(Source, PathBuf)>,
     pub errors: Vec<DiscoveryError>,
 }
 
@@ -29,6 +31,44 @@ pub fn mtime_ns(metadata: &Metadata) -> i64 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+pub fn file_identity(metadata: &Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+pub fn ctime_ns(metadata: &Metadata) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata
+            .ctime()
+            .checked_mul(1_000_000_000)?
+            .checked_add(metadata.ctime_nsec())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+impl DiscoveredFile {
+    pub fn matches_metadata(&self, metadata: &Metadata) -> bool {
+        self.size == metadata.len()
+            && self.mtime_ns == mtime_ns(metadata)
+            && self.file_identity == file_identity(metadata)
+            && self.ctime_ns == ctime_ns(metadata)
+    }
 }
 
 /// Decode Claude's project-slug folder naming. Claude Code encodes a cwd like
@@ -117,6 +157,8 @@ fn discover(roots: &[PathBuf], source: Source) -> Discovery {
                         project,
                         size: metadata.len(),
                         mtime_ns: mtime_ns(&metadata),
+                        file_identity: file_identity(&metadata),
+                        ctime_ns: ctime_ns(&metadata),
                     });
                 }
                 Err(error) => {
@@ -129,7 +171,7 @@ fn discover(roots: &[PathBuf], source: Source) -> Discovery {
             }
         }
         if complete {
-            out.complete_roots.push(root);
+            out.complete_roots.push((source, root));
         }
     }
     out.files.sort_by(|left, right| left.path.cmp(&right.path));

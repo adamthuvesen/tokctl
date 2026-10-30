@@ -45,6 +45,7 @@ name = "report_parity"
 portable-pty = "0.9"
 vt100 = "0.16"
 criterion = { version = "0.5", features = ["html_reports"] }
+regex = "1"
 
 [[bench]]
 name = "parse"

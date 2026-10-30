@@ -23,7 +23,14 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
             continue;
         }
         match input.manifest.get(&file.path) {
-            Some(row) if row.size == file.size && row.mtime_ns == file.mtime_ns => {
+            Some(row)
+                if row.size == file.size
+                    && row.mtime_ns == file.mtime_ns
+                    && row.file_identity.is_some()
+                    && row.file_identity == file.file_identity
+                    && row.ctime_ns.is_some()
+                    && row.ctime_ns == file.ctime_ns =>
+            {
                 plan.to_skip.push(file.path.clone())
             }
             _ => plan.to_full_parse.push(file.clone()),
@@ -31,13 +38,13 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
     }
 
     // Only complete scans establish that an undiscovered file was deleted.
-    for p in input.manifest.keys() {
+    for (p, row) in input.manifest {
         if !touched.contains(p)
             && input
                 .discovery
                 .complete_roots
                 .iter()
-                .any(|root| p.starts_with(root))
+                .any(|(source, root)| row.source == *source && p.starts_with(root))
         {
             plan.to_purge.push(p.clone());
         }
@@ -63,6 +70,8 @@ mod tests {
             project: None,
             size,
             mtime_ns: mtime,
+            file_identity: Some("test-file".into()),
+            ctime_ns: Some(1),
         }
     }
 
@@ -73,6 +82,8 @@ mod tests {
             project: None,
             size,
             mtime_ns: mtime,
+            file_identity: Some("test-file".into()),
+            ctime_ns: Some(1),
             last_offset,
             n_events: 0,
             session_id: None,
@@ -81,7 +92,6 @@ mod tests {
     }
 
     fn far_past_ns() -> i64 {
-        // 2020-01-01 in nanoseconds — well outside any test's safety window.
         1_577_836_800_000_000_000
     }
 
@@ -161,7 +171,7 @@ mod tests {
     #[test]
     fn disappeared_file_goes_to_purge() {
         let discovery = Discovery {
-            complete_roots: vec![PathBuf::from("/")],
+            complete_roots: vec![(Source::Claude, PathBuf::from("/"))],
             ..Default::default()
         };
         let mut manifest = HashMap::new();
@@ -178,7 +188,6 @@ mod tests {
 
     #[test]
     fn recent_file_goes_to_full_parse_even_if_grown() {
-        // mtime within safety window
         let now_ms = base_now_ms();
         let recent_ns = (now_ms - 1_000).saturating_mul(1_000_000);
         let files = vec![mk_file("/x.jsonl", 800, recent_ns)];
@@ -208,6 +217,8 @@ mod tests {
                 project: None,
                 size: 800,
                 mtime_ns: mt + 1,
+                file_identity: Some("test-file".into()),
+                ctime_ns: Some(1),
             }],
             ..Default::default()
         };
@@ -220,6 +231,8 @@ mod tests {
                 project: None,
                 size: 500,
                 mtime_ns: mt,
+                file_identity: Some("test-file".into()),
+                ctime_ns: Some(1),
                 last_offset: 500,
                 n_events: 0,
                 session_id: None,
@@ -254,6 +267,8 @@ mod tests {
                 project: None,
                 size: 500,
                 mtime_ns: mt,
+                file_identity: Some("test-file".into()),
+                ctime_ns: Some(1),
                 last_offset: 500,
                 n_events: 0,
                 session_id: None,

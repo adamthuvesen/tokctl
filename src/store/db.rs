@@ -111,6 +111,19 @@ fn migrate_provenance(conn: &mut Connection) -> Result<()> {
             "ALTER TABLE events ADD COLUMN cost_provenance TEXT NOT NULL DEFAULT 'legacy';",
         )?;
     }
+    let file_columns = {
+        let mut statement = tx.prepare("PRAGMA table_info(files)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns
+    };
+    if !file_columns.iter().any(|column| column == "file_identity") {
+        tx.execute_batch("ALTER TABLE files ADD COLUMN file_identity TEXT;")?;
+    }
+    if !file_columns.iter().any(|column| column == "ctime_ns") {
+        tx.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;")?;
+    }
     tx.execute_batch(DDL)?;
     tx.execute(
         "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?1)",
@@ -134,7 +147,7 @@ pub fn parser_signature(source: crate::types::Source) -> String {
             hash.update(include_bytes!("../types.rs"));
             hash.update(include_bytes!("../sources/mod.rs"));
             hash.update(include_bytes!("../ingest/file_range.rs"));
-            hash.update(include_bytes!("../ingest/run.rs"));
+            hash.update(include_bytes!("ingest_run.rs"));
             hash.update(include_bytes!("../discovery.rs"));
             hash.update(include_bytes!("../repo.rs"));
             hash.update(parser);

@@ -1,20 +1,21 @@
 default:
     @just --list
 
-# Complete verification, shared by local development and CI.
-check: fmt lint test-all test-minimal build
+# Fast lane: local, pre-commit, and the first CI step.
+check: fmt lint test
+
+# Slow lane: CI runs it after `check`.
+verify: test-minimal build
 
 fmt:
     cargo fmt --all -- --check
 
 lint:
     cargo clippy --locked --all-targets --all-features -- -D warnings
+    cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
-test filter="":
-    cargo test --locked --all-features {{quote(filter)}}
-
-test-all:
-    cargo test --locked --all-features
+test *filter:
+    cargo test --locked --all-features {{filter}}
 
 test-minimal:
     cargo test --locked --no-default-features

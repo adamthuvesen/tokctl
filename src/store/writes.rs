@@ -12,6 +12,8 @@ pub struct FileManifestRow {
     pub project: Option<String>,
     pub size: u64,
     pub mtime_ns: i64,
+    pub file_identity: Option<String>,
+    pub ctime_ns: Option<i64>,
     pub last_offset: u64,
     pub n_events: u64,
     pub session_id: Option<String>,
@@ -48,7 +50,7 @@ pub struct RepoRow {
 
 pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileManifestRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, source, project, size, mtime_ns, last_offset, n_events, session_id, model FROM files",
+        "SELECT path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns FROM files",
     )?;
     let rows = stmt.query_map([], |row| {
         let path: String = row.get(0)?;
@@ -70,6 +72,8 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
             n_events: row.get::<_, i64>(6)? as u64,
             session_id: row.get(7)?,
             model: row.get(8)?,
+            file_identity: row.get(9)?,
+            ctime_ns: row.get(10)?,
         })
     })?;
     let mut map = HashMap::new();
@@ -83,13 +87,15 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
 pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Result<()> {
     tx.execute(
         r#"INSERT INTO files
-             (path, source, project, size, mtime_ns, last_offset, n_events, session_id, model)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             (path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
            ON CONFLICT(path) DO UPDATE SET
              source      = excluded.source,
              project     = excluded.project,
              size        = excluded.size,
              mtime_ns    = excluded.mtime_ns,
+             file_identity = excluded.file_identity,
+             ctime_ns = excluded.ctime_ns,
              last_offset = excluded.last_offset,
              n_events    = excluded.n_events,
              session_id  = COALESCE(excluded.session_id, files.session_id),
@@ -104,6 +110,8 @@ pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Resu
             row.n_events as i64,
             row.session_id,
             row.model,
+            row.file_identity,
+            row.ctime_ns,
         ],
     )?;
     Ok(())
@@ -231,6 +239,8 @@ mod tests {
             project: Some("proj".into()),
             size: 100,
             mtime_ns: 12345,
+            file_identity: Some("test-file".into()),
+            ctime_ns: Some(1),
             last_offset: 100,
             n_events: 5,
             session_id: Some("sess".into()),
@@ -258,6 +268,8 @@ mod tests {
                 project: None,
                 size: 10,
                 mtime_ns: 1,
+                file_identity: Some("test-file".into()),
+                ctime_ns: Some(1),
                 last_offset: 10,
                 n_events: 1,
                 session_id: None,

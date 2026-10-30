@@ -2384,6 +2384,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "rayon",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

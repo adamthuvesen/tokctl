@@ -8,6 +8,7 @@ use rusqlite::{
     types::{Type, Value},
     Connection,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -545,20 +546,109 @@ pub fn resolve_repo_filter_scoped(
     Ok(RepoFilterSpec::DisplayName(name.to_owned()))
 }
 
-pub fn skipped_records(store: &Store, scope: &QueryScope) -> Result<usize> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportDiagnostics {
+    pub unknown_models: HashSet<String>,
+    pub skipped_records: usize,
+    pub current_file_errors: usize,
+    pub legacy_cost_rows: u64,
+    pub stale_pricing_rows: u64,
+    pub stale_parser_files: u64,
+}
+
+pub fn report_diagnostics(store: &Store, scope: &QueryScope) -> Result<ReportDiagnostics> {
+    report_diagnostics_for_scopes(store, std::slice::from_ref(scope))
+}
+
+pub fn report_diagnostics_for_scopes(
+    store: &Store,
+    scopes: &[QueryScope],
+) -> Result<ReportDiagnostics> {
     if store.connection().is_autocommit() {
-        return store.read_snapshot(|store| skipped_records(store, scope));
+        return store.read_snapshot(|store| report_diagnostics_for_scopes(store, scopes));
     }
+    let mut event_clauses = Vec::new();
+    let mut event_parameters = Vec::new();
+    let mut file_clauses = Vec::new();
+    let mut file_parameters = Vec::new();
+    for scope in scopes {
+        let (clause, values) = scope_clause(scope);
+        event_clauses.push(format!("(1=1 {clause})"));
+        event_parameters.extend(values);
+        let (clause, values) = diagnostic_file_clause(scope);
+        file_clauses.push(format!("(1=1 {clause})"));
+        file_parameters.extend(values);
+    }
+    let events = if event_clauses.is_empty() {
+        "0".into()
+    } else {
+        event_clauses.join(" OR ")
+    };
+    let files = if file_clauses.is_empty() {
+        "0".into()
+    } else {
+        file_clauses.join(" OR ")
+    };
+    let connection = store.connection();
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT DISTINCT e.model FROM events e WHERE e.source <> 'cursor' AND ({events})"
+    ))?;
+    let unknown_models = statement
+        .query_map(params_from_iter(&event_parameters), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|model| !crate::pricing::has_price(model))
+        .collect();
+    let mut cost_parameters = vec![Value::Text(crate::pricing::signature())];
+    cost_parameters.extend(event_parameters);
+    let (legacy_cost_rows, stale_pricing_rows) = connection.query_row(
+        &format!("SELECT COALESCE(SUM(e.cost_provenance='legacy'),0), COALESCE(SUM(e.cost_provenance NOT IN ('legacy','source',?)),0) FROM events e WHERE {events}"),
+        params_from_iter(cost_parameters),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let skipped_records = connection.query_row(
+        &format!("SELECT COALESCE(SUM(d.skipped_records),0) FROM ingest_diagnostics d JOIN files f ON f.path=d.file_path WHERE {files}"),
+        params_from_iter(&file_parameters),
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT f.source,p.signature FROM files f LEFT JOIN parser_provenance p ON p.path=f.path WHERE {files}"
+    ))?;
+    let signatures = statement.query_map(params_from_iter(file_parameters), |row| {
+        Ok((
+            parse_source_column(row.get(0)?, 0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    let mut stale_parser_files = 0;
+    for signature in signatures {
+        let (source, signature) = signature?;
+        if signature.as_deref() != Some(super::db::parser_signature(source).as_str()) {
+            stale_parser_files += 1;
+        }
+    }
+    Ok(ReportDiagnostics {
+        unknown_models,
+        skipped_records,
+        legacy_cost_rows,
+        stale_pricing_rows,
+        stale_parser_files,
+        ..Default::default()
+    })
+}
+
+fn diagnostic_file_clause(scope: &QueryScope) -> (String, Vec<Value>) {
     let files = QueryScope {
         source: scope.source,
         roots: scope.roots.clone(),
         ..Default::default()
     };
     let (clause, mut parameters) = scope_clause(&files);
-    let file_clause = clause
+    let mut file_clause = clause
         .replace("e.source", "f.source")
         .replace("e.file_path", "f.path");
-    let mut sql = format!("SELECT COALESCE(SUM(d.skipped_records),0) FROM ingest_diagnostics d JOIN files f ON f.path=d.file_path WHERE 1=1 {file_clause}");
     if scope.since_ms.is_some()
         || scope.until_ms.is_some()
         || scope.repo.is_some()
@@ -566,14 +656,16 @@ pub fn skipped_records(store: &Store, scope: &QueryScope) -> Result<usize> {
         || scope.session.is_some()
     {
         let (clause, values) = scope_clause(scope);
-        sql.push_str(&format!(
+        file_clause.push_str(&format!(
             " AND EXISTS(SELECT 1 FROM events e WHERE e.file_path=f.path {clause})"
         ));
         parameters.extend(values);
     }
-    Ok(store
-        .connection()
-        .query_row(&sql, params_from_iter(parameters), |row| row.get(0))?)
+    (file_clause, parameters)
+}
+
+pub fn skipped_records(store: &Store, scope: &QueryScope) -> Result<usize> {
+    Ok(report_diagnostics(store, scope)?.skipped_records)
 }
 
 #[derive(Debug, Clone)]
@@ -645,22 +737,6 @@ pub fn scoped_sparkline(store: &Store, scope: QueryScope, days: u32) -> Result<V
         rows.drain(..rows.len() - days as usize);
     }
     Ok(rows.into_iter().map(|row| row.cost_usd).collect())
-}
-
-pub fn unknown_models(store: &Store, scope: &QueryScope) -> Result<Vec<String>> {
-    if store.connection().is_autocommit() {
-        return store.read_snapshot(|store| unknown_models(store, scope));
-    }
-    let (clause, parameters) = scope_clause(scope);
-    let sql = format!("SELECT DISTINCT e.model FROM events e WHERE e.source <> 'cursor' {clause}");
-    let mut statement = store.connection().prepare_cached(&sql)?;
-    let models = statement
-        .query_map(params_from_iter(parameters), |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(models
-        .into_iter()
-        .filter(|model| !crate::pricing::has_price(model))
-        .collect())
 }
 
 #[derive(Debug, Clone)]
@@ -930,5 +1006,92 @@ mod tests {
         tx.commit().unwrap();
         let err = resolve_repo_filter_scoped(&conn, "alpha", &QueryScope::default()).unwrap_err();
         assert!(err.to_string().contains("ambiguous"));
+    }
+    #[test]
+    fn diagnostics_follow_event_scope_and_keep_malformed_only_files_in_root_scope() {
+        let mut store = fresh_conn();
+        let mut selected = evt(1, "selected", Some("/repo"), 1, 1.0, Source::Claude);
+        selected.file_path = "/selected/usage.jsonl".into();
+        selected.model = "unknown-selected-model".into();
+        let mut other = evt(2, "other", None, 1, 1.0, Source::Codex);
+        other.file_path = "/other/usage.jsonl".into();
+        other.model = "unknown-other-model".into();
+        other.cost_provenance = "old-price".into();
+        let tx = store.transaction().unwrap();
+        insert_events(&tx, &[selected.clone(), other]).unwrap();
+        tx.execute_batch("INSERT INTO files(path,source,size,mtime_ns) VALUES('/selected/usage.jsonl','claude',1,1),('/selected/malformed.jsonl','claude',1,1),('/other/usage.jsonl','codex',1,1); INSERT INTO ingest_diagnostics(file_path,skipped_records) VALUES('/selected/usage.jsonl',2),('/selected/malformed.jsonl',3),('/other/usage.jsonl',7);").unwrap();
+        tx.commit().unwrap();
+        store.execute_batch("BEGIN").unwrap();
+        let scope = QueryScope {
+            source: Some(Source::Claude),
+            roots: Some(vec![PathBuf::from("/selected")]),
+            ..Default::default()
+        };
+        let diagnostics = report_diagnostics(&store, &scope).unwrap();
+        assert_eq!(
+            diagnostics.unknown_models,
+            HashSet::from([selected.model.clone()])
+        );
+        assert_eq!(diagnostics.skipped_records, 5);
+        assert_eq!(diagnostics.legacy_cost_rows, 1);
+        assert_eq!(diagnostics.stale_pricing_rows, 0);
+        assert_eq!(diagnostics.stale_parser_files, 2);
+        let selected_scope = QueryScope {
+            since_ms: Some(selected.ts),
+            until_ms: Some(selected.ts + 1),
+            repo: Some(RepoFilterSpec::KeyExact("/repo".into())),
+            model: Some(selected.model.clone()),
+            session: Some(SessionKey {
+                source: Source::Claude,
+                id: selected.session_id,
+            }),
+            ..scope.clone()
+        };
+        let diagnostics = report_diagnostics(&store, &selected_scope).unwrap();
+        assert_eq!(diagnostics.skipped_records, 2);
+        assert_eq!(diagnostics.legacy_cost_rows, 1);
+        assert_eq!(diagnostics.stale_parser_files, 1);
+        for excluded in [
+            QueryScope {
+                since_ms: Some(selected.ts + 1),
+                ..selected_scope.clone()
+            },
+            QueryScope {
+                repo: Some(RepoFilterSpec::NoRepo),
+                ..selected_scope.clone()
+            },
+            QueryScope {
+                model: Some("different-model".into()),
+                ..selected_scope.clone()
+            },
+            QueryScope {
+                session: Some(SessionKey {
+                    source: Source::Claude,
+                    id: "different-session".into(),
+                }),
+                ..selected_scope
+            },
+        ] {
+            assert_eq!(
+                report_diagnostics(&store, &excluded).unwrap(),
+                ReportDiagnostics::default()
+            );
+        }
+        let both = report_diagnostics_for_scopes(&store, &[scope.clone(), scope]).unwrap();
+        assert_eq!(both.skipped_records, 5);
+        assert_eq!(both.legacy_cost_rows, 1);
+        assert_eq!(both.stale_parser_files, 2);
+        assert_eq!(
+            report_diagnostics(
+                &store,
+                &QueryScope {
+                    source: Some(Source::Codex),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .stale_pricing_rows,
+            1
+        );
     }
 }

@@ -1,7 +1,6 @@
 //! Shared CLI orchestration: root resolution, optional Cursor sync, cache vs no-cache ingest.
 
-use anyhow::Result;
-use std::collections::HashSet;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::cursor_sync::{has_configured_account, sync_active_account};
@@ -40,7 +39,7 @@ pub fn resolve_root_dirs(
     claude_dir: Option<&str>,
     codex_dir: Option<&str>,
     cursor_dir: Option<&str>,
-) -> RootDirs {
+) -> Result<RootDirs> {
     let env = |k: &str| std::env::var(k).ok();
     let claude = resolve_roots(ResolveInput {
         flag: claude_dir,
@@ -56,68 +55,72 @@ pub fn resolve_root_dirs(
         tool_env_suffix: Some("sessions"),
         defaults: default_codex_roots(),
     });
-    let cursor = resolve_roots(ResolveInput {
-        flag: cursor_dir,
-        tokctl_env: env("TOKCTL_CURSOR_DIR").as_deref(),
-        tool_env: None,
-        tool_env_suffix: None,
-        defaults: default_cursor_roots(),
-    });
-    RootDirs {
-        claude: canonical_roots(claude),
-        codex: canonical_roots(codex),
-        cursor: canonical_roots(cursor),
-    }
+    let cursor = cursor_roots(cursor_dir, env("TOKCTL_CURSOR_DIR").as_deref());
+    Ok(RootDirs {
+        claude: requested_roots(claude)?,
+        codex: requested_roots(codex)?,
+        cursor: requested_roots(cursor)?,
+    })
 }
 
-fn canonical_roots(resolved: crate::paths::ResolvedRoots) -> Vec<PathBuf> {
+fn requested_roots(resolved: crate::paths::ResolvedRoots) -> Result<Vec<PathBuf>> {
     let mut roots: Vec<_> = resolved
         .roots
         .into_iter()
-        .map(|path| path.canonicalize().unwrap_or(path))
-        .collect();
+        .map(|path| std::path::absolute(path).context("resolving source root"))
+        .collect::<Result<_>>()?;
     roots.sort();
     roots.dedup();
-    roots
+    Ok(roots)
 }
 
-pub fn cursor_sync_target_dir(cursor_dir: Option<&str>) -> PathBuf {
-    let env = |k: &str| std::env::var(k).ok();
-    let resolved = resolve_roots(ResolveInput {
+fn cursor_roots(
+    cursor_dir: Option<&str>,
+    configured_dir: Option<&str>,
+) -> crate::paths::ResolvedRoots {
+    resolve_roots(ResolveInput {
         flag: cursor_dir,
-        tokctl_env: env("TOKCTL_CURSOR_DIR").as_deref(),
+        tokctl_env: configured_dir,
         tool_env: None,
         tool_env_suffix: None,
         defaults: default_cursor_roots(),
-    });
-    resolved
-        .roots
-        .into_iter()
-        .next()
-        .unwrap_or_else(cursor_sync_cache_dir)
+    })
 }
 
-pub fn maybe_sync_cursor(target_dir: Option<&Path>) -> Result<()> {
+pub fn cursor_sync_target_dir(cursor_dir: Option<&str>) -> PathBuf {
+    cursor_roots(
+        cursor_dir,
+        std::env::var("TOKCTL_CURSOR_DIR").ok().as_deref(),
+    )
+    .roots
+    .into_iter()
+    .next()
+    .unwrap_or_else(cursor_sync_cache_dir)
+}
+
+pub fn maybe_sync_cursor(target_dir: Option<&Path>) -> Result<Option<String>> {
     if !has_configured_account()? {
-        return Ok(());
+        return Ok(None);
     }
-    if let Err(error) = sync_active_account(target_dir) {
-        eprintln!("warning: Cursor sync failed: {error:#}");
-    }
-    Ok(())
+    Ok(sync_active_account(target_dir)
+        .err()
+        .map(|error| format!("Cursor sync failed. Using cached exports: {error:#}")))
 }
 
-pub fn sync_cursor_if_needed(scope: SourceScope, cursor_dir: Option<&str>) -> Result<()> {
+pub fn sync_cursor_if_needed(
+    scope: SourceScope,
+    cursor_dir: Option<&str>,
+) -> Result<Option<String>> {
     if scope.includes(Source::Cursor) {
         let target = cursor_sync_target_dir(cursor_dir);
-        maybe_sync_cursor(Some(&target))?;
+        return maybe_sync_cursor(Some(&target));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub fn prepare_run(
     scope: SourceScope,
-    roots: &RootDirs,
+    roots: &mut RootDirs,
     rebuild: bool,
     no_cache: bool,
 ) -> Result<CachedRun> {
@@ -128,6 +131,15 @@ pub fn prepare_run(
     };
     if rebuild {
         conn.rebuild()?;
+    }
+    if scope.includes(Source::Claude) {
+        roots.claude = conn.resolve_source_roots(Source::Claude, &roots.claude)?;
+    }
+    if scope.includes(Source::Codex) {
+        roots.codex = conn.resolve_source_roots(Source::Codex, &roots.codex)?;
+    }
+    if scope.includes(Source::Cursor) {
+        roots.cursor = conn.resolve_source_roots(Source::Cursor, &roots.cursor)?;
     }
     let stats = run_ingest(
         &mut conn,
@@ -159,18 +171,31 @@ pub fn query_scope(scope: SourceScope, roots: &RootDirs) -> crate::store::querie
     }
 }
 
-pub fn finish_cached_warnings(
-    conn: &Store,
-    stats: &IngestStats,
-    scope: crate::store::queries::QueryScope,
-) -> Result<(HashSet<String>, usize, usize)> {
-    let mut unknown = stats.unknown_models.clone();
-    for model in crate::store::queries::unknown_models(conn, &scope)? {
-        unknown.insert(model);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_cursor_sync_target_is_the_selected_report_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("selected-cursor");
+        let configured = configured.to_str().unwrap();
+        let roots = resolve_root_dirs(None, None, Some(configured)).unwrap();
+        assert_eq!(cursor_sync_target_dir(Some(configured)), roots.cursor[0]);
+        assert!(!roots.cursor[0].exists());
+        let configured_roots = cursor_roots(None, Some(configured));
+        assert_eq!(configured_roots.roots, roots.cursor);
     }
-    Ok((
-        unknown,
-        crate::store::queries::skipped_records(conn, &scope)?,
-        stats.file_errors,
-    ))
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_roots_preserve_symlink_identity_until_store_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("source");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let roots = resolve_root_dirs(None, Some(alias.to_str().unwrap()), None).unwrap();
+        assert_eq!(roots.codex, vec![alias]);
+    }
 }

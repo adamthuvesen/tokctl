@@ -1,3 +1,6 @@
+// The Store is the one owner of SQLite connections (clippy.toml).
+#![allow(clippy::disallowed_types)]
+
 #[cfg(not(test))]
 mod db;
 #[cfg(test)]
@@ -12,10 +15,8 @@ pub(crate) use writes::{EventRow, RepoRow};
 
 pub use db::path as store_path;
 pub use writes::FileManifestRow;
-#[path = "../ingest/run.rs"]
 pub mod ingest_run;
 #[cfg(any(test, feature = "test-fixtures"))]
-#[path = "../test_support.rs"]
 pub mod test_support;
 
 /// SQLite-backed usage store. Both persistent and temporary reports use this type.
@@ -35,6 +36,43 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn resolve_source_roots(
+        &self,
+        source: crate::types::Source,
+        roots: &[std::path::PathBuf],
+    ) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        use rusqlite::OptionalExtension;
+        anyhow::ensure!(
+            roots.iter().all(|root| root.is_absolute()),
+            "source roots must be absolute paths"
+        );
+        let _lock = self.path.as_deref().map(acquire_ingest_lock).transpose()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut resolved = Vec::new();
+        for requested in roots {
+            let root = match requested.canonicalize() {
+                Ok(canonical) => {
+                    anyhow::ensure!(self.writable, "cannot update source roots in a read-only cache");
+                    transaction.execute(
+                        "INSERT INTO source_roots(source,requested_path,canonical_path) VALUES(?1,?2,?3) ON CONFLICT(source,requested_path) DO UPDATE SET canonical_path=excluded.canonical_path",
+                        rusqlite::params![source.as_str(), requested.to_string_lossy(), canonical.to_string_lossy()],
+                    )?;
+                    canonical
+                }
+                Err(_) => transaction.query_row(
+                    "SELECT canonical_path FROM source_roots WHERE source=?1 AND requested_path=?2",
+                    rusqlite::params![source.as_str(), requested.to_string_lossy()],
+                    |row| row.get::<_, String>(0),
+                ).optional()?.map(std::path::PathBuf::from).unwrap_or_else(|| requested.clone()),
+            };
+            if !resolved.contains(&root) {
+                resolved.push(root);
+            }
+        }
+        transaction.commit()?;
+        Ok(resolved)
+    }
+
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
         Ok(Self {
             connection: db::open_store(path)?,
@@ -45,9 +83,9 @@ impl Store {
 
     pub fn open_read_only(path: &std::path::Path) -> anyhow::Result<Self> {
         use anyhow::Context;
-        let connection =
-            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("opening read-only store {}", path.display()))?;
+        let store = Self::open_for_inspection(path)
+            .with_context(|| format!("opening read-only store {}", path.display()))?;
+        let connection = &store.connection;
         let version: String = connection.query_row(
             "SELECT value FROM meta WHERE key='schema_version'",
             [],
@@ -57,7 +95,7 @@ impl Store {
             version == schema::SCHEMA_VERSION.to_string(),
             "cache needs migration; run tokctl daily before inspection"
         );
-        let status = db::provenance_status(&connection)?;
+        let status = db::provenance_status(connection)?;
         anyhow::ensure!(
             status.legacy_cost_rows == 0
                 && status.stale_pricing_rows == 0
@@ -65,8 +103,16 @@ impl Store {
                 && !status.stale_calendar,
             "cache provenance is stale; run tokctl daily with the source roots before inspection"
         );
+        Ok(store)
+    }
+
+    /// Read-only open without schema or provenance checks, so doctor can diagnose any cache.
+    pub(in crate::store) fn open_for_inspection(path: &std::path::Path) -> rusqlite::Result<Self> {
         Ok(Self {
-            connection,
+            connection: rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?,
             path: Some(path.to_path_buf()),
             writable: false,
         })
@@ -169,5 +215,4 @@ fn acquire_ingest_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> 
     Ok(file)
 }
 
-#[path = "../doctor/checks.rs"]
 pub(crate) mod inspection;

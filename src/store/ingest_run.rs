@@ -1,7 +1,5 @@
 use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoveredFile};
-use crate::ingest::file_range::{
-    parse_claude_file, parse_codex_file, parse_cursor_file, ParseResult,
-};
+use crate::ingest::file_range::{parse_discovered_file, ParseResult};
 use crate::ingest::plan::{plan_ingest, IngestPlan, PlanInput};
 use crate::pricing::cost_of;
 use crate::repo::Resolver;
@@ -13,7 +11,7 @@ use crate::types::{IngestStats, Source, UsageEvent};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -40,11 +38,8 @@ pub fn local_month(ts: &DateTime<Utc>) -> String {
         .1
 }
 
-/// Convert a parsed UsageEvent to a row ready for SQLite insert. Costs the
-/// event against the pricing table, accumulating any unknown model IDs into
-/// the provided set (which is thread-local during parallel parsing).
-fn event_to_row(ev: &UsageEvent, file_path: &str, unknown: &mut HashSet<String>) -> EventRow {
-    let cost = cost_of(ev, Some(unknown));
+fn event_to_row(ev: &UsageEvent, file_path: &str) -> EventRow {
+    let cost = cost_of(ev, None);
     EventRow {
         file_path: file_path.to_owned(),
         source: ev.source,
@@ -73,29 +68,12 @@ struct ParsedFile {
     first_session: Option<String>,
     first_model: Option<String>,
     skipped_lines: usize,
-    unknown_models: HashSet<String>,
 }
 
-/// Parse a full or partial file range and produce insertable rows.
+/// Parse a coherent file snapshot and produce insertable rows.
 /// Runs on a rayon worker — no SQLite access here.
 fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
-    let metadata = std::fs::metadata(&file.path)?;
-    anyhow::ensure!(
-        metadata.len() == file.size && crate::discovery::mtime_ns(&metadata) == file.mtime_ns,
-        "{} changed before parsing",
-        file.path.display()
-    );
-    let range = match file.source {
-        Source::Claude => parse_claude_file(&file.path, file.project.as_deref())?,
-        Source::Codex => parse_codex_file(&file.path)?,
-        Source::Cursor => parse_cursor_file(&file.path)?,
-    };
-    let metadata = std::fs::metadata(&file.path)?;
-    anyhow::ensure!(
-        metadata.len() == file.size && crate::discovery::mtime_ns(&metadata) == file.mtime_ns,
-        "{} changed during parsing",
-        file.path.display()
-    );
+    let range = parse_discovered_file(&file)?;
     let ParseResult {
         events,
         skipped_lines,
@@ -103,10 +81,9 @@ fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
     } = range;
 
     let path_str = file.path.to_string_lossy().into_owned();
-    let mut unknown = HashSet::new();
     let rows: Vec<EventRow> = events
         .iter()
-        .map(|ev| event_to_row(ev, &path_str, &mut unknown))
+        .map(|ev| event_to_row(ev, &path_str))
         .collect();
     let first_session = events.first().map(|e| e.session_id.clone());
     let first_model = events.first().map(|e| e.model.clone());
@@ -117,7 +94,6 @@ fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
         first_session,
         first_model,
         skipped_lines,
-        unknown_models: unknown,
     })
 }
 
@@ -134,9 +110,6 @@ pub fn run_ingest(store: &mut crate::store::Store, opts: RunIngestOptions) -> Re
         source,
     } = opts;
 
-    crate::calendar::Calendar::system()?;
-    crate::store::db::reproject(conn, &crate::calendar::Calendar::system()?)?;
-    conn.execute("DELETE FROM meta WHERE key='demo_marker'", [])?;
     let manifest = load_file_manifest(conn)?;
     let signatures: HashMap<PathBuf, String> = {
         let mut statement = conn.prepare("SELECT path,signature FROM parser_provenance")?;
@@ -176,6 +149,22 @@ pub fn run_ingest(store: &mut crate::store::Store, opts: RunIngestOptions) -> Re
         all.complete_roots.extend(d.complete_roots);
         all.errors.extend(d.errors);
     }
+
+    let mut owners = HashMap::new();
+    for file in &all.files {
+        let previous = owners
+            .insert(&file.path, file.source)
+            .or_else(|| manifest.get(&file.path).map(|row| row.source));
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous == file.source,
+                "{} is claimed by both {} and {}; choose the correct provider root or explicitly rebuild the cache with --rebuild",
+                file.path.display(), previous, file.source
+            );
+        }
+    }
+    crate::store::db::reproject(conn, &crate::calendar::Calendar::system()?)?;
+    conn.execute("DELETE FROM meta WHERE key='demo_marker'", [])?;
 
     let mut plan = plan_ingest(PlanInput {
         manifest: &planned_manifest,
@@ -279,9 +268,20 @@ fn execute_plan(conn: &mut Connection, plan: IngestPlan) -> Result<IngestStats> 
                 }
             };
             stats.skipped_lines += parsed.skipped_lines;
-            stats
-                .unknown_models
-                .extend(parsed.unknown_models.iter().cloned());
+            let path = parsed.file.path.to_string_lossy().into_owned();
+            if parsed.rows.is_empty()
+                && parsed.skipped_lines > 0
+                && conn
+                    .query_row("SELECT n_events FROM files WHERE path=?1", [&path], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .optional()?
+                    .is_some_and(|count| count > 0)
+            {
+                eprintln!("warning: parsing {}: replacement has malformed records and no valid events; preserving the previous snapshot", file.path.display());
+                stats.file_errors += 1;
+                continue;
+            }
             let mut first_seen = HashMap::new();
             stamp_repos(
                 &mut parsed.rows,
@@ -289,9 +289,7 @@ fn execute_plan(conn: &mut Connection, plan: IngestPlan) -> Result<IngestStats> 
                 &mut first_seen,
                 &mut stats.events_no_repo,
             );
-            let path = parsed.file.path.to_string_lossy().into_owned();
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            // Replacement is unconditional after a coherent full read.
             delete_file_and_events(&tx, &path)?;
             stats.events_inserted += insert_events(&tx, &parsed.rows)?;
             upsert_file_manifest(
@@ -302,6 +300,8 @@ fn execute_plan(conn: &mut Connection, plan: IngestPlan) -> Result<IngestStats> 
                     project: parsed.file.project.clone(),
                     size: parsed.file.size,
                     mtime_ns: parsed.file.mtime_ns,
+                    file_identity: parsed.file.file_identity.clone(),
+                    ctime_ns: parsed.file.ctime_ns,
                     last_offset: parsed.file.size,
                     n_events: parsed.rows.len() as u64,
                     session_id: parsed.first_session,
@@ -351,6 +351,8 @@ mod tests {
             project: None,
             size: 10,
             mtime_ns: 1,
+            file_identity: Some("test-file".into()),
+            ctime_ns: Some(1),
             last_offset: 10,
             n_events: 1,
             session_id: Some(format!("{source}-session")),
@@ -399,6 +401,8 @@ mod tests {
                     project: None,
                     size: good_md.len(),
                     mtime_ns: crate::discovery::mtime_ns(&good_md),
+                    file_identity: crate::discovery::file_identity(&good_md),
+                    ctime_ns: crate::discovery::ctime_ns(&good_md),
                 },
                 DiscoveredFile {
                     path: missing_path,
@@ -406,6 +410,8 @@ mod tests {
                     project: None,
                     size: 100,
                     mtime_ns: 1,
+                    file_identity: Some("test-file".into()),
+                    ctime_ns: Some(1),
                 },
             ],
             ..IngestPlan::default()

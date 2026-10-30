@@ -8,7 +8,7 @@ use super::rows::{
     CacheStatus, EventRow, LeftMemoKey, LeftRow, RefreshError, RefreshScope, SessionRow,
     TrendMemoKey, TrendRow,
 };
-use crate::store::queries::{scoped_sparkline, QueryScope};
+use crate::store::queries::{report_diagnostics, scoped_sparkline, QueryScope, ReportDiagnostics};
 use crate::store::Store;
 use crate::tui::state::{AppState, DrillKind, Section, TrendGranularity};
 
@@ -31,6 +31,9 @@ pub struct DataCache {
     pub sparkline: Vec<f64>,
     pub trend: Vec<TrendRow>,
     pub status: CacheStatus,
+    pub diagnostics: ReportDiagnostics,
+    pub current_file_errors: usize,
+    pub cursor_sync_failure: Option<String>,
     pub refresh_error: Option<RefreshError>,
     pub loaded_state: Option<AppState>,
     pub loaded_scope: Option<QueryScope>,
@@ -95,7 +98,12 @@ impl DataCache {
         let mut scope = drill.scope.clone();
         scope.roots = current.roots;
         scope.intersect_time(current.since_ms, current.until_ms);
-        if !matches!(drill.kind, DrillKind::Events { .. }) {
+        if let DrillKind::Events { source } = drill.kind {
+            scope.session = Some(crate::store::queries::SessionKey {
+                source,
+                id: drill.key.clone(),
+            });
+        } else {
             scope.source = current.source;
         }
         Ok(scope)
@@ -179,6 +187,9 @@ impl DataCache {
             .scope_for(state, now)
             .map_err(|e| RefreshError::new(RefreshScope::Left, e))?;
         self.loaded_scope = Some(scope.clone());
+        self.diagnostics = report_diagnostics(store, &scope)
+            .map_err(|e| RefreshError::new(RefreshScope::Status, e))?;
+        self.diagnostics.current_file_errors = self.current_file_errors;
         match state.deepest_drill().map(|d| d.kind) {
             Some(DrillKind::Events { source }) => {
                 let drill = state.deepest_drill().unwrap();

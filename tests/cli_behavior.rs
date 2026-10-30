@@ -1,3 +1,6 @@
+// These tests corrupt or observe caches from outside, like another process would.
+#![allow(clippy::disallowed_types)]
+
 use std::fs;
 use std::process::Command;
 
@@ -318,5 +321,161 @@ fn noninteractive_ui_fails_before_creating_demo_or_cache() {
             String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal")
         );
         assert!(!cache.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_symlink_root_keeps_previously_cached_rows_visible() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    let alias = workspace.path().join("alias");
+    fs::create_dir(&root).unwrap();
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    write_codex_session(&root, "session.jsonl", workspace.path(), "saved-session");
+    let report = || {
+        tokctl()
+            .args(["daily", "--json", "--source", "codex"])
+            .env("TOKCTL_CODEX_DIR", &alias)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+            .output()
+            .unwrap()
+    };
+    let initial = report();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let expected: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(expected.as_array().unwrap().len(), 1);
+    fs::rename(&root, workspace.path().join("offline")).unwrap();
+    let offline = report();
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&offline.stdout).unwrap(),
+        expected
+    );
+    assert!(String::from_utf8_lossy(&offline.stderr).contains("warning:"));
+}
+
+#[test]
+fn retained_stale_provenance_warns_only_for_matching_report_scope() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    fs::create_dir(&root).unwrap();
+    write_codex_session(&root, "session.jsonl", workspace.path(), "saved-session");
+    let report = |extra: &[&str]| {
+        tokctl()
+            .args(["daily", "--json", "--source", "codex"])
+            .args(extra)
+            .env("TOKCTL_CODEX_DIR", &root)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+            .output()
+            .unwrap()
+    };
+    assert!(report(&[]).status.success());
+    let connection = rusqlite::Connection::open(workspace.path().join("cache/cache.db")).unwrap();
+    connection.execute_batch("UPDATE events SET cost_provenance='legacy'; UPDATE parser_provenance SET signature='stale';").unwrap();
+    drop(connection);
+    fs::rename(&root, workspace.path().join("offline")).unwrap();
+    let offline = report(&[]);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&offline.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let warnings = String::from_utf8_lossy(&offline.stderr);
+    assert!(
+        warnings.contains("retained 1 legacy cost row(s)"),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("retained 1 file snapshot(s) from a stale parser"),
+        "{warnings}"
+    );
+    let excluded = report(&["--since", "2026-04-21", "--until", "2026-04-21"]);
+    assert!(excluded.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&excluded.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(!String::from_utf8_lossy(&excluded.stderr).contains("retained"));
+}
+
+#[test]
+fn diagnostic_failure_prevents_partial_report_stdout() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    fs::create_dir(&root).unwrap();
+    write_codex_session(&root, "session.jsonl", workspace.path(), "saved-session");
+    let report = |command: &str| {
+        let mut command_line = tokctl();
+        command_line
+            .args([command, "--json", "--source", "codex"])
+            .env("TOKCTL_CODEX_DIR", &root)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"));
+        if command == "compare" {
+            command_line.args(["2026-04-20..2026-04-20", "2026-04-19..2026-04-19"]);
+        }
+        command_line.output().unwrap()
+    };
+    assert!(report("daily").status.success());
+    let connection = rusqlite::Connection::open(workspace.path().join("cache/cache.db")).unwrap();
+    connection
+        .execute("UPDATE ingest_diagnostics SET skipped_records=-1", [])
+        .unwrap();
+    drop(connection);
+    for command in ["daily", "monthly", "session", "repo", "compare"] {
+        let output = report(command);
+        assert!(!output.status.success(), "{command}");
+        assert!(
+            output.stdout.is_empty(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn malformed_only_files_warn_in_selected_source_roots_without_events() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("malformed.jsonl"), "{broken json\n").unwrap();
+    for no_cache in [false, true] {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "codex"])
+            .env("TOKCTL_CODEX_DIR", &root)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"));
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!([])
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("skipped 1 malformed input line(s)")
+        );
     }
 }

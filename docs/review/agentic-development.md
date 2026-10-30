@@ -1,5 +1,7 @@
 # Agentic development refactor verification
 
+This records the first refactor. See the [later excellence reassessment](excellence-reassessment.md) for the current verdict and additional fixes.
+
 Date: 2026-11-04. Baseline: `20a887f`. Implementation: `5b24f5f`.
 Work happened in an isolated local worktree. No branch was pushed.
 

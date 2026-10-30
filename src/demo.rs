@@ -1,7 +1,5 @@
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Utc};
-#[cfg(test)]
-use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 use crate::pricing;
@@ -140,6 +138,8 @@ fn seed_demo_cache_at(
             size: 384_000,
             mtime_ns: now_ns,
             last_offset: 384_000,
+            file_identity: None,
+            ctime_ns: None,
             n_events: events.iter().filter(|event| event.source == source).count() as u64,
             session_id: None,
             model: None,
@@ -364,7 +364,7 @@ mod tests {
         drop(conn);
         let err = seed_demo_cache(dir.path(), true).unwrap_err();
         assert!(err.to_string().contains("unmarked cache"));
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let conn = open_store(&path).unwrap();
         let value: String = conn
             .query_row("SELECT value FROM meta WHERE key = 'private'", [], |row| {
                 row.get(0)
@@ -382,8 +382,7 @@ mod tests {
         conn.execute_batch("CREATE TRIGGER fail_demo_insert BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'injected seed failure'); END;").unwrap();
         drop(conn);
         assert!(seed_demo_cache(dir.path(), true).is_err());
-        let conn = Connection::open_with_flags(&first.cache_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
+        let conn = open_store(&first.cache_path).unwrap();
         let events: usize = conn
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
