@@ -10,9 +10,64 @@ pub struct PriceEntry {
     pub cache_write: f64,
 }
 
-// USD per 1M tokens. Last verified 2026-04.
+// USD per 1M tokens. Last verified 2026-11-03 for Claude 5 and GPT-6 models, 2026-04 for the rest.
 const PRICES: &[(&str, PriceEntry)] = &[
     // Anthropic
+    (
+        "claude-fable-5-1",
+        PriceEntry {
+            input: 10.0,
+            output: 50.0,
+            cache_read: 0.25,
+            cache_write: 12.5,
+        },
+    ),
+    (
+        "claude-opus-5-5",
+        PriceEntry {
+            input: 4.0,
+            output: 20.0,
+            cache_read: 0.2,
+            cache_write: 5.0,
+        },
+    ),
+    (
+        "claude-opus-5",
+        PriceEntry {
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+        },
+    ),
+    (
+        "claude-sonnet-5-5",
+        PriceEntry {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.1,
+            cache_write: 2.5,
+        },
+    ),
+    (
+        "claude-sonnet-5",
+        PriceEntry {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.2,
+            cache_write: 2.5,
+        },
+    ),
+    // Rate for prompts up to 100,000 tokens. Longer prompts cost 5x, which this table does not model.
+    (
+        "claude-haiku-5-5",
+        PriceEntry {
+            input: 0.1,
+            output: 0.5,
+            cache_read: 0.01,
+            cache_write: 0.125,
+        },
+    ),
     (
         "claude-fable-5",
         PriceEntry {
@@ -159,6 +214,52 @@ const PRICES: &[(&str, PriceEntry)] = &[
         },
     ),
     // OpenAI (Codex)
+    // Short-context rates, for up to 272K input tokens. A longer prompt costs more, which this table does not model.
+    (
+        "gpt-6-astra",
+        PriceEntry {
+            input: 10.0,
+            output: 50.0,
+            cache_read: 1.0,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-6.1-sol",
+        PriceEntry {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.1,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-6-sol",
+        PriceEntry {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.2,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-6.1-terra",
+        PriceEntry {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.05,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-6-luna",
+        PriceEntry {
+            input: 0.1,
+            output: 0.5,
+            cache_read: 0.01,
+            cache_write: 0.0,
+        },
+    ),
     (
         "gpt-5",
         PriceEntry {
@@ -468,6 +569,8 @@ mod tests {
         assert!(has_price("claude-opus-4-7"));
         assert!(has_price("claude-3-5-haiku-20241022"));
         assert!(has_price("claude-sonnet-4-6-20250101"));
+        assert!(has_price("claude-opus-5-5"));
+        assert!(has_price("gpt-6.1-sol"));
         assert!(has_price("gpt-5.5"));
         assert!(has_price("gpt-5.5-pro"));
         assert!(!has_price("gpt-99-ultra"));
