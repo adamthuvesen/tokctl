@@ -19,7 +19,7 @@ From the repo root:
 
 ## Reading results
 
-Each drive prints `PASS|FAIL <drive> <seconds>s <detail>`. A FAIL detail names the expected and the actual value. The run ends with `evidence: .verify/runs/<utc>-<sha7>[-dirty]/`, which holds `build.log`, one `<drive>.<step>.json` per command (argv, env, exit, stdout, stderr), `ui.screen.txt` for the PTY drive, and `summary.json`. The helper does not retry, so it never reports `FLAKY`. A FAIL is a FAIL: rerun it by name to investigate, and report both results.
+Each drive prints `PASS|FAIL <drive> <seconds>s <detail>`. A FAIL detail names the expected and the actual value. A drive that crashes is a FAIL. The run also fails when a drive changes the checkout: a tracked, untracked, or ignored file (`target/` included), the index, HEAD, or `.git/config`; only `.verify/` may change. The run ends with `evidence: .verify/runs/<utc>-<sha7>[-dirty]/`, which holds `build.log`, one `<drive>.<step>.json` per command (argv, env, exit, stdout, stderr), `ui.screen.txt` for the PTY drive, and `summary.json` (overall `result` and `checkout_changed`). The helper does not retry, so it never reports `FLAKY`. A FAIL is a FAIL: rerun it by name to investigate, and report both results.
 
 ## Limits
 

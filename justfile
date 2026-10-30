@@ -14,11 +14,15 @@ verify *args:
 # Auto-fixers: format in place.
 fix:
     cargo fmt --all
+    uvx ruff@0.17.4 check --fix .agents/skills/verify-tokctl/verify
+    uvx ruff@0.17.4 format .agents/skills/verify-tokctl/verify
 
 fmt:
     cargo fmt --all -- --check
+    uvx ruff@0.17.4 format --check .agents/skills/verify-tokctl/verify
 
 lint:
+    uvx ruff@0.17.4 check .agents/skills/verify-tokctl/verify
     cargo clippy --locked --all-targets --all-features -- -D warnings
     cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
