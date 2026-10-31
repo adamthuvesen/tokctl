@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use std::io::{self, Write};
 
 use super::pipeline::{
-    prepare_run, query_scope, resolve_root_dirs, sync_cursor_if_needed, CachedRun, SourceScope,
+    cursor_sync_target_dir, prepare_run, query_scope, resolve_root_dirs, sync_cursor_if_needed,
+    CachedRun, SourceScope,
 };
 use super::{
     CompareArgs, CursorArgs, CursorCommands, CursorLoginArgs, DemoArgs, DoctorArgs, GroupBy,
@@ -14,7 +15,6 @@ use crate::cursor_sync::{
     validate_cursor_session,
 };
 use crate::dates::{parse_since, parse_until};
-use crate::paths::cursor_sync_cache_dir;
 use crate::render::{
     render_json, render_repo_json, render_repo_table, render_table, render_warnings,
 };
@@ -211,7 +211,7 @@ fn run_cursor_status() -> Result<()> {
 }
 
 fn run_cursor_sync() -> Result<()> {
-    let result = sync_active_account(Some(&cursor_sync_cache_dir()))?;
+    let result = sync_active_account(Some(&cursor_sync_target_dir(None)))?;
     writeln!(
         io::stdout().lock(),
         "Synced Cursor usage to {} ({} rows)",

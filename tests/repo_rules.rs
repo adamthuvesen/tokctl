@@ -101,6 +101,32 @@ fn doctor_network_uses(files: &[(PathBuf, String)]) -> Vec<String> {
     found
 }
 
+const NETWORK_OWNER: &str = "src/cursor_sync.rs";
+
+fn stray_network_uses(files: &[(PathBuf, String)]) -> Vec<String> {
+    let banned = ["reqwest", "std::net", "process::Command"];
+    let mut found = Vec::new();
+    for (path, text) in files
+        .iter()
+        .filter(|(path, _)| path != Path::new(NETWORK_OWNER))
+    {
+        for token in banned.iter().filter(|token| text.contains(**token)) {
+            found.push(format!("{}: uses {token}", path.display()));
+        }
+    }
+    found
+}
+
+#[test]
+fn network_and_process_calls_stay_in_the_cursor_sync_owner() {
+    let found = stray_network_uses(&files_under(&["src"]));
+    assert!(
+        found.is_empty(),
+        "only {NETWORK_OWNER} may use the network or spawn processes:\n{}",
+        found.join("\n")
+    );
+}
+
 #[test]
 fn doctor_stays_offline() {
     let found = doctor_network_uses(&files_under(&["src/doctor", "src/store/inspection.rs"]));
@@ -150,6 +176,25 @@ fn connection_lint_allows_stay_in_store() {
     );
 }
 
+/// True when `text` defines `fn name(` without `#[ignore]`: an ignored test never runs, so it
+/// cannot enforce a rule.
+fn rust_fn_is_live_test(text: &str, name: &str) -> bool {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let Some(at) = lines.iter().position(|line| {
+        line.trim_start_matches("pub ")
+            .starts_with(&format!("fn {name}("))
+    }) else {
+        return false;
+    };
+    let attributes: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|line| line.starts_with("#["))
+        .copied()
+        .collect();
+    !attributes.iter().any(|a| a.starts_with("#[ignore"))
+}
+
 fn citation_problems(agents: &str) -> Vec<String> {
     let section = agents
         .split("\n## Enforced Rules\n")
@@ -179,7 +224,7 @@ fn citation_problems(agents: &str) -> Vec<String> {
         for citation in names {
             let defined = citation.split_once("::").is_some_and(|(file, name)| {
                 fs::read_to_string(Path::new(ROOT).join(file)).is_ok_and(|text| {
-                    text.contains(&format!("fn {name}("))
+                    rust_fn_is_live_test(&text, name)
                         || text.contains(&format!("def {name}("))
                         || text.lines().any(|line| {
                             let rest = line.trim_start().strip_prefix(name).unwrap_or("#");
@@ -227,6 +272,11 @@ fn each_scan_finds_its_known_violation() {
         doctor_network_uses(&doctor),
         ["src/doctor/x.rs: uses reqwest"]
     );
+
+    let net = vec![(PathBuf::from("src/x.rs"), "use reqwest;".to_string())];
+    assert_eq!(stray_network_uses(&net), ["src/x.rs: uses reqwest"]);
+    assert!(rust_fn_is_live_test("#[test]\nfn a() {}", "a"));
+    assert!(!rust_fn_is_live_test("#[test]\n#[ignore]\nfn a() {}", "a"));
 
     let allow = format!("#[allow(clippy::{})]", "disallowed_types");
     let stray = vec![(PathBuf::from("src/x.rs"), allow)];

@@ -479,3 +479,51 @@ fn malformed_only_files_warn_in_selected_source_roots_without_events() {
         );
     }
 }
+
+fn claude_line(message_id: &str, session: &str, input: u64, output: u64) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"2026-04-22T12:00:00Z","sessionId":"{session}","message":{{"id":"{message_id}","model":"claude-sonnet-4-6","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+#[test]
+fn a_claude_message_id_in_two_session_files_counts_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("claude/project");
+    fs::create_dir_all(&project).unwrap();
+    // A resumed session replays m1 in a second file under a new session id; m2 is new there.
+    fs::write(
+        project.join("original.jsonl"),
+        claude_line("m1", "s-original", 100, 40) + "\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("resumed.jsonl"),
+        claude_line("m1", "s-resumed", 100, 40)
+            + "\n"
+            + &claude_line("m2", "s-resumed", 10, 5)
+            + "\n",
+    )
+    .unwrap();
+    for no_cache in [false, true] {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "claude"])
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"));
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            rows[0]["totalTokens"], 155,
+            "no_cache={no_cache}: m1 (140) counts once, plus m2 (15): {rows}"
+        );
+    }
+}

@@ -52,7 +52,10 @@ Cite each enforcer as `path::name`; `enforced_rules_table_cites_real_enforcers` 
 | Displayed and activated rows agree | `src/tui/input/tests.rs::filtered_highlight_copy_details_totals_and_drill_use_the_same_repo` | 2026-11-04 |
 | Demo overwrite needs a synthetic cache | `src/demo.rs::overwrite_refuses_normal_cache_without_changing_rows`, `tests/ingest_safety.rs::normal_ingestion_and_rebuild_remove_demo_overwrite_authority` | 2026-11-04 |
 | Doctor is read-only and offline | `tests/cli_behavior.rs::doctor_json_does_not_create_cache_or_config`, `tests/repo_rules.rs::doctor_stays_offline` | 2026-11-06 |
+| Only the Cursor sync adapter uses the network or spawns processes | `tests/repo_rules.rs::network_and_process_calls_stay_in_the_cursor_sync_owner` | 2026-11-07 |
 | Fixtures hold no real home paths, user names, session IDs, or emails | `tests/repo_rules.rs::fixtures_contain_no_real_identities` | 2026-11-06 |
 | Local, pre-commit, and CI run one fast lane | `tests/repo_rules.rs::fast_lane_runs_in_pre_commit_and_ci` | 2026-11-04 |
 | `verify control` must observe FAIL before a verify pass counts | `.agents/skills/verify-tokctl/verify::control` | 2026-11-06 |
+| The verify helper passes basedpyright strict as its own project, and ruff lints the extensionless script by name | `justfile::lint`, `.agents/skills/verify-tokctl/pyrightconfig.json::"extends"`, `pyproject.toml::typeCheckingMode` | 2026-11-07 |
+| A Claude message id counts once across all session files | `tests/cli_behavior.rs::a_claude_message_id_in_two_session_files_counts_once` | 2026-11-07 |
 | This table cites real enforcers | `tests/repo_rules.rs::enforced_rules_table_cites_real_enforcers` | 2026-11-06 |

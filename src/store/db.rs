@@ -111,6 +111,9 @@ fn migrate_provenance(conn: &mut Connection) -> Result<()> {
             "ALTER TABLE events ADD COLUMN cost_provenance TEXT NOT NULL DEFAULT 'legacy';",
         )?;
     }
+    if !columns.iter().any(|column| column == "message_id") {
+        tx.execute_batch("ALTER TABLE events ADD COLUMN message_id TEXT;")?;
+    }
     let file_columns = {
         let mut statement = tx.prepare("PRAGMA table_info(files)")?;
         let columns = statement

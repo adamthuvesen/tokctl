@@ -1,0 +1,13 @@
+# tokctl is a Rust crate. This file only holds the shared basedpyright settings
+# (agents/stack/stack.toml) that the verify skill's own pyright project extends.
+[tool.basedpyright]
+typeCheckingMode = "strict"
+enableTypeIgnoreComments = false
+reportUnnecessaryTypeIgnoreComment = "error"
+pythonVersion = "3.14"
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+reportMissingTypeStubs = false

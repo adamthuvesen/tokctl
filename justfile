@@ -23,6 +23,7 @@ fmt:
 
 lint:
     uvx ruff@0.17.4 check .agents/skills/verify-tokctl/verify
+    uvx basedpyright@1.40.2 --project .agents/skills/verify-tokctl
     cargo clippy --locked --all-targets --all-features -- -D warnings
     cargo clippy --locked --all-targets --no-default-features -- -D warnings
 

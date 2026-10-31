@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS events (
   cache_write  INTEGER NOT NULL,
   cost_usd     REAL NOT NULL,
   explicit_cost_usd REAL,
-  cost_provenance TEXT NOT NULL DEFAULT 'legacy'
+  cost_provenance TEXT NOT NULL DEFAULT 'legacy',
+  message_id   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS parser_provenance (
@@ -71,4 +72,16 @@ CREATE INDEX IF NOT EXISTS idx_events_session   ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_project   ON events(project_path);
 CREATE INDEX IF NOT EXISTS idx_events_repo      ON events(repo);
 CREATE INDEX IF NOT EXISTS idx_events_file      ON events(file_path);
+CREATE INDEX IF NOT EXISTS idx_events_message   ON events(message_id);
+
+-- The same Claude message id in two session files (a resumed or forked session) counts once.
+-- The copy in the lowest file path wins, so the result does not depend on ingest order.
+CREATE VIEW IF NOT EXISTS counted_events AS
+SELECT e.* FROM events e
+WHERE e.message_id IS NULL
+   OR NOT EXISTS (
+     SELECT 1 FROM events other
+     WHERE other.message_id = e.message_id AND other.source = 'claude'
+       AND other.file_path < e.file_path
+   );
 "#;

@@ -235,6 +235,7 @@ fn cache_status_reports_event_count() {
             cache_write: 0,
             cost_usd: 0.0,
             cost_provenance: "source".into(),
+            message_id: None,
             explicit_cost_usd: Some(0.0),
         }],
     )
@@ -267,6 +268,7 @@ fn model_session_drill_uses_first_non_null_project_path() {
                 cache_write: 0,
                 cost_usd: 0.1,
                 cost_provenance: "source".into(),
+                message_id: None,
                 explicit_cost_usd: Some(0.1),
             },
             EventRow {
@@ -285,6 +287,7 @@ fn model_session_drill_uses_first_non_null_project_path() {
                 cache_write: 0,
                 cost_usd: 0.1,
                 cost_provenance: "source".into(),
+                message_id: None,
                 explicit_cost_usd: Some(0.1),
             },
             EventRow {
@@ -303,6 +306,7 @@ fn model_session_drill_uses_first_non_null_project_path() {
                 cache_write: 0,
                 cost_usd: 0.1,
                 cost_provenance: "source".into(),
+                message_id: None,
                 explicit_cost_usd: Some(0.1),
             },
         ],
@@ -433,6 +437,7 @@ fn mk_event(ts_ms: i64, day: &str, month: &str, src: Source, cost: f64) -> Event
         cache_write: 0,
         cost_usd: cost,
         cost_provenance: "source".into(),
+        message_id: None,
         explicit_cost_usd: Some(cost),
     }
 }

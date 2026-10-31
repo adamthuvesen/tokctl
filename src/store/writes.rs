@@ -38,6 +38,7 @@ pub struct EventRow {
     pub cost_usd: f64,
     pub explicit_cost_usd: Option<f64>,
     pub cost_provenance: String,
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,8 +155,8 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
     let mut stmt = tx.prepare(
         r#"INSERT INTO events
              (file_path, source, ts, day, month, session_id, project_path, repo, model,
-              input, output, cache_read, cache_write, cost_usd, explicit_cost_usd, cost_provenance)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
+              input, output, cache_read, cache_write, cost_usd, explicit_cost_usd, cost_provenance, message_id)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
     )?;
     let mut n = 0usize;
     for r in rows {
@@ -192,6 +193,7 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
             r.cost_usd,
             r.explicit_cost_usd,
             r.cost_provenance,
+            r.message_id,
         ])?;
         n += 1;
     }
@@ -227,6 +229,7 @@ mod tests {
             cost_usd: 0.5,
             explicit_cost_usd: None,
             cost_provenance: crate::pricing::signature(),
+            message_id: None,
         }
     }
 

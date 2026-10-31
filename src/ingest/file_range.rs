@@ -12,6 +12,8 @@ use std::path::Path;
 #[derive(Debug, Default)]
 pub struct ParseResult {
     pub events: Vec<UsageEvent>,
+    /// Claude message id of each event, aligned with `events`; other sources use `None`.
+    pub message_ids: Vec<Option<String>>,
     pub skipped_lines: usize,
 }
 
@@ -62,6 +64,7 @@ pub fn parse_discovered_file(file: &crate::discovery::DiscoveredFile) -> Result<
         crate::types::Source::Cursor => {
             let (events, skipped_lines) = parse_cursor_reader(reader, &file.path)?;
             Ok(ParseResult {
+                message_ids: vec![None; events.len()],
                 events,
                 skipped_lines,
             })
@@ -90,6 +93,7 @@ fn parse_jsonl(reader: impl Read, project: Option<&str>, codex: bool) -> Result<
         if line.is_empty() {
             continue;
         }
+        let mut message_id = None;
         let event = if codex {
             match parse_codex_line(line, &mut context) {
                 Some(CodexParsed::Event(event)) => Some(event),
@@ -102,8 +106,11 @@ fn parse_jsonl(reader: impl Read, project: Option<&str>, codex: bool) -> Result<
         } else {
             match parse_claude_line_classified(line, project) {
                 ClaudeParseResult::Event(parsed) => {
-                    if parsed.message_id.is_some_and(|id| !seen_ids.insert(id)) {
-                        continue;
+                    if let Some(id) = parsed.message_id {
+                        if !seen_ids.insert(id.clone()) {
+                            continue;
+                        }
+                        message_id = Some(id);
                     }
                     Some(parsed.event)
                 }
@@ -119,6 +126,7 @@ fn parse_jsonl(reader: impl Read, project: Option<&str>, codex: bool) -> Result<
                 result.skipped_lines += 1;
             } else {
                 result.events.push(event);
+                result.message_ids.push(message_id);
             }
         }
     }
@@ -137,6 +145,7 @@ pub fn parse_cursor_file(path: &Path) -> Result<ParseResult> {
     read_snapshot(path, None, |file| {
         let (events, skipped_lines) = parse_cursor_reader(file, path)?;
         Ok(ParseResult {
+            message_ids: vec![None; events.len()],
             events,
             skipped_lines,
         })

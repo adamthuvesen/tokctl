@@ -277,6 +277,7 @@ fn demo_event(
         } else {
             pricing::signature()
         },
+        message_id: None,
     }
 }
 

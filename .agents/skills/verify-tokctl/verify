@@ -24,12 +24,22 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 BIN = ROOT / "target" / "debug" / "tokctl"
 SCRATCH = Path(tempfile.mkdtemp(prefix="verify-tokctl-"))
 CHILD_GROUPS: list[int] = []
 SECRET_NAME = re.compile("KEY|TOKEN|SECRET|PASSWORD")
+TRIPWIRE_DIR = SCRATCH / "tripwire"
+TRIPWIRE_LOG = SCRATCH / "tripwire.log"
+# Network and install commands. A stub first on PATH logs the call and exits 97, so a drive that runs one fails.
+TRIPWIRE_TOOLS = (
+    *("curl", "wget", "nc", "ncat", "ssh", "scp", "sftp", "rsync", "telnet", "ftp"),
+    *("pip", "pip3", "uv", "uvx", "npm", "npx", "pnpm", "yarn", "brew", "apt", "apt-get", "gem"),
+    *("cargo", "rustup", "go", "docker", "gh"),
+)
+CLOSED_PROXY = "http://127.0.0.1:9"
 CARGO = shutil.which("cargo") or str(Path.home() / ".cargo/bin/cargo")
 SHARED_PATHS = [
     "Cargo.toml",
@@ -120,7 +130,13 @@ class Run:
         self.name = name
         self.home = Path(tempfile.mkdtemp(prefix=f"{name}-", dir=SCRATCH))
         self.env = {
-            "PATH": "/usr/bin:/bin",
+            "PATH": f"{TRIPWIRE_DIR}:/usr/bin:/bin",
+            "TRIPWIRE_LOG": str(TRIPWIRE_LOG),
+            **{
+                variable: CLOSED_PROXY
+                for base in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+                for variable in (base, base.lower())
+            },
             "HOME": str(self.home),
             "TZ": "UTC",
             "TERM": "xterm-256color",
@@ -208,7 +224,7 @@ def codex_session(cwd: Path) -> str:
     return "".join(json.dumps(line) + "\n" for line in lines)
 
 
-def by_date(rows: list[dict]) -> dict[str, int]:
+def by_date(rows: list[dict[str, Any]]) -> dict[str, int]:
     return {row["date"]: row["totalTokens"] for row in rows}
 
 
@@ -349,7 +365,20 @@ def select_changed() -> list[str]:
     return picked or [SMOKE]
 
 
+def plant_tripwires() -> None:
+    TRIPWIRE_DIR.mkdir(exist_ok=True)
+    for tool in TRIPWIRE_TOOLS:
+        stub = TRIPWIRE_DIR / tool
+        stub.write_text(f'#!/bin/sh\necho "{tool} $*" >> "$TRIPWIRE_LOG"\nexit 97\n')
+        stub.chmod(0o755)
+
+
+def tripwire_hits() -> str:
+    return TRIPWIRE_LOG.read_text().strip() if TRIPWIRE_LOG.exists() else ""
+
+
 def preflight(run_dir: Path) -> None:
+    plant_tripwires()
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     build = subprocess.run(
         [CARGO, "build", "--locked", "--bin", "tokctl"],
@@ -370,7 +399,11 @@ def preflight(run_dir: Path) -> None:
     probe = Run(run_dir, "preflight")
     real_home = Path.home().resolve()
     for key, value in probe.env.items():
-        if key != "PATH" and "/" in value and Path(value).resolve().is_relative_to(real_home):
+        if (
+            key != "PATH"
+            and value.startswith("/")
+            and Path(value).resolve().is_relative_to(real_home)
+        ):
             sys.exit(f"preflight: {key}={value} is inside the real HOME")
     if (probe.home / ".config/tokctl/cursor-credentials.json").exists():
         sys.exit("preflight: temp HOME has Cursor credentials; Cursor sync would reach the network")
@@ -407,6 +440,9 @@ def execute(names: list[str], control: bool = False) -> int:
             except Exception as error:
                 result, detail = "FAIL", f"drive crashed: {type(error).__name__}: {error}"
             seconds = round(time.monotonic() - started, 1)
+            if hits := tripwire_hits():
+                result, detail = "FAIL", f"tripwire fired: {hits}"
+                TRIPWIRE_LOG.unlink()
             if seconds > drive.timeout and result == "PASS":
                 result, detail = "FAIL", f"took {seconds}s, budget {drive.timeout}s"
             print(f"{result} {'control' if control else name} {seconds}s {detail}")

@@ -38,7 +38,7 @@ pub fn local_month(ts: &DateTime<Utc>) -> String {
         .1
 }
 
-fn event_to_row(ev: &UsageEvent, file_path: &str) -> EventRow {
+fn event_to_row(ev: &UsageEvent, file_path: &str, message_id: Option<String>) -> EventRow {
     let cost = cost_of(ev, None);
     EventRow {
         file_path: file_path.to_owned(),
@@ -57,6 +57,7 @@ fn event_to_row(ev: &UsageEvent, file_path: &str) -> EventRow {
         cost_usd: cost,
         explicit_cost_usd: ev.explicit_cost_usd,
         cost_provenance: crate::pricing::provenance(ev),
+        message_id,
     }
 }
 
@@ -76,14 +77,15 @@ fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
     let range = parse_discovered_file(&file)?;
     let ParseResult {
         events,
+        message_ids,
         skipped_lines,
-        ..
     } = range;
 
     let path_str = file.path.to_string_lossy().into_owned();
     let rows: Vec<EventRow> = events
         .iter()
-        .map(|ev| event_to_row(ev, &path_str))
+        .zip(message_ids)
+        .map(|(ev, message_id)| event_to_row(ev, &path_str, message_id))
         .collect();
     let first_session = events.first().map(|e| e.session_id.clone());
     let first_model = events.first().map(|e| e.model.clone());
@@ -378,6 +380,7 @@ mod tests {
             cost_usd: 0.0,
             explicit_cost_usd: None,
             cost_provenance: "legacy".into(),
+            message_id: None,
         }
     }
 

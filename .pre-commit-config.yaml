@@ -5,5 +5,5 @@ repos:
         name: just check
         entry: just check
         language: system
-        files: '(^Cargo\.(toml|lock)$|\.rs$|^AGENTS\.md$|^justfile$)'
+        files: '(^Cargo\.(toml|lock)$|\.rs$|^AGENTS\.md$|^justfile$|^\.agents/skills/verify-tokctl/verify$)'
         pass_filenames: false

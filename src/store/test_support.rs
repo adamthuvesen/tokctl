@@ -41,6 +41,7 @@ pub fn event_row(
         cost_usd: cost,
         explicit_cost_usd: None,
         cost_provenance: "legacy".into(),
+        message_id: None,
     }
 }
 

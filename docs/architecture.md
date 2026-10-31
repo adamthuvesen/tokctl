@@ -38,6 +38,10 @@ Non-Unix systems conservatively reparse files because the current identity imple
 Each changed file is parsed completely so deduplication and cumulative provider counters retain their full context.
 Unchanged files use manifest and parser fingerprints to avoid parsing.
 
+A Claude `message.id` counts once per report. A file keeps the first copy of an id.
+Queries read the `counted_events` view, which also drops a copy whose id appears in a file with a lower path.
+This stops a resumed or forked session from counting the replayed messages twice.
+
 Parsing runs in bounded parallel batches. SQLite writes run serially.
 A file replacement publishes its events, manifest, parser provenance, diagnostics, and repository metadata in one transaction.
 A read or parse failure preserves the previous file snapshot.
