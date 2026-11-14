@@ -99,8 +99,14 @@ pub fn cursor_sync_target_dir(cursor_dir: Option<&str>) -> PathBuf {
 }
 
 pub fn maybe_sync_cursor(target_dir: Option<&Path>) -> Result<Option<String>> {
-    if !has_configured_account()? {
-        return Ok(None);
+    match has_configured_account() {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(error) => {
+            return Ok(Some(format!(
+                "Cursor unavailable: {error:#}. Reporting the other sources."
+            )));
+        }
     }
     Ok(sync_active_account(target_dir)
         .err()

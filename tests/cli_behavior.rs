@@ -527,3 +527,66 @@ fn a_claude_message_id_in_two_session_files_counts_once() {
         );
     }
 }
+
+fn write_cursor_credentials(home: &std::path::Path, contents: &str) {
+    let dir = home.join(".config/tokctl");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("cursor-credentials.json"), contents).unwrap();
+}
+
+#[test]
+fn cursor_status_lists_accounts_and_reports_a_failed_validation() {
+    let home = tempfile::tempdir().unwrap();
+    write_cursor_credentials(
+        home.path(),
+        r#"{"version":1,"activeAccountId":"acct-1","accounts":{"acct-1":{"sessionToken":"synthetic-token","createdAt":"2026-04-01T00:00:00Z","label":"work"}}}"#,
+    );
+    // A closed local proxy makes validation fail without any request leaving this machine.
+    let output = tokctl()
+        .args(["cursor", "status"])
+        .env("HOME", home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("* acct-1 (work)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("session: not validated"),
+        "stdout: {stdout}"
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("validating Cursor session"));
+}
+
+#[test]
+fn a_corrupt_cursor_credentials_file_leaves_the_other_sources_reporting() {
+    let workspace = tempfile::tempdir().unwrap();
+    write_cursor_credentials(workspace.path(), "{not json");
+    let project = workspace.path().join("claude/project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("s.jsonl"),
+        claude_line("m1", "s", 100, 40) + "\n",
+    )
+    .unwrap();
+    let output = tokctl()
+        .args(["daily", "--json"])
+        .env("HOME", workspace.path())
+        .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+        .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["totalTokens"], 140);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cursor unavailable: invalid Cursor credentials at"),
+        "{stderr}"
+    );
+}

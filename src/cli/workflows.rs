@@ -184,7 +184,7 @@ fn run_cursor_status() -> Result<()> {
         writeln!(io::stdout().lock(), "No saved Cursor accounts.")?;
         return Ok(());
     }
-    let validation = validate_active_account()?;
+    let validation = validate_active_account();
     for account in accounts {
         let marker = if account.is_active { "*" } else { " " };
         writeln!(
@@ -203,11 +203,17 @@ fn run_cursor_status() -> Result<()> {
                 .unwrap_or_default(),
         )?;
         writeln!(io::stdout().lock(), "  created: {}", account.created_at)?;
-        if account.is_active && validation.is_some() {
-            writeln!(io::stdout().lock(), "  session: valid")?;
+        if account.is_active {
+            match &validation {
+                Ok(Some(())) => writeln!(io::stdout().lock(), "  session: valid")?,
+                Ok(None) => {}
+                Err(error) => {
+                    writeln!(io::stdout().lock(), "  session: not validated ({error:#})")?
+                }
+            }
         }
     }
-    Ok(())
+    validation.map(|_| ())
 }
 
 fn run_cursor_sync() -> Result<()> {

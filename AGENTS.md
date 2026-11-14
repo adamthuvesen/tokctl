@@ -57,5 +57,6 @@ Cite each enforcer as `path::name`; `enforced_rules_table_cites_real_enforcers` 
 | Local, pre-commit, and CI run one fast lane | `tests/repo_rules.rs::fast_lane_runs_in_pre_commit_and_ci` | 2026-11-04 |
 | `verify control` must observe FAIL before a verify pass counts | `.agents/skills/verify-tokctl/verify::control` | 2026-11-06 |
 | The verify helper passes basedpyright strict as its own project, and ruff lints the extensionless script by name | `justfile::lint`, `.agents/skills/verify-tokctl/pyrightconfig.json::"extends"`, `pyproject.toml::typeCheckingMode` | 2026-11-07 |
+| No crate, module, or Python file turns a check off: no inner `#![allow]`, no `[lints]` allow, no bare or file-wide `noqa`, no bare or reasonless `pyright: ignore`, no weaker `pyright:` mode | `tests/repo_rules.rs::no_check_is_silenced_for_a_whole_file_or_crate` | 2026-11-09 |
 | A Claude message id counts once across all session files | `tests/cli_behavior.rs::a_claude_message_id_in_two_session_files_counts_once` | 2026-11-07 |
 | This table cites real enforcers | `tests/repo_rules.rs::enforced_rules_table_cites_real_enforcers` | 2026-11-06 |

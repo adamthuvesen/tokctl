@@ -437,6 +437,11 @@ def execute(names: list[str], control: bool = False) -> int:
                 result = "PASS"
             except (DriveFailure, subprocess.TimeoutExpired) as error:
                 result, detail = "FAIL", str(error)
+            except SystemExit as early_exit:
+                result, detail = (
+                    "FAIL",
+                    f"the drive exited the process early (exit {early_exit.code!r})",
+                )
             except Exception as error:
                 result, detail = "FAIL", f"drive crashed: {type(error).__name__}: {error}"
             seconds = round(time.monotonic() - started, 1)

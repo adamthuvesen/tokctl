@@ -176,6 +176,87 @@ fn connection_lint_allows_stay_in_store() {
     );
 }
 
+/// Lint silencers that turn a check off for a whole crate, module, or file: an inner
+/// `#![allow(...)]`, a `[lints]` entry set to "allow", and a Python file-wide or blanket suppression.
+fn silenced_lints(files: &[(PathBuf, String)]) -> Vec<String> {
+    let allowed_inner = [
+        "src/store/mod.rs",
+        "tests/cli_behavior.rs",
+        "tests/ingest_safety.rs",
+    ];
+    let inner_allow = Regex::new(r"^\s*#!\[\s*allow\s*\(").unwrap();
+    let lints_allow = Regex::new(r#"=\s*(?:"allow"|\{[^}]*level\s*=\s*"allow")"#).unwrap();
+    let noqa = Regex::new(r"#\s*(?:(?:ruff|flake8)\s*:\s*)?noqa\b(?P<codes>\s*:\s*[A-Z]+[0-9]+)?")
+        .unwrap();
+    let file_wide_noqa = Regex::new(r"#\s*(?:ruff|flake8)\s*:\s*noqa").unwrap();
+    let pyright = Regex::new(
+        r"#\s*pyright:\s*(?P<directive>[^\[\s]+)(?:\[(?P<rules>[^\]]*)\])?(?P<reason>.*)",
+    )
+    .unwrap();
+    let mut found = Vec::new();
+    for (path, text) in files {
+        let name = path.to_str().unwrap();
+        for (number, line) in text.lines().enumerate() {
+            let at = format!("{name}:{}", number + 1);
+            if name.ends_with(".rs") && inner_allow.is_match(line) && !allowed_inner.contains(&name)
+            {
+                found.push(format!("{at} allows a lint for a whole module. Fix the code; use #[allow] on one item with a reason"));
+            }
+            if name == "Cargo.toml" && lints_allow.is_match(line) {
+                found.push(format!(
+                    "{at} sets a lint to allow for the whole crate. Fix the code instead"
+                ));
+            }
+            if name.ends_with("/verify") {
+                if file_wide_noqa.is_match(line) {
+                    found.push(format!(
+                        "{at} turns off ruff for the whole file. Remove it and fix the code"
+                    ));
+                } else if let Some(hit) = noqa.captures(line) {
+                    if hit.name("codes").is_none() {
+                        found.push(format!("{at} has a bare noqa. Name the rule and give a reason: # noqa: E402  why"));
+                    }
+                }
+                if let Some(hit) = pyright.captures(line) {
+                    if &hit["directive"] != "ignore" {
+                        found.push(format!(
+                            "{at} sets pyright: {}, which weakens strict checking. Remove it",
+                            &hit["directive"]
+                        ));
+                    } else if hit.name("rules").is_none() {
+                        found.push(format!("{at} has a bare pyright: ignore. Name the rule and give a reason: # pyright: ignore[reportX] why"));
+                    } else if hit["reason"]
+                        .trim_matches(|c: char| c == ' ' || c == '-' || c == ':')
+                        .is_empty()
+                    {
+                        found.push(format!(
+                            "{at} gives pyright: ignore no reason. Add one after the rule"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn no_check_is_silenced_for_a_whole_file_or_crate() {
+    let mut files = files_under(&["src", "tests", "benches", "examples"]);
+    files.extend(
+        files_under(&[".agents/skills/verify-tokctl"])
+            .into_iter()
+            .filter(|(path, _)| path.ends_with("verify")),
+    );
+    let manifest = PathBuf::from("Cargo.toml");
+    files.push((
+        manifest.clone(),
+        fs::read_to_string(Path::new(ROOT).join(&manifest)).unwrap(),
+    ));
+    let found = silenced_lints(&files);
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
 /// True when `text` defines `fn name(` without `#[ignore]`: an ignored test never runs, so it
 /// cannot enforce a rule.
 fn rust_fn_is_live_test(text: &str, name: &str) -> bool {
@@ -281,6 +362,18 @@ fn each_scan_finds_its_known_violation() {
     let allow = format!("#[allow(clippy::{})]", "disallowed_types");
     let stray = vec![(PathBuf::from("src/x.rs"), allow)];
     assert_eq!(stray_connection_allows(&stray), [PathBuf::from("src/x.rs")]);
+
+    let silenced = vec![
+        (PathBuf::from("src/x.rs"), format!("#![{}(unused)]", "allow")),
+        (PathBuf::from("Cargo.toml"), format!("dead_code = \"{}\"", "allow")),
+        (PathBuf::from(".agents/skills/verify-tokctl/verify"), format!("x = 1  # {}\n# ruff: {}\ny: int = 'a'  # pyright: ignore\nz: int = 'a'  # pyright: ignore[reportAssignmentType]\n# pyright: basic", "noqa", "noqa")),
+    ];
+    assert_eq!(
+        silenced_lints(&silenced).len(),
+        7,
+        "{:?}",
+        silenced_lints(&silenced)
+    );
 
     let table = "\n## Enforced Rules\n\n| Rule | Enforced by |\n| --- | --- |\n\
         | ok | `tests/repo_rules.rs::doctor_stays_offline` |\n\
