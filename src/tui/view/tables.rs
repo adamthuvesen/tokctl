@@ -13,8 +13,6 @@ use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, session_when};
 use crate::tui::state::{AppState, Focus, SourceFilter};
 use crate::tui::theme::Palette;
 
-// -- Section: left-row table (Days, Models, Sessions, Repos Costs tab) ------------
-
 pub(super) fn draw_left_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -195,8 +193,6 @@ fn label_cell(label: String, is_selected: bool, palette: &Palette) -> Cell<'stat
     }
 }
 
-// -- Sessions table ---------------------------------------------------------
-
 pub(super) fn draw_sessions_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -298,8 +294,6 @@ pub(super) fn draw_sessions_table(
     ts.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut ts);
 }
-
-// -- Events table (deepest drill) -------------------------------------------
 
 pub(super) fn draw_events_table(
     frame: &mut Frame<'_>,
@@ -411,8 +405,6 @@ fn short_model(model: &str) -> String {
     s.push('…');
     s
 }
-
-// -- Trend table ------------------------------------------------------------
 
 pub(super) fn draw_trend_table(
     frame: &mut Frame<'_>,

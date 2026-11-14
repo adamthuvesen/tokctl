@@ -585,7 +585,6 @@ mod tests {
 
         let conn = open_store(&db_path).unwrap();
 
-        // schema_version bumped
         assert_eq!(read_schema_version(&conn), Some(SCHEMA_VERSION));
         // events.repo backfilled for the resolvable row
         let repo_for_a: Option<String> = conn

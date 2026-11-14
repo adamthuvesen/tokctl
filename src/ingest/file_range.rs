@@ -137,21 +137,6 @@ pub fn parse_claude_file(path: &Path, project: Option<&str>) -> Result<ParseResu
     read_snapshot(path, None, |file| parse_jsonl(file, project, false))
 }
 
-pub fn parse_codex_file(path: &Path) -> Result<ParseResult> {
-    read_snapshot(path, None, |file| parse_jsonl(file, None, true))
-}
-
-pub fn parse_cursor_file(path: &Path) -> Result<ParseResult> {
-    read_snapshot(path, None, |file| {
-        let (events, skipped_lines) = parse_cursor_reader(file, path)?;
-        Ok(ParseResult {
-            message_ids: vec![None; events.len()],
-            events,
-            skipped_lines,
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

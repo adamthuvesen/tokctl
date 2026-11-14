@@ -800,7 +800,6 @@ mod tests {
         let rows = repo_report(&conn, QueryFilter::default()).unwrap();
         assert_eq!(rows[0].display_name, "beta"); // 5.00 cost
         assert_eq!(rows[1].display_name, "alpha"); // 1.50
-                                                   // no-repo bucket present
         assert!(rows.iter().any(|r| r.is_no_repo()));
         assert_eq!(rows.iter().find(|r| r.is_no_repo()).unwrap().sessions, 1);
     }

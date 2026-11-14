@@ -15,8 +15,6 @@ use crate::tui::state::{AppState, DrillKind, Section};
 use crate::tui::theme::Palette;
 use crate::tui::widgets::filter::should_filter;
 
-// -- Header / context -------------------------------------------------------
-
 pub(super) fn draw_header(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -148,8 +146,6 @@ fn truncate_chars(value: &str, width: usize) -> String {
     out.push('…');
     out
 }
-
-// -- Footer / sparkline -----------------------------------------------------
 
 pub(super) fn draw_footer(
     frame: &mut Frame<'_>,
@@ -314,8 +310,6 @@ fn push_hint_group(spans: &mut Vec<Span<'static>>, hints: &[(&str, &str)], palet
         }
     }
 }
-
-// -- Help / detail / filter overlays ----------------------------------------
 
 pub(super) fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
     let block = Block::default()

@@ -12,8 +12,6 @@ const PANEL_BORDER: u16 = 2;
 // 1 top border + 1 top pad + 1 bottom border.
 const PANEL_CHROME_HEIGHT: u16 = 3;
 
-// -- Main panel sizing ------------------------------------------------------
-
 /// Returns the (width, height) the main bordered panel "wants" given the
 /// currently active section and the data in the cache. The caller clamps
 /// these to the available terminal size.

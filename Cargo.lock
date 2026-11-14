@@ -2391,7 +2391,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
  "vt100",
  "walkdir",
 ]

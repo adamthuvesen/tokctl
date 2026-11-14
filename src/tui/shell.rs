@@ -28,7 +28,6 @@ pub fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &AppState, palette
         return;
     }
 
-    // -- Pill header ------------------------------------------------------
     // A short violet block with `Sections` inside, padded one column from
     // the sidebar edge. No rounded border around the sidebar.
     let pill_style = Style::default()
@@ -44,7 +43,6 @@ pub fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &AppState, palette
     };
     frame.render_widget(Paragraph::new(pill_line), pill_rect);
 
-    // -- Items ------------------------------------------------------------
     // Each item gets one row + one blank row between, starting two rows
     // below the pill (so there's breathing room).
     let items_top = area.y + 3;

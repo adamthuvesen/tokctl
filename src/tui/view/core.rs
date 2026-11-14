@@ -87,8 +87,6 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
     }
 }
 
-// -- Main pane dispatch -----------------------------------------------------
-
 fn draw_main(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -154,8 +152,6 @@ fn main_pane_title(state: &AppState) -> String {
         state.current_section.title().to_owned()
     }
 }
-
-// -- Breadcrumb / drill renderer --------------------------------------------
 
 /// Build the cumulative breadcrumb title for the bordered panel:
 /// `SECTION › label_1 [› label_2]`. Labels are kept short by the caller

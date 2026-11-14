@@ -289,8 +289,6 @@ fn drill_is_not_persisted() {
     assert_eq!(loaded.drill_depth(), 0);
 }
 
-// ---- new tests for the drill stack ---------------------------------
-
 #[test]
 fn next_drill_kind_root_repos_is_sessions() {
     let s = AppState {
