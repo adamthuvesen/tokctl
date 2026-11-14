@@ -8,6 +8,7 @@ pub mod dates;
 pub mod demo;
 pub mod discovery;
 pub mod doctor;
+pub mod format;
 pub mod ingest;
 pub mod paths;
 pub mod pricing;
@@ -17,5 +18,6 @@ pub mod sources;
 pub mod store;
 pub mod tui;
 pub mod types;
+pub mod windows;
 
 pub mod calendar;

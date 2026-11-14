@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Local, Utc};
 
-pub use crate::render::fmt_num;
+pub use crate::format::fmt_num;
 
 pub fn fmt_cost(n: f64) -> String {
     format!("${:.2}", n)

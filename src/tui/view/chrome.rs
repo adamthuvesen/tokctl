@@ -48,7 +48,7 @@ pub(super) fn draw_header(
                 window_label,
                 scope_suffix,
                 fmt_cost(total_cost),
-                crate::render::fmt_wide_num(total_tokens),
+                crate::format::fmt_wide_num(total_tokens),
             ),
             palette.dim_text(),
         ),
@@ -430,7 +430,7 @@ pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String>
                         ),
                         format!(
                             "tokens: {}",
-                            crate::render::fmt_wide_num(u128::from(row.total_tokens))
+                            crate::format::fmt_wide_num(u128::from(row.total_tokens))
                         ),
                         format!("cost: {}", fmt_cost(row.cost)),
                         "copy: y key, Y summary".into(),
@@ -475,7 +475,7 @@ pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String>
             .map(|row| {
                 vec![
                     format!("bucket: {}", row.bucket),
-                    format!("tokens: {}", crate::render::fmt_wide_num(row.total_tokens)),
+                    format!("tokens: {}", crate::format::fmt_wide_num(row.total_tokens)),
                     format!("total: {}", fmt_cost(row.total_cost)),
                     format!("claude: {}", fmt_cost(row.claude_cost)),
                     format!("codex: {}", fmt_cost(row.codex_cost)),
@@ -506,7 +506,7 @@ pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String>
                     ),
                     format!(
                         "tokens: {}",
-                        crate::render::fmt_wide_num(u128::from(row.total_tokens))
+                        crate::format::fmt_wide_num(u128::from(row.total_tokens))
                     ),
                     format!("cost: {}", fmt_cost(row.cost)),
                     "copy: y key, Y summary".into(),
@@ -527,7 +527,7 @@ pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String>
                     format!("sessions: {}", fmt_num(row.sessions)),
                     format!(
                         "tokens: {}",
-                        crate::render::fmt_wide_num(u128::from(row.total_tokens))
+                        crate::format::fmt_wide_num(u128::from(row.total_tokens))
                     ),
                     format!("cost: {}", fmt_cost(row.cost)),
                     "copy: y key, Y summary".into(),

@@ -1,3 +1,4 @@
+use crate::calendar::Calendar;
 use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoveredFile};
 use crate::ingest::file_range::{parse_discovered_file, ParseResult};
 use crate::ingest::plan::{plan_ingest, IngestPlan, PlanInput};
@@ -9,7 +10,6 @@ use crate::store::writes::{
 };
 use crate::types::{IngestStats, Source, UsageEvent};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
@@ -22,30 +22,20 @@ pub struct RunIngestOptions {
     pub source: Option<Source>,
 }
 
-/// YYYY-MM-DD bucket key in the user's local timezone (matches what humans
-/// see in their session logs, not UTC).
-pub fn local_day(ts: &DateTime<Utc>) -> String {
-    crate::calendar::Calendar::system()
-        .expect("calendar resolved before ingest")
-        .local_day_month(*ts)
-        .0
-}
-
-pub fn local_month(ts: &DateTime<Utc>) -> String {
-    crate::calendar::Calendar::system()
-        .expect("calendar resolved before ingest")
-        .local_day_month(*ts)
-        .1
-}
-
-fn event_to_row(ev: &UsageEvent, file_path: &str, message_id: Option<String>) -> EventRow {
+fn event_to_row(
+    calendar: &Calendar,
+    ev: &UsageEvent,
+    file_path: &str,
+    message_id: Option<String>,
+) -> EventRow {
     let cost = cost_of(ev, None);
+    let (day, month) = calendar.local_day_month(ev.timestamp);
     EventRow {
         file_path: file_path.to_owned(),
         source: ev.source,
         ts: ev.timestamp.timestamp_millis(),
-        day: local_day(&ev.timestamp),
-        month: local_month(&ev.timestamp),
+        day,
+        month,
         session_id: ev.session_id.clone(),
         project_path: ev.project_path.clone(),
         repo: None,
@@ -73,7 +63,7 @@ struct ParsedFile {
 
 /// Parse a coherent file snapshot and produce insertable rows.
 /// Runs on a rayon worker — no SQLite access here.
-fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
+fn parse_file(calendar: &Calendar, file: DiscoveredFile) -> Result<ParsedFile> {
     let range = parse_discovered_file(&file)?;
     let ParseResult {
         events,
@@ -85,7 +75,7 @@ fn parse_file(file: DiscoveredFile) -> Result<ParsedFile> {
     let rows: Vec<EventRow> = events
         .iter()
         .zip(message_ids)
-        .map(|(ev, message_id)| event_to_row(ev, &path_str, message_id))
+        .map(|(ev, message_id)| event_to_row(calendar, ev, &path_str, message_id))
         .collect();
     let first_session = events.first().map(|e| e.session_id.clone());
     let first_model = events.first().map(|e| e.model.clone());
@@ -165,7 +155,8 @@ pub fn run_ingest(store: &mut crate::store::Store, opts: RunIngestOptions) -> Re
             );
         }
     }
-    crate::store::db::reproject(conn, &crate::calendar::Calendar::system()?)?;
+    let calendar = Calendar::system()?;
+    crate::store::db::reproject(conn, &calendar)?;
     conn.execute("DELETE FROM meta WHERE key='demo_marker'", [])?;
 
     let mut plan = plan_ingest(PlanInput {
@@ -198,7 +189,7 @@ pub fn run_ingest(store: &mut crate::store::Store, opts: RunIngestOptions) -> Re
             error.reason
         );
     }
-    let mut stats = execute_plan(conn, plan)?;
+    let mut stats = execute_plan(conn, plan, &calendar)?;
     stats.file_errors += discovery_errors;
     Ok(stats)
 }
@@ -237,7 +228,11 @@ fn stamp_repos(
     }
 }
 
-fn execute_plan(conn: &mut Connection, plan: IngestPlan) -> Result<IngestStats> {
+fn execute_plan(
+    conn: &mut Connection,
+    plan: IngestPlan,
+    calendar: &Calendar,
+) -> Result<IngestStats> {
     let mut stats = IngestStats {
         files_scanned: plan.to_skip.len() + plan.to_full_parse.len() + plan.to_purge.len(),
         files_skipped: plan.to_skip.len(),
@@ -258,7 +253,7 @@ fn execute_plan(conn: &mut Connection, plan: IngestPlan) -> Result<IngestStats> 
     for batch in plan.to_full_parse.chunks(batch_size) {
         let results: Vec<_> = batch
             .par_iter()
-            .map(|file| parse_file(file.clone()))
+            .map(|file| parse_file(calendar, file.clone()))
             .collect();
         for (file, result) in batch.iter().zip(results) {
             let mut parsed = match result {
@@ -341,9 +336,9 @@ mod tests {
 
     #[test]
     fn local_day_month_formats() {
-        let ts: DateTime<Utc> = "2026-04-18T09:00:05Z".parse().unwrap();
-        assert_eq!(local_day(&ts).len(), 10);
-        assert_eq!(local_month(&ts).len(), 7);
+        let ts: chrono::DateTime<chrono::Utc> = "2026-04-18T09:00:05Z".parse().unwrap();
+        let (day, month) = Calendar::named("UTC").unwrap().local_day_month(ts);
+        assert_eq!((day.as_str(), month.as_str()), ("2026-04-18", "2026-04"));
     }
 
     fn manifest_row(path: &str, source: Source) -> FileManifestRow {
@@ -421,7 +416,8 @@ mod tests {
         };
         let mut conn = crate::store::Store::ephemeral().unwrap();
 
-        let stats = execute_plan(conn.connection_mut(), plan).unwrap();
+        let stats =
+            execute_plan(conn.connection_mut(), plan, &Calendar::system().unwrap()).unwrap();
 
         assert_eq!(stats.file_errors, 1);
         assert_eq!(stats.events_inserted, 1);

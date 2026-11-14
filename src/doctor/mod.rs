@@ -1,4 +1,4 @@
-use crate::store::inspection as checks;
+mod checks;
 mod render;
 
 use crate::discovery::{discover_claude, discover_codex, discover_cursor};
@@ -160,14 +160,14 @@ pub fn run() -> DoctorReport {
         discovered_cursor_files: cursor_discovery.files.len(),
     };
 
-    match checks::inspect_cache(&cache_path) {
-        Ok(cache) => {
-            summary.event_count = cache.event_count;
-            summary.file_count = cache.file_count;
-            summary.repo_count = cache.repo_count;
-            checks.extend(cache.checks);
+    match crate::store::inspection::inspect_cache(&cache_path) {
+        Ok(facts) => {
+            summary.event_count = facts.event_count;
+            summary.file_count = facts.file_count;
+            summary.repo_count = facts.repo_count;
+            checks.extend(checks::cache_checks(facts));
         }
-        Err(check) => checks.push(check),
+        Err(fault) => checks.push(checks::cache_fault_check(&cache_path, fault)),
     }
 
     checks.push(checks::cursor_sync_check());
