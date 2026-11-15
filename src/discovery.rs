@@ -1,9 +1,8 @@
 use crate::types::Source;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::Metadata;
-use std::io::BufRead;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
@@ -12,20 +11,15 @@ pub struct DiscoveredFile {
     pub project: Option<String>,
     pub size: u64,
     pub mtime_ns: i64,
+    pub file_identity: Option<String>,
+    pub ctime_ns: Option<i64>,
 }
 
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub files: Vec<DiscoveredFile>,
-    /// Paths whose containing directory looks unchanged; trust the manifest.
-    pub unchanged_paths: HashSet<PathBuf>,
-}
-
-/// A manifest row has at least these fields from the planner's perspective.
-/// The store module defines the full struct.
-pub trait ManifestLike {
-    fn mtime_ns(&self) -> i64;
-    fn size(&self) -> u64;
+    pub complete_roots: Vec<(Source, PathBuf)>,
+    pub errors: Vec<DiscoveryError>,
 }
 
 /// Convert a SystemTime (typically from std::fs::Metadata::modified) to
@@ -39,10 +33,42 @@ pub fn mtime_ns(metadata: &Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn system_time_ns(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+pub fn file_identity(metadata: &Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+pub fn ctime_ns(metadata: &Metadata) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata
+            .ctime()
+            .checked_mul(1_000_000_000)?
+            .checked_add(metadata.ctime_nsec())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+impl DiscoveredFile {
+    pub fn matches_metadata(&self, metadata: &Metadata) -> bool {
+        self.size == metadata.len()
+            && self.mtime_ns == mtime_ns(metadata)
+            && self.file_identity == file_identity(metadata)
+            && self.ctime_ns == ctime_ns(metadata)
+    }
 }
 
 /// Decode Claude's project-slug folder naming. Claude Code encodes a cwd like
@@ -54,395 +80,142 @@ fn decode_claude_slug(folder_name: &str) -> Option<String> {
         .map(|rest| format!("/{}", rest.replace('-', "/")))
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct DiscoverOpts {
-    pub safety_window_ms: i64,
-    pub now_ms: i64,
+#[derive(Debug)]
+pub struct DiscoveryError {
+    pub path: PathBuf,
+    pub reason: String,
 }
 
-impl DiscoverOpts {
-    pub fn safety_threshold_ns(&self) -> i64 {
-        (self.now_ms - self.safety_window_ms).saturating_mul(1_000_000)
-    }
-}
-
-/// Index a manifest map by the parent directory of each path.
-pub fn index_manifest_by_parent<M: ManifestLike>(
-    manifest: &HashMap<PathBuf, M>,
-) -> HashMap<PathBuf, ParentEntry> {
-    let mut by_parent: HashMap<PathBuf, ParentEntry> = HashMap::new();
-    for (p, row) in manifest {
-        let parent = p
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(""));
-        let entry = by_parent.entry(parent).or_default();
-        entry.paths.push(p.clone());
-        let m = row.mtime_ns();
-        if m > entry.max_mtime_ns {
-            entry.max_mtime_ns = m;
-        }
-    }
-    by_parent
-}
-
-#[derive(Debug, Default)]
-pub struct ParentEntry {
-    pub paths: Vec<PathBuf>,
-    pub max_mtime_ns: i64,
-}
-
-fn walk_with_short_circuit<M: ManifestLike>(
-    dir: &Path,
-    source: Source,
-    project: Option<String>,
-    manifest: &HashMap<PathBuf, M>,
-    index: &HashMap<PathBuf, ParentEntry>,
-    safety_threshold_ns: i64,
-    out: &mut Discovery,
-) {
-    let Ok(md) = std::fs::metadata(dir) else {
-        return;
-    };
-    if !md.is_dir() {
-        return;
-    }
-    let dir_mtime_ns = md.modified().ok().map(system_time_ns).unwrap_or(0);
-
-    let dir_pb = dir.to_path_buf();
-    if let Some(entry) = index.get(&dir_pb) {
-        if dir_mtime_ns <= entry.max_mtime_ns {
-            // Dir hasn't advanced past any manifest entry. Short-circuit only
-            // when every known file still matches; appends update file metadata
-            // without necessarily touching the parent directory mtime.
-            let all_files_unchanged = entry.paths.iter().all(|p| {
-                let Some(row) = manifest.get(p) else {
-                    return false;
-                };
-                if row.mtime_ns() >= safety_threshold_ns {
-                    return false;
-                }
-                let Ok(md) = std::fs::metadata(p) else {
-                    return false;
-                };
-                md.is_file() && md.len() == row.size() && mtime_ns(&md) == row.mtime_ns()
-            });
-            if all_files_unchanged {
-                for p in &entry.paths {
-                    out.unchanged_paths.insert(p.clone());
-                }
-                return;
-            }
-        }
-    }
-
-    // Full walk
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let path = e.path();
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_dir() {
-            walk_with_short_circuit(
-                &path,
-                source,
-                project.clone(),
-                manifest,
-                index,
-                safety_threshold_ns,
-                out,
-            );
-        } else if ft.is_file() && matches_discovered_file(&path, source) {
-            let Ok(fmd) = e.metadata() else { continue };
-            out.files.push(DiscoveredFile {
-                path,
-                source,
-                project: project.clone(),
-                size: fmd.len(),
-                mtime_ns: mtime_ns(&fmd),
-            });
-        }
-    }
-}
-
-fn matches_discovered_file(path: &Path, source: Source) -> bool {
-    match source {
-        Source::Claude | Source::Codex => path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s == "jsonl"),
-        Source::Cursor => is_cursor_usage_csv(path),
-    }
-}
-
-fn is_cursor_usage_csv(path: &Path) -> bool {
-    if !path
-        .extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("csv"))
-    {
-        return false;
-    }
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut reader = std::io::BufReader::new(file);
-    let mut header = String::new();
-    if reader.read_line(&mut header).is_err() {
-        return false;
-    }
-    let lower = header.to_ascii_lowercase();
-    lower.contains("date") && lower.contains("model")
-}
-
-/// Discover Claude session files at `<root>/<project-slug>/<session>.jsonl`.
-pub fn discover_claude<M: ManifestLike>(
-    roots: &[PathBuf],
-    manifest: &HashMap<PathBuf, M>,
-    opts: DiscoverOpts,
-) -> Discovery {
-    let index = index_manifest_by_parent(manifest);
-    let threshold = opts.safety_threshold_ns();
+fn discover(roots: &[PathBuf], source: Source) -> Discovery {
     let mut out = Discovery::default();
-
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if !ft.is_dir() {
+    let mut seen = HashSet::new();
+    for requested in roots {
+        let root = match requested.canonicalize() {
+            Ok(root) => root,
+            Err(error) => {
+                out.errors.push(DiscoveryError {
+                    path: requested.clone(),
+                    reason: error.to_string(),
+                });
                 continue;
             }
-            let project_dir = e.path();
-            let folder_name = e.file_name().to_string_lossy().into_owned();
-            let project = decode_claude_slug(&folder_name);
-            walk_with_short_circuit(
-                &project_dir,
-                Source::Claude,
-                project,
-                manifest,
-                &index,
-                threshold,
-                &mut out,
-            );
+        };
+        if !root.is_dir() {
+            out.errors.push(DiscoveryError {
+                path: root,
+                reason: "root is not a directory".into(),
+            });
+            continue;
+        }
+        if !seen.insert(root.clone()) {
+            continue;
+        }
+        let mut complete = true;
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    complete = false;
+                    out.errors.push(DiscoveryError {
+                        path: error.path().unwrap_or(&root).to_path_buf(),
+                        reason: error
+                            .io_error()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "directory walk failed".into()),
+                    });
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let wanted =
+                path.extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| match source {
+                        Source::Cursor => ext.eq_ignore_ascii_case("csv"),
+                        _ => ext == "jsonl",
+                    });
+            if !wanted {
+                continue;
+            }
+            match entry.metadata() {
+                Ok(metadata) => {
+                    let project = if source == Source::Claude {
+                        path.strip_prefix(&root)
+                            .ok()
+                            .and_then(|p| p.components().next())
+                            .and_then(|c| c.as_os_str().to_str())
+                            .and_then(decode_claude_slug)
+                    } else {
+                        None
+                    };
+                    out.files.push(DiscoveredFile {
+                        path: path.to_path_buf(),
+                        source,
+                        project,
+                        size: metadata.len(),
+                        mtime_ns: mtime_ns(&metadata),
+                        file_identity: file_identity(&metadata),
+                        ctime_ns: ctime_ns(&metadata),
+                    });
+                }
+                Err(error) => {
+                    complete = false;
+                    out.errors.push(DiscoveryError {
+                        path: path.to_path_buf(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        if complete {
+            out.complete_roots.push((source, root));
         }
     }
+    out.files.sort_by(|left, right| left.path.cmp(&right.path));
+    out.files.dedup_by(|left, right| left.path == right.path);
     out
 }
 
-/// Discover Codex session files at any depth below `root`.
-pub fn discover_codex<M: ManifestLike>(
-    roots: &[PathBuf],
-    manifest: &HashMap<PathBuf, M>,
-    opts: DiscoverOpts,
-) -> Discovery {
-    let index = index_manifest_by_parent(manifest);
-    let threshold = opts.safety_threshold_ns();
-    let mut out = Discovery::default();
-    for root in roots {
-        walk_with_short_circuit(
-            root,
-            Source::Codex,
-            None,
-            manifest,
-            &index,
-            threshold,
-            &mut out,
-        );
-    }
-    out
+pub fn discover_claude(roots: &[PathBuf]) -> Discovery {
+    discover(roots, Source::Claude)
 }
-
-pub fn discover_cursor<M: ManifestLike>(
-    roots: &[PathBuf],
-    manifest: &HashMap<PathBuf, M>,
-    opts: DiscoverOpts,
-) -> Discovery {
-    let index = index_manifest_by_parent(manifest);
-    let threshold = opts.safety_threshold_ns();
-    let mut out = Discovery::default();
-    for root in roots {
-        walk_with_short_circuit(
-            root,
-            Source::Cursor,
-            None,
-            manifest,
-            &index,
-            threshold,
-            &mut out,
-        );
-    }
-    out
+pub fn discover_codex(roots: &[PathBuf]) -> Discovery {
+    discover(roots, Source::Codex)
+}
+pub fn discover_cursor(roots: &[PathBuf]) -> Discovery {
+    discover(roots, Source::Cursor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::fs;
-    use std::io::Write;
-    use tempfile::tempdir;
-
-    struct FakeRow {
-        size: u64,
-        mtime_ns: i64,
-    }
-
-    impl ManifestLike for FakeRow {
-        fn mtime_ns(&self) -> i64 {
-            self.mtime_ns
-        }
-
-        fn size(&self) -> u64 {
-            self.size
-        }
-    }
-
-    fn stale_short_circuit_mtime_ns() -> i64 {
-        // Future relative to test-created files, but older than the synthetic
-        // safety threshold below so the row is not treated as "recent".
-        1_900_000_000_000_000_000
-    }
-
-    fn stale_short_circuit_opts() -> DiscoverOpts {
-        DiscoverOpts {
-            safety_window_ms: 60_000,
-            now_ms: 1_900_000_060_001,
-        }
-    }
-
     #[test]
-    fn discover_claude_finds_files_at_correct_depth() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let proj = root.join("-Users-dev-repo");
-        fs::create_dir_all(&proj).unwrap();
-        fs::write(proj.join("abc.jsonl"), b"hello").unwrap();
-        fs::write(proj.join("not-jsonl.txt"), b"x").unwrap();
-
-        let manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
-        let d = discover_claude(
-            &[root.to_path_buf()],
-            &manifest,
-            DiscoverOpts {
-                safety_window_ms: 60_000,
-                now_ms: 0,
-            },
-        );
-        assert_eq!(d.files.len(), 1);
-        assert_eq!(d.files[0].source, Source::Claude);
-        assert_eq!(d.files[0].project.as_deref(), Some("/Users/dev/repo"));
+    fn claude_decodes_project_and_walks_nested_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-Users-dev-repo/subagents");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("a.jsonl"), "{}").unwrap();
+        let result = discover_claude(&[dir.path().to_path_buf()]);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].project.as_deref(), Some("/Users/dev/repo"));
+        assert_eq!(result.complete_roots.len(), 1);
     }
-
     #[test]
-    fn missing_root_silently_skipped() {
-        let manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
-        let d = discover_claude(
-            &[PathBuf::from("/definitely/not/here")],
-            &manifest,
-            DiscoverOpts {
-                safety_window_ms: 60_000,
-                now_ms: 0,
-            },
-        );
-        assert!(d.files.is_empty());
+    fn missing_root_is_an_incomplete_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = discover_codex(&[dir.path().join("absent")]);
+        assert!(result.complete_roots.is_empty());
+        assert_eq!(result.errors.len(), 1);
     }
-
     #[test]
-    fn discover_codex_walks_any_depth() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let deep = root.join("2026").join("04");
-        fs::create_dir_all(&deep).unwrap();
-        fs::write(deep.join("sess.jsonl"), b"x").unwrap();
-
-        let manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
-        let d = discover_codex(
-            &[root.to_path_buf()],
-            &manifest,
-            DiscoverOpts {
-                safety_window_ms: 60_000,
-                now_ms: 0,
-            },
-        );
-        assert_eq!(d.files.len(), 1);
-        assert_eq!(d.files[0].source, Source::Codex);
-        assert!(d.files[0].project.is_none());
-    }
-
-    #[test]
-    fn discover_cursor_finds_usage_csv_and_ignores_other_csvs() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let deep = root.join("accounts").join("work");
-        fs::create_dir_all(&deep).unwrap();
-        fs::write(
-            deep.join("usage.csv"),
-            b"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n",
-        )
-        .unwrap();
-        fs::write(deep.join("other.csv"), b"name,value\nfoo,1\n").unwrap();
-
-        let manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
-        let d = discover_cursor(
-            &[root.to_path_buf()],
-            &manifest,
-            DiscoverOpts {
-                safety_window_ms: 60_000,
-                now_ms: 0,
-            },
-        );
-        assert_eq!(d.files.len(), 1);
-        assert_eq!(d.files[0].source, Source::Cursor);
-        assert!(d.files[0].project.is_none());
-    }
-
-    #[test]
-    fn changed_file_in_stale_directory_is_discovered() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let path = root.join("sess.jsonl");
-        fs::write(&path, b"{\"type\":\"user\"}\n").unwrap();
-        let cached_size = fs::metadata(&path).unwrap().len();
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file, "{{\"type\":\"event_msg\"}}").unwrap();
-
-        let mut manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
-        manifest.insert(
-            path.clone(),
-            FakeRow {
-                size: cached_size,
-                mtime_ns: stale_short_circuit_mtime_ns(),
-            },
-        );
-
-        let d = discover_codex(&[root.to_path_buf()], &manifest, stale_short_circuit_opts());
-
-        assert!(d.unchanged_paths.is_empty());
-        assert_eq!(d.files.len(), 1);
-        assert_eq!(d.files[0].path, path);
-    }
-
-    #[test]
-    fn disappeared_file_in_stale_directory_is_not_marked_unchanged() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let path = root.join("gone.jsonl");
-
-        let mut manifest: HashMap<PathBuf, FakeRow> = HashMap::new();
-        manifest.insert(
-            path.clone(),
-            FakeRow {
-                size: 100,
-                mtime_ns: stale_short_circuit_mtime_ns(),
-            },
-        );
-
-        let d = discover_codex(&[root.to_path_buf()], &manifest, stale_short_circuit_opts());
-
-        assert!(d.files.is_empty());
-        assert!(d.unchanged_paths.is_empty());
+    fn cursor_csv_candidates_reach_the_parser_for_header_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("malformed.csv"), "Date,Model").unwrap();
+        fs::write(dir.path().join("other.txt"), "Date,Model").unwrap();
+        assert_eq!(discover_cursor(&[dir.path().to_path_buf()]).files.len(), 1);
     }
 }

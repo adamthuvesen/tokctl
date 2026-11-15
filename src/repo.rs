@@ -11,6 +11,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::paths::home_dir;
+
+const TCC_PROTECTED_DIRS: [&str; 4] = [
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Library/Mobile Documents",
+];
+
 /// Result of resolving a single `project_path`.
 ///
 /// `key` is `None` when no `.git` ancestor was found — the caller is expected
@@ -82,9 +91,15 @@ pub fn project_basename(s: &str) -> &str {
 
 /// Resolve without memoization. Prefer [`Resolver::resolve`] in hot paths.
 pub fn resolve_path(project_path: &str) -> RepoIdentity {
+    if skips_filesystem(Path::new(project_path)) {
+        return RepoIdentity::no_repo(fallback_display(project_path));
+    }
     let candidates = decode_candidates(project_path);
 
     for cand in &candidates {
+        if skips_filesystem(cand) {
+            continue;
+        }
         if let Some(root) = nearest_git_root(cand) {
             return identity_for_root(&root);
         }
@@ -93,6 +108,18 @@ pub fn resolve_path(project_path: &str) -> RepoIdentity {
     // Nothing matched. Use the original input as the opaque display name.
     let fallback = fallback_display(project_path);
     RepoIdentity::no_repo(fallback)
+}
+
+// macOS TCC guards these folders: any syscall on them can block on a
+// permission prompt and stall ingest, so repo resolution never touches them.
+fn skips_filesystem(path: &Path) -> bool {
+    cfg!(target_os = "macos") && is_tcc_protected(&home_dir(), path)
+}
+
+fn is_tcc_protected(home: &Path, path: &Path) -> bool {
+    TCC_PROTECTED_DIRS
+        .iter()
+        .any(|dir| path.starts_with(home.join(dir)))
 }
 
 fn fallback_display(project_path: &str) -> String {
@@ -217,6 +244,9 @@ fn main_repo_from_worktree_pointer(git_file: &Path) -> Option<PathBuf> {
     // Walk up three parents to recover `<main>`.
     let gitdir_path = Path::new(gitdir);
     let main = gitdir_path.parent()?.parent()?.parent()?;
+    if skips_filesystem(main) {
+        return None;
+    }
     if main.join(".git").is_dir() {
         fs::canonicalize(main)
             .ok()
@@ -374,6 +404,22 @@ mod tests {
         assert!(id.key.is_none());
         // The display falls back to the basename of the raw input.
         assert!(!id.display_name.is_empty());
+    }
+
+    #[test]
+    fn tcc_protected_folders_match_by_component() {
+        let home = Path::new("/Users/me");
+        assert!(is_tcc_protected(
+            home,
+            Path::new("/Users/me/Documents/ChatGPT/x")
+        ));
+        assert!(is_tcc_protected(home, Path::new("/Users/me/Desktop")));
+        assert!(is_tcc_protected(
+            home,
+            Path::new("/Users/me/Library/Mobile Documents/com~apple~CloudDocs/a")
+        ));
+        assert!(!is_tcc_protected(home, Path::new("/Users/me/dev/tokctl")));
+        assert!(!is_tcc_protected(home, Path::new("/Users/me/Documents2/x")));
     }
 
     #[test]

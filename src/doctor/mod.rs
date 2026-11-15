@@ -1,12 +1,10 @@
 mod checks;
 mod render;
 
-use crate::discovery::{discover_claude, discover_codex, discover_cursor, DiscoverOpts};
+use crate::discovery::{discover_claude, discover_codex, discover_cursor};
 use crate::store::store_path;
 use crate::types::Source;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 pub use render::{render_human, render_json};
 
@@ -116,26 +114,9 @@ pub fn run() -> DoctorReport {
     checks::push_root_check(&mut checks, Source::Codex, &codex);
     checks::push_root_check(&mut checks, Source::Cursor, &cursor);
 
-    let discover_opts = DiscoverOpts {
-        safety_window_ms: 60 * 60 * 1000,
-        now_ms: chrono::Utc::now().timestamp_millis(),
-    };
-    let manifest: HashMap<PathBuf, crate::store::FileManifestRow> = HashMap::new();
-    let claude_discovery = discover_claude(
-        &checks::existing_roots(&claude.roots),
-        &manifest,
-        discover_opts,
-    );
-    let codex_discovery = discover_codex(
-        &checks::existing_roots(&codex.roots),
-        &manifest,
-        discover_opts,
-    );
-    let cursor_discovery = discover_cursor(
-        &checks::existing_roots(&cursor.roots),
-        &manifest,
-        discover_opts,
-    );
+    let claude_discovery = discover_claude(&checks::existing_roots(&claude.roots));
+    let codex_discovery = discover_codex(&checks::existing_roots(&codex.roots));
+    let cursor_discovery = discover_cursor(&checks::existing_roots(&cursor.roots));
     checks.push(checks::discovery_check(
         Source::Claude,
         claude_discovery.files.len(),
@@ -152,6 +133,23 @@ pub fn run() -> DoctorReport {
         cursor.roots.is_empty(),
     ));
 
+    let discovery_errors: Vec<String> = [&claude_discovery, &codex_discovery, &cursor_discovery]
+        .into_iter()
+        .flat_map(|discovery| &discovery.errors)
+        .map(|error| format!("{}: {}", error.path.display(), error.reason))
+        .collect();
+    if !discovery_errors.is_empty() {
+        checks.push(
+            DoctorCheck::new(
+                "discovery",
+                CheckSeverity::Warn,
+                "some source paths could not be read",
+            )
+            .details(discovery_errors)
+            .action("check source path permissions, then run tokctl doctor again"),
+        );
+    }
+
     let mut summary = DoctorSummary {
         cache_path: cache_path.display().to_string(),
         event_count: 0,
@@ -162,14 +160,14 @@ pub fn run() -> DoctorReport {
         discovered_cursor_files: cursor_discovery.files.len(),
     };
 
-    match checks::inspect_cache(&cache_path) {
-        Ok(cache) => {
-            summary.event_count = cache.event_count;
-            summary.file_count = cache.file_count;
-            summary.repo_count = cache.repo_count;
-            checks.extend(cache.checks);
+    match crate::store::inspection::inspect_cache(&cache_path) {
+        Ok(facts) => {
+            summary.event_count = facts.event_count;
+            summary.file_count = facts.file_count;
+            summary.repo_count = facts.repo_count;
+            checks.extend(checks::cache_checks(facts));
         }
-        Err(check) => checks.push(check),
+        Err(fault) => checks.push(checks::cache_fault_check(&cache_path, fault)),
     }
 
     checks.push(checks::cursor_sync_check());
@@ -192,8 +190,6 @@ pub fn run() -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema::DDL;
-    use rusqlite::Connection;
 
     #[test]
     fn severity_status_uses_highest_check() {
@@ -219,54 +215,6 @@ mod tests {
             },
         };
         assert_eq!(report.status, CheckSeverity::Warn);
-    }
-
-    #[test]
-    fn missing_cache_is_warning_and_not_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.db");
-        let err = checks::inspect_cache(&path).unwrap_err();
-        assert_eq!(err.severity, CheckSeverity::Warn);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn newer_schema_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '999');",
-        )
-        .unwrap();
-        drop(conn);
-
-        let inspected = checks::inspect_cache(&path).unwrap();
-        let schema = inspected
-            .checks
-            .iter()
-            .find(|check| check.message.contains("newer"))
-            .unwrap();
-        assert_eq!(schema.severity, CheckSeverity::Error);
-    }
-
-    #[test]
-    fn unknown_priced_models_ignore_cursor() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(DDL).unwrap();
-        conn.execute(
-            "INSERT INTO events
-             (file_path, source, ts, day, month, session_id, project_path, repo, model,
-              input, output, cache_read, cache_write, cost_usd)
-             VALUES
-             ('/a', 'claude', 1, '2026-04-01', '2026-04', 's1', NULL, NULL, 'mystery', 1, 0, 0, 0, 0),
-             ('/b', 'cursor', 1, '2026-04-01', '2026-04', 's2', NULL, NULL, 'composer-1', 1, 0, 0, 0, 1)",
-            [],
-        )
-        .unwrap();
-        let unknown = checks::unknown_priced_models(&conn).unwrap();
-        assert_eq!(unknown, vec!["mystery"]);
     }
 
     #[test]

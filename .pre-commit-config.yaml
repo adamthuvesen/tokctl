@@ -1,16 +1,9 @@
 repos:
   - repo: local
     hooks:
-      - id: cargo-fmt
-        name: cargo fmt
-        entry: cargo fmt --all -- --check
+      - id: just-check
+        name: just check
+        entry: just check
         language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy
-        entry: cargo clippy --locked --all-targets --all-features -- -D warnings
-        language: system
-        types: [rust]
+        files: '(^Cargo\.(toml|lock)$|\.rs$|^AGENTS\.md$|^justfile$|^\.agents/skills/verify-tokctl/verify$)'
         pass_filenames: false

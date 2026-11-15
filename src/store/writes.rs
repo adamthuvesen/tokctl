@@ -1,4 +1,3 @@
-use crate::discovery::ManifestLike;
 use crate::types::Source;
 use anyhow::Result;
 use rusqlite::{params, types::Type, Connection, Transaction};
@@ -13,20 +12,14 @@ pub struct FileManifestRow {
     pub project: Option<String>,
     pub size: u64,
     pub mtime_ns: i64,
+    pub file_identity: Option<String>,
+    pub ctime_ns: Option<i64>,
     pub last_offset: u64,
     pub n_events: u64,
     pub session_id: Option<String>,
     pub model: Option<String>,
-}
-
-impl ManifestLike for FileManifestRow {
-    fn mtime_ns(&self) -> i64 {
-        self.mtime_ns
-    }
-
-    fn size(&self) -> u64 {
-        self.size
-    }
+    /// Unix ms when a complete scan first found the file gone. Its events stay in the cache.
+    pub missing_since: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +38,9 @@ pub struct EventRow {
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost_usd: f64,
+    pub explicit_cost_usd: Option<f64>,
+    pub cost_provenance: String,
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +53,7 @@ pub struct RepoRow {
 
 pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileManifestRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, source, project, size, mtime_ns, last_offset, n_events, session_id, model FROM files",
+        "SELECT path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns, missing_since FROM files",
     )?;
     let rows = stmt.query_map([], |row| {
         let path: String = row.get(0)?;
@@ -79,6 +75,9 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
             n_events: row.get::<_, i64>(6)? as u64,
             session_id: row.get(7)?,
             model: row.get(8)?,
+            file_identity: row.get(9)?,
+            ctime_ns: row.get(10)?,
+            missing_since: row.get(11)?,
         })
     })?;
     let mut map = HashMap::new();
@@ -92,13 +91,16 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
 pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Result<()> {
     tx.execute(
         r#"INSERT INTO files
-             (path, source, project, size, mtime_ns, last_offset, n_events, session_id, model)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             (path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns, missing_since)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
            ON CONFLICT(path) DO UPDATE SET
              source      = excluded.source,
              project     = excluded.project,
              size        = excluded.size,
              mtime_ns    = excluded.mtime_ns,
+             file_identity = excluded.file_identity,
+             ctime_ns = excluded.ctime_ns,
+             missing_since = excluded.missing_since,
              last_offset = excluded.last_offset,
              n_events    = excluded.n_events,
              session_id  = COALESCE(excluded.session_id, files.session_id),
@@ -113,6 +115,9 @@ pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Resu
             row.n_events as i64,
             row.session_id,
             row.model,
+            row.file_identity,
+            row.ctime_ns,
+            row.missing_since,
         ],
     )?;
     Ok(())
@@ -131,12 +136,28 @@ pub fn upsert_repo(tx: &Transaction<'_>, row: &RepoRow) -> Result<()> {
     Ok(())
 }
 
+pub fn mark_file_missing(tx: &Transaction<'_>, file_path: &str, now_ms: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE files SET missing_since = ?2 WHERE path = ?1",
+        params![file_path, now_ms],
+    )?;
+    Ok(())
+}
+
 pub fn delete_file_and_events(tx: &Transaction<'_>, file_path: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM events WHERE file_path = ?1",
         params![file_path],
     )?;
     tx.execute("DELETE FROM files WHERE path = ?1", params![file_path])?;
+    tx.execute(
+        "DELETE FROM parser_provenance WHERE path = ?1",
+        params![file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM ingest_diagnostics WHERE file_path = ?1",
+        params![file_path],
+    )?;
     Ok(())
 }
 
@@ -147,11 +168,27 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
     let mut stmt = tx.prepare(
         r#"INSERT INTO events
              (file_path, source, ts, day, month, session_id, project_path, repo, model,
-              input, output, cache_read, cache_write, cost_usd)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
+              input, output, cache_read, cache_write, cost_usd, explicit_cost_usd, cost_provenance, message_id)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
     )?;
     let mut n = 0usize;
     for r in rows {
+        anyhow::ensure!(
+            r.cost_usd.is_finite() && r.cost_usd >= 0.0,
+            "event cost must be finite and nonnegative"
+        );
+        anyhow::ensure!(
+            r.explicit_cost_usd
+                .is_none_or(|cost| cost.is_finite() && cost >= 0.0),
+            "explicit event cost must be finite and nonnegative"
+        );
+        let total = [r.input, r.output, r.cache_read, r.cache_write]
+            .into_iter()
+            .try_fold(0u64, u64::checked_add);
+        anyhow::ensure!(
+            total.is_some_and(|value| value <= i64::MAX as u64),
+            "event token total exceeds SQLite integer range"
+        );
         stmt.execute(params![
             r.file_path,
             r.source.as_str(),
@@ -167,6 +204,9 @@ pub fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<usize> {
             r.cache_read as i64,
             r.cache_write as i64,
             r.cost_usd,
+            r.explicit_cost_usd,
+            r.cost_provenance,
+            r.message_id,
         ])?;
         n += 1;
     }
@@ -200,6 +240,9 @@ mod tests {
             cache_read: 3,
             cache_write: 4,
             cost_usd: 0.5,
+            explicit_cost_usd: None,
+            cost_provenance: crate::pricing::signature(),
+            message_id: None,
         }
     }
 
@@ -212,10 +255,13 @@ mod tests {
             project: Some("proj".into()),
             size: 100,
             mtime_ns: 12345,
+            file_identity: Some("test-file".into()),
+            ctime_ns: Some(1),
             last_offset: 100,
             n_events: 5,
             session_id: Some("sess".into()),
             model: Some("claude-sonnet-4-6".into()),
+            missing_since: None,
         };
         let tx = conn.transaction().unwrap();
         upsert_file_manifest(&tx, &row).unwrap();
@@ -239,10 +285,13 @@ mod tests {
                 project: None,
                 size: 10,
                 mtime_ns: 1,
+                file_identity: Some("test-file".into()),
+                ctime_ns: Some(1),
                 last_offset: 10,
                 n_events: 1,
                 session_id: None,
                 model: None,
+                missing_since: None,
             },
         )
         .unwrap();

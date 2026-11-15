@@ -1,3 +1,3 @@
 pub mod file_range;
 pub mod plan;
-pub mod run;
+pub use crate::store::ingest_run as run;

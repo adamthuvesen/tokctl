@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub use crate::windows::TimeWindow;
 pub const STATE_VERSION: u32 = 3;
 
 /// Top-level navigation entries — one per sidebar row.
@@ -79,47 +81,6 @@ impl Section {
     /// nothing meaningful to drill into; everything else does.
     pub fn rows_drill_to_sessions(self) -> bool {
         !matches!(self, Section::Provider | Section::Sessions)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeWindow {
-    Today,
-    Week,
-    Month,
-    Year,
-    All,
-}
-
-impl TimeWindow {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TimeWindow::Today => "today",
-            TimeWindow::Week => "week",
-            TimeWindow::Month => "month",
-            TimeWindow::Year => "year",
-            TimeWindow::All => "all",
-        }
-    }
-    /// Millisecond lower-bound for this window, computed against local `now`.
-    pub fn since_ms(self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
-        use chrono::{Duration, Local, NaiveTime, TimeZone};
-        let local = now.with_timezone(&Local);
-        let start_of_day = local
-            .date_naive()
-            .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-        let start_local = Local
-            .from_local_datetime(&start_of_day)
-            .single()
-            .unwrap_or(local);
-        match self {
-            TimeWindow::Today => Some(start_local.timestamp_millis()),
-            TimeWindow::Week => Some((start_local - Duration::days(6)).timestamp_millis()),
-            TimeWindow::Month => Some((start_local - Duration::days(29)).timestamp_millis()),
-            TimeWindow::Year => Some((start_local - Duration::days(364)).timestamp_millis()),
-            TimeWindow::All => None,
-        }
     }
 }
 
@@ -232,6 +193,12 @@ pub enum DrillKind {
     Events { source: crate::types::Source },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextDrill {
+    Sessions,
+    Events,
+}
+
 /// One level on the drill stack. `key` is the stable identifier of the row
 /// that was drilled into (repo key, day bucket, session id, …); `label` is
 /// the human-readable breadcrumb chunk; `cursor` is the row-cursor inside
@@ -243,9 +210,11 @@ pub struct Drill {
     pub key: String,
     pub label: String,
     pub cursor: usize,
+    pub scope: crate::store::queries::QueryScope,
+    pub parent_filter: FilterState,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilterState {
     pub active: bool,
     pub query: String,
@@ -276,6 +245,8 @@ pub struct AppState {
     pub flash: Option<String>,
     /// Whether tables show expanded columns. Default false = compact.
     pub expanded: bool,
+    /// Models section groups by `model_family()` instead of normalized model id.
+    pub models_by_family: bool,
     /// One-shot intro flash on first launch under v3. Persisted so it shows once.
     pub seen_v3_intro: bool,
     /// Set once a source-filter no-op flash has fired in the current events
@@ -288,7 +259,7 @@ impl Default for AppState {
         let sidebar_index = 0;
         Self {
             current_section: Section::Days,
-            time_window: TimeWindow::Month,
+            time_window: TimeWindow::D30,
             source_filter: SourceFilter::All,
             sort: Sort::CostDesc,
             trend_granularity: TrendGranularity::Monthly,
@@ -303,6 +274,7 @@ impl Default for AppState {
             filter: FilterState::default(),
             flash: None,
             expanded: false,
+            models_by_family: false,
             seen_v3_intro: false,
             source_filter_hint_fired: false,
         }
@@ -310,6 +282,11 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn is_provider_view(&self) -> bool {
+        !self.drill_active()
+            && (self.current_section == Section::Provider
+                || (self.current_section == Section::Repos && self.active_tab_index() != 0))
+    }
     pub fn active_tab_index(&self) -> u8 {
         *self
             .tab_per_section

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::compare::CompareDimension;
 use crate::store::store_path;
-use crate::types::{ReportKind, Source, SourceLabel};
+use crate::types::{ReportKind, Source};
 
 mod pipeline;
 mod workflows;
@@ -39,6 +39,8 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Compare usage across two calendar windows.
     Compare(CompareArgs),
+    /// Tokens and cost per model over a rolling window.
+    Models(ModelsArgs),
     /// Print the absolute path of the cache DB (does not create it).
     ExportDb,
     /// Cursor account setup, sync, and status.
@@ -121,6 +123,48 @@ struct CompareArgs {
     /// number of positive and negative driver rows to show per breakdown
     #[arg(long, default_value_t = 5)]
     top: usize,
+    /// emit machine-readable JSON instead of a table
+    #[arg(long)]
+    json: bool,
+    /// one or more comma-separated Claude project roots
+    #[arg(long = "claude-dir")]
+    claude_dir: Option<String>,
+    /// one or more comma-separated Codex session roots
+    #[arg(long = "codex-dir")]
+    codex_dir: Option<String>,
+    /// one or more comma-separated Cursor usage CSV roots
+    #[arg(long = "cursor-dir")]
+    cursor_dir: Option<String>,
+    /// delete the cache DB before running
+    #[arg(long)]
+    rebuild: bool,
+    /// bypass the cache for this invocation
+    #[arg(long = "no-cache")]
+    no_cache: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModelsByArg {
+    Model,
+    Family,
+}
+
+#[derive(Debug, clap::Args)]
+struct ModelsArgs {
+    /// rolling window ending now: 1d | 7d | 30d | 365d | all
+    #[arg(long, default_value = "30d")]
+    last: String,
+    /// model | family. Families group the versions of one model line
+    /// (claude-opus-5-5 and claude-opus-5 become claude-opus). This is a display
+    /// grouping only: each version keeps its own price.
+    #[arg(long = "by", value_enum, default_value_t = ModelsByArg::Model)]
+    by: ModelsByArg,
+    /// claude | codex | cursor | all
+    #[arg(long, default_value = "all")]
+    source: String,
+    /// filter to a repo (display name, path prefix, or `(no-repo)`)
+    #[arg(long)]
+    repo: Option<String>,
     /// emit machine-readable JSON instead of a table
     #[arg(long)]
     json: bool,
@@ -258,25 +302,8 @@ impl SourceArg {
         }
     }
 
-    fn include_claude(self) -> bool {
-        matches!(self, SourceArg::Claude | SourceArg::All)
-    }
-    fn include_codex(self) -> bool {
-        matches!(self, SourceArg::Codex | SourceArg::All)
-    }
-    fn include_cursor(self) -> bool {
-        matches!(self, SourceArg::Cursor | SourceArg::All)
-    }
     fn show_source(self) -> bool {
         matches!(self, SourceArg::All)
-    }
-    fn label(self) -> SourceLabel {
-        match self {
-            SourceArg::All => SourceLabel::All,
-            SourceArg::Claude => SourceLabel::Source(Source::Claude),
-            SourceArg::Codex => SourceLabel::Source(Source::Codex),
-            SourceArg::Cursor => SourceLabel::Source(Source::Cursor),
-        }
     }
 }
 
@@ -320,8 +347,10 @@ pub fn run() -> Result<()> {
         Commands::Repo(a) => workflows::run_repo(a),
         Commands::Doctor(a) => workflows::run_doctor(a),
         Commands::Compare(a) => workflows::run_compare(a),
+        Commands::Models(a) => workflows::run_models(a),
         Commands::ExportDb => {
-            println!("{}", store_path().display());
+            use std::io::Write;
+            writeln!(std::io::stdout().lock(), "{}", store_path().display())?;
             Ok(())
         }
         Commands::Cursor(a) => workflows::run_cursor(a),

@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-thiserror = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -22,7 +21,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 comfy-table = "7"
 walkdir = "2"
 rayon = "1"
-memmap2 = "0.9"
 ratatui = "0.28"
 crossterm = "0.28"
 nucleo-matcher = "0.3"
@@ -30,6 +28,9 @@ arboard = { version = "3", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 sha2 = "0.10"
 csv = "1"
+tempfile = "3"
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 
 [features]
 default = ["clipboard"]
@@ -38,11 +39,12 @@ test-fixtures = []
 
 [[test]]
 name = "report_parity"
-required-features = ["test-fixtures"]
 
 [dev-dependencies]
-tempfile = "3"
+portable-pty = "0.9"
+vt100 = "0.16"
 criterion = { version = "0.5", features = ["html_reports"] }
+regex = "1"
 
 [[bench]]
 name = "parse"

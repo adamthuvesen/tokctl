@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,17 +51,42 @@ pub struct UsageEvent {
     pub explicit_cost_usd: Option<f64>,
 }
 
+impl UsageEvent {
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.input_tokens
+            .checked_add(self.output_tokens)?
+            .checked_add(self.cache_read_tokens)?
+            .checked_add(self.cache_write_tokens)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let total = self
+            .total_tokens()
+            .ok_or_else(|| anyhow::anyhow!("token total exceeds supported range"))?;
+        anyhow::ensure!(
+            total <= i64::MAX as u64,
+            "token total exceeds SQLite integer range"
+        );
+        if let Some(cost) = self.explicit_cost_usd {
+            anyhow::ensure!(
+                cost.is_finite() && cost >= 0.0,
+                "cost must be finite and non-negative"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IngestStats {
     pub files_scanned: usize,
     pub files_skipped: usize,
-    pub files_tailed: usize,
     pub files_full_parsed: usize,
     pub files_purged: usize,
+    pub files_marked_missing: usize,
     pub file_errors: usize,
     pub events_inserted: usize,
     pub skipped_lines: usize,
-    pub unknown_models: HashSet<String>,
     /// Distinct repo keys upserted during the run.
     pub repos_resolved: usize,
     /// Events inserted with `repo IS NULL` (no resolvable git ancestor).

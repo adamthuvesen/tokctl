@@ -1,178 +1,129 @@
-//! SQL report paths must match in-memory aggregations on the same fixture.
+//! Persistent and ephemeral reports obey the same public fixture contract.
+use serde_json::{json, Value};
+use std::fs;
+use std::process::Command;
 
-use std::collections::HashSet;
+struct Fixture {
+    home: tempfile::TempDir,
+}
+impl Fixture {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        fs::create_dir_all(root.join("claude/project")).unwrap();
+        fs::create_dir_all(root.join("codex")).unwrap();
+        fs::create_dir_all(root.join("cursor")).unwrap();
+        fs::write(root.join("claude/project/session.jsonl"), r#"{"type": "assistant", "timestamp":"2026-04-22T12:00:00Z","sessionId":"same","message":{"id":"a","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}
+"#).unwrap();
+        fs::write(root.join("codex/session.jsonl"), r#"{"type": "session_meta","payload":{"id":"same"}}
+{"type": "turn_context","payload":{"model":"gpt-5.4"}}
+{"type": "event_msg","timestamp":"2026-04-22T12:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":60}}}}
+"#).unwrap();
+        Self { home }
+    }
+    fn report(&self, command: &str, no_cache: bool, extra: &[&str]) -> Value {
+        let root = self.home.path();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tokctl"));
+        cmd.arg(command)
+            .arg("--json")
+            .args(extra)
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env(
+                "TOKCTL_CACHE_DIR",
+                root.join(if no_cache { "unused-cache" } else { "cache" }),
+            )
+            .env("TOKCTL_CLAUDE_DIR", root.join("claude"))
+            .env("TOKCTL_CODEX_DIR", root.join("codex"))
+            .env("TOKCTL_CURSOR_DIR", root.join("cursor"))
+            .env("TZ", "UTC")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME");
+        if no_cache {
+            cmd.arg("--no-cache");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+}
 
-use tokctl::reports::in_memory::{
-    daily_in_memory, filter_by_repo, monthly_in_memory, repo_in_memory, session_in_memory,
-};
-use tokctl::store::queries::{
-    daily_report, monthly_report, repo_report, session_report, QueryFilter, RepoFilterSpec,
-};
-use tokctl::store::queries::{RepoAggregateRow, NO_REPO_SENTINEL};
-use tokctl::test_support::{
-    fresh_conn, sample_resolved_pairs, sample_usage_events, seed_standard_events,
-};
-use tokctl::types::{AggregateRow, Source, SourceLabel};
+#[test]
+fn daily_and_monthly_match_independent_expected_totals() {
+    let fixture = Fixture::new();
+    for no_cache in [true, false] {
+        assert_eq!(
+            fixture.report("daily", no_cache, &[]),
+            json!([{"date":"2026-04-22","source":"all","input":250,"output":100,"cache_read":550,"cache_write":200,"totalTokens":1100,"costUsd":0.0031}])
+        );
+        assert_eq!(
+            fixture.report("monthly", no_cache, &[]),
+            json!([{"month":"2026-04","source":"all","input":250,"output":100,"cache_read":550,"cache_write":200,"totalTokens":1100,"costUsd":0.0031}])
+        );
+    }
+    assert!(!fixture.home.path().join("unused-cache").exists());
+}
 
-const EPS: f64 = 1e-9;
+#[test]
+fn sessions_keep_source_qualified_identity_and_metadata() {
+    let fixture = Fixture::new();
+    let expected = json!([
+        {"session_id":"same","source":"codex","project_path":null,"latest_timestamp":"2026-04-22T12:00:01+00:00","input":150,"output":60,"cache_read":50,"cache_write":0,"totalTokens":260,"costUsd":0.0013},
+        {"session_id":"same","source":"claude","project_path":null,"latest_timestamp":"2026-04-22T12:00:00+00:00","input":100,"output":40,"cache_read":500,"cache_write":200,"totalTokens":840,"costUsd":0.0018}
+    ]);
+    assert_eq!(fixture.report("session", true, &[]), expected);
+    assert_eq!(fixture.report("session", false, &[]), expected);
+}
 
-fn assert_aggregate_parity(sql: &[AggregateRow], mem: &[AggregateRow]) {
-    let mut sql_by_key: std::collections::BTreeMap<_, _> =
-        sql.iter().map(|r| (r.key.clone(), r)).collect();
+#[test]
+fn source_and_inclusive_date_filters_match_both_stores() {
+    let fixture = Fixture::new();
+    for no_cache in [true, false] {
+        assert_eq!(
+            fixture.report(
+                "daily",
+                no_cache,
+                &[
+                    "--source",
+                    "codex",
+                    "--since",
+                    "2026-04-22",
+                    "--until",
+                    "2026-04-22"
+                ]
+            ),
+            json!([{"date":"2026-04-22","input":150,"output":60,"cache_read":50,"cache_write":0,"totalTokens":260,"costUsd":0.0013}])
+        );
+        assert_eq!(
+            fixture.report("daily", no_cache, &["--until", "2026-04-21"]),
+            json!([])
+        );
+    }
+}
+
+#[test]
+fn comparison_uses_same_calendar_scope_and_source_session_counts() {
+    let fixture = Fixture::new();
+    let args = ["2026-04-22..2026-04-22", "2026-04-21..2026-04-21"];
+    let ephemeral = fixture.report("compare", true, &args);
+    let persistent = fixture.report("compare", false, &args);
+    assert_eq!(ephemeral, persistent);
+    assert_eq!(persistent["summary"]["current"]["total_tokens"], 1100);
+    assert_eq!(persistent["summary"]["baseline"]["total_tokens"], 0);
     assert_eq!(
-        sql.len(),
-        mem.len(),
-        "row count mismatch: sql={} mem={}",
-        sql.len(),
-        mem.len()
+        persistent["breakdowns"]["session"]["positive"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
-    for m in mem {
-        let s = sql_by_key
-            .remove(&m.key)
-            .unwrap_or_else(|| panic!("missing sql row for key {}", m.key));
-        assert_eq!(s.input_tokens, m.input_tokens, "key={}", m.key);
-        assert_eq!(s.output_tokens, m.output_tokens, "key={}", m.key);
-        assert_eq!(s.cache_read_tokens, m.cache_read_tokens, "key={}", m.key);
-        assert_eq!(s.cache_write_tokens, m.cache_write_tokens, "key={}", m.key);
-        assert_eq!(s.total_tokens, m.total_tokens, "key={}", m.key);
-        assert!((s.cost_usd - m.cost_usd).abs() < EPS, "key={}", m.key);
-    }
-    assert!(sql_by_key.is_empty());
-}
-
-fn assert_repo_parity(sql: &[RepoAggregateRow], mem: &[RepoAggregateRow]) {
-    let mut sql_by_key: std::collections::BTreeMap<_, _> =
-        sql.iter().map(|r| (r.key.clone(), r)).collect();
-    assert_eq!(sql.len(), mem.len());
-    for m in mem {
-        let s = sql_by_key.remove(&m.key).expect("missing sql repo row");
-        assert_eq!(s.display_name, m.display_name);
-        assert_eq!(s.sessions, m.sessions);
-        assert_eq!(s.total_tokens, m.total_tokens);
-        assert!((s.cost_usd - m.cost_usd).abs() < EPS);
-    }
-}
-
-#[test]
-fn daily_report_matches_in_memory() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let sql = daily_report(&conn, QueryFilter::default()).unwrap();
-
-    let events = sample_usage_events();
-    let mut unknown = HashSet::new();
-    let mem = daily_in_memory(&events, SourceLabel::All, &mut unknown);
-
-    assert_aggregate_parity(&sql, &mem);
-}
-
-#[test]
-fn monthly_report_matches_in_memory() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let sql = monthly_report(&conn, QueryFilter::default()).unwrap();
-
-    let events = sample_usage_events();
-    let mut unknown = HashSet::new();
-    let mem = monthly_in_memory(&events, SourceLabel::All, &mut unknown);
-
-    assert_aggregate_parity(&sql, &mem);
-}
-
-#[test]
-fn session_report_matches_in_memory() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let sql = session_report(&conn, QueryFilter::default()).unwrap();
-
-    let events = sample_usage_events();
-    let mut unknown = HashSet::new();
-    let mem = session_in_memory(&events, &mut unknown);
-
-    // Both order by latest activity desc; compare as sets keyed by session id.
-    let mut sql_map: std::collections::BTreeMap<_, _> =
-        sql.iter().map(|r| (r.key.clone(), r)).collect();
-    assert_eq!(sql.len(), mem.len());
-    for m in mem {
-        let s = sql_map.remove(&m.key).expect("missing session");
-        assert_eq!(s.input_tokens, m.input_tokens);
-        assert!((s.cost_usd - m.cost_usd).abs() < EPS);
-    }
-}
-
-#[test]
-fn repo_report_matches_in_memory() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let sql = repo_report(&conn, QueryFilter::default()).unwrap();
-
-    let resolved = sample_resolved_pairs();
-    let mut unknown = HashSet::new();
-    let mem = repo_in_memory(&resolved, &None, &mut unknown);
-
-    assert_repo_parity(&sql, &mem);
-}
-
-#[test]
-fn daily_report_source_filter_parity() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let filter = QueryFilter {
-        source: Some(Source::Claude),
-        ..Default::default()
-    };
-    let sql = daily_report(&conn, filter.clone()).unwrap();
-
-    let events: Vec<_> = sample_usage_events()
-        .into_iter()
-        .filter(|e| e.source == Source::Claude)
-        .collect();
-    let mut unknown = HashSet::new();
-    let mem = daily_in_memory(&events, SourceLabel::Source(Source::Claude), &mut unknown);
-
-    assert_aggregate_parity(&sql, &mem);
-}
-
-#[test]
-fn repo_filter_display_name_parity() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let filter = QueryFilter {
-        repo: Some(RepoFilterSpec::DisplayName("alpha".into())),
-        ..Default::default()
-    };
-    let sql = daily_report(&conn, filter.clone()).unwrap();
-
-    let resolved = sample_resolved_pairs();
-    let spec = Some(RepoFilterSpec::DisplayName("alpha".into()));
-    let filtered: Vec<_> = tokctl::reports::in_memory::filter_by_repo(&resolved, &spec);
-    let mut unknown = HashSet::new();
-    let mem = daily_in_memory(&filtered, SourceLabel::All, &mut unknown);
-
-    assert_aggregate_parity(&sql, &mem);
-}
-
-#[test]
-fn repo_filter_no_repo_session_parity() {
-    let mut conn = fresh_conn();
-    seed_standard_events(&mut conn);
-    let filter = QueryFilter {
-        repo: Some(RepoFilterSpec::NoRepo),
-        ..Default::default()
-    };
-    let sql = session_report(&conn, filter).unwrap();
-
-    let resolved = sample_resolved_pairs();
-    let spec = Some(RepoFilterSpec::NoRepo);
-    let mut unknown = HashSet::new();
-    let mem = session_in_memory(&filter_by_repo(&resolved, &spec), &mut unknown);
-
-    assert_eq!(sql.len(), mem.len());
-    assert_eq!(sql[0].key, "sC");
-    assert_eq!(mem[0].key, "sC");
-}
-
-#[test]
-fn no_repo_sentinel_matches_display_name() {
-    assert_eq!(NO_REPO_SENTINEL, "<NO_REPO>");
 }

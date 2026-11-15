@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use tokctl::sources::{parse_claude_line, parse_codex_line, CodexCtx};
+use tokctl::sources::{parse_claude_line, parse_codex_line, CodexCtx, CodexParsed};
 
 const CLAUDE_LINE: &str = r#"{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"sess-a","message":{"id":"m1","model":"claude-sonnet-4-6","role":"assistant","usage":{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}"#;
 
@@ -10,6 +10,10 @@ const CODEX_SEQUENCE: &[&str] = &[
 ];
 
 fn bench_claude_parse_line(c: &mut Criterion) {
+    assert!(
+        parse_claude_line(CLAUDE_LINE, Some("/proj")).is_some(),
+        "Claude benchmark must parse a usage event"
+    );
     let mut group = c.benchmark_group("claude_parse_line");
     group.throughput(Throughput::Bytes(CLAUDE_LINE.len() as u64));
     group.bench_function("assistant", |b| {
@@ -22,6 +26,19 @@ fn bench_claude_parse_line(c: &mut Criterion) {
 }
 
 fn bench_codex_parse_line(c: &mut Criterion) {
+    let mut ctx = CodexCtx::default();
+    let parsed = CODEX_SEQUENCE
+        .iter()
+        .filter_map(|line| match parse_codex_line(line, &mut ctx) {
+            Some(CodexParsed::Event(event)) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parsed.len(),
+        1,
+        "Codex benchmark must produce one usage event"
+    );
     let mut group = c.benchmark_group("codex_parse_line");
     let total_bytes: usize = CODEX_SEQUENCE.iter().map(|s| s.len()).sum();
     group.throughput(Throughput::Bytes(total_bytes as u64));

@@ -6,18 +6,22 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::data::DataCache;
+use crate::tui::data::{DataCache, VisibleRows};
 use crate::tui::shell::{draw_main_frame, draw_sidebar};
 use crate::tui::state::{AppState, DrillKind, Focus, Section};
 use crate::tui::theme::Palette;
-use crate::tui::widgets::filter::apply_filter_sessions;
+
 use crate::tui::MIN_WIDTH;
 
 use super::chrome::{draw_detail, draw_filter_prompt, draw_footer, draw_header, draw_help};
 use super::layout::{main_panel_dimensions, pad_top, SIDEBAR_WIDTH};
-use super::tables::{draw_events_table, draw_left_table, draw_sessions_table, draw_trend_table};
+use super::tables::{
+    draw_events_table, draw_left_table, draw_models_table, draw_sessions_table, draw_trend_table,
+};
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
+    let visible = cache.visible(state);
+    let cache = &visible;
     let palette = Palette::default();
     let area = frame.area();
 
@@ -85,13 +89,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, cache: &DataCache) {
     }
 }
 
-// -- Main pane dispatch -----------------------------------------------------
-
 fn draw_main(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
     let focused = state.focus == Focus::Main;
@@ -116,11 +118,10 @@ fn draw_main(
             0 => draw_left_table(frame, padded, state, cache, palette),
             _ => draw_trend_table(frame, padded, state, cache, palette),
         },
-        Section::Days | Section::Models => {
-            draw_left_table(frame, padded, state, cache, palette);
-        }
+        Section::Days => draw_left_table(frame, padded, state, cache, palette),
+        Section::Models => draw_models_table(frame, padded, state, cache, palette),
         Section::Sessions => {
-            let (rows, _) = apply_filter_sessions(&cache.sessions, state);
+            let rows = &cache.sessions;
             if rows.is_empty() {
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
@@ -130,7 +131,7 @@ fn draw_main(
                     padded,
                 );
             } else {
-                draw_sessions_table(frame, padded, state, &rows, palette);
+                draw_sessions_table(frame, padded, state, rows, palette);
             }
         }
         Section::Provider => {
@@ -148,12 +149,12 @@ fn main_pane_title(state: &AppState) -> String {
             crate::tui::state::TrendGranularity::Monthly => "MONTHS".into(),
             crate::tui::state::TrendGranularity::Yearly => "YEARS".into(),
         }
+    } else if state.current_section == Section::Models && state.models_by_family {
+        "MODELS · FAMILY".into()
     } else {
         state.current_section.title().to_owned()
     }
 }
-
-// -- Breadcrumb / drill renderer --------------------------------------------
 
 /// Build the cumulative breadcrumb title for the bordered panel:
 /// `SECTION › label_1 [› label_2]`. Labels are kept short by the caller
@@ -172,7 +173,7 @@ fn draw_drill(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
     if area.height < 2 {

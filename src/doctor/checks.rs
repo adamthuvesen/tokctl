@@ -1,15 +1,12 @@
+use super::{CheckSeverity, DoctorCheck};
 use crate::paths::{
     cursor_credentials_path, default_claude_roots, default_codex_roots, default_cursor_roots,
     resolve_roots, tokscale_cursor_credentials_path, ResolveInput,
 };
-use crate::pricing;
+use crate::store::inspection::{CacheFacts, CacheFault};
 use crate::store::schema::SCHEMA_VERSION;
 use crate::types::Source;
-use anyhow::Result;
-use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
-
-use super::{CheckSeverity, DoctorCheck};
 
 pub(crate) struct RootSet {
     pub(crate) roots: Vec<PathBuf>,
@@ -124,71 +121,82 @@ pub(crate) fn discovery_check(source: Source, files: usize, no_roots: bool) -> D
     check
 }
 
-#[derive(Debug)]
-pub(crate) struct CacheInspection {
-    pub(crate) event_count: u64,
-    pub(crate) file_count: u64,
-    pub(crate) repo_count: u64,
-    pub(crate) checks: Vec<DoctorCheck>,
-}
-
-pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection, DoctorCheck> {
-    if !path.exists() {
-        return Err(DoctorCheck::new(
+pub(crate) fn cache_fault_check(path: &Path, fault: CacheFault) -> DoctorCheck {
+    match fault {
+        CacheFault::Missing => DoctorCheck::new(
             "cache",
             CheckSeverity::Warn,
             format!("cache does not exist at {}", path.display()),
         )
-        .action("run tokctl daily or another cached report to create the cache"));
+        .action("run tokctl daily or another cached report to create the cache"),
+        CacheFault::Open(err) => DoctorCheck::new(
+            "cache",
+            CheckSeverity::Error,
+            format!("could not open cache at {}", path.display()),
+        )
+        .details(vec![err]),
+        CacheFault::SchemaNewer(v) => DoctorCheck::new(
+            "cache",
+            CheckSeverity::Error,
+            format!("cache schema is newer than this tokctl ({v}, current {SCHEMA_VERSION})"),
+        )
+        .action("use a newer tokctl binary, preserving this cache"),
+        CacheFault::SchemaMissing => DoctorCheck::new(
+            "cache",
+            CheckSeverity::Error,
+            "cache schema version is missing",
+        )
+        .action("preserve this cache and set TOKCTL_CACHE_DIR to a new directory before ingesting"),
+        CacheFault::Table { table, error } => DoctorCheck::new(
+            "cache",
+            CheckSeverity::Error,
+            format!("could not inspect {table} in {}", path.display()),
+        )
+        .details(vec![error])
+        .action("preserve this cache and inspect its schema before repair"),
+        CacheFault::ModelQuery(err) => DoctorCheck::new(
+            "pricing",
+            CheckSeverity::Error,
+            "could not query cached models",
+        )
+        .details(vec![err]),
+        CacheFault::ModelRow(err) => DoctorCheck::new(
+            "pricing",
+            CheckSeverity::Error,
+            "could not read cached model row",
+        )
+        .details(vec![err]),
+        CacheFault::Provenance(err) => DoctorCheck::new(
+            "provenance",
+            CheckSeverity::Error,
+            "could not inspect cache provenance",
+        )
+        .details(vec![err]),
     }
+}
 
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|err| {
-            DoctorCheck::new(
-                "cache",
-                CheckSeverity::Error,
-                format!("could not open cache at {}", path.display()),
-            )
-            .details(vec![err.to_string()])
-        })?;
-
+pub(crate) fn cache_checks(facts: CacheFacts) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
-    let schema_version = read_schema_version(&conn);
-    match schema_version {
-        Some(SCHEMA_VERSION) => checks.push(DoctorCheck::new(
+    let version = facts.schema_version;
+    if version == SCHEMA_VERSION {
+        checks.push(DoctorCheck::new(
             "cache",
             CheckSeverity::Ok,
             format!("cache schema is current ({SCHEMA_VERSION})"),
-        )),
-        Some(v) if v < SCHEMA_VERSION => checks.push(
+        ));
+    } else {
+        checks.push(
             DoctorCheck::new(
                 "cache",
                 CheckSeverity::Warn,
-                format!("cache schema is old ({v}, current {SCHEMA_VERSION})"),
+                format!("cache schema is old ({version}, current {SCHEMA_VERSION})"),
             )
             .action("run a cached report or tokctl daily --rebuild to refresh the cache"),
-        ),
-        Some(v) => checks.push(
-            DoctorCheck::new(
-                "cache",
-                CheckSeverity::Error,
-                format!("cache schema is newer than this tokctl ({v}, current {SCHEMA_VERSION})"),
-            )
-            .action("use a newer tokctl binary or rebuild the cache with this version"),
-        ),
-        None => checks.push(
-            DoctorCheck::new(
-                "cache",
-                CheckSeverity::Error,
-                "cache schema version is missing",
-            )
-            .action("run tokctl daily --rebuild"),
-        ),
+        );
     }
 
-    let file_count = count_table(&conn, "files").unwrap_or(0);
-    let event_count = count_table(&conn, "events").unwrap_or(0);
-    let repo_count = count_table(&conn, "repos").unwrap_or(0);
+    let (event_count, file_count, repo_count) =
+        (facts.event_count, facts.file_count, facts.repo_count);
     checks.push(
         DoctorCheck::new(
             "cache",
@@ -208,7 +216,18 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
         }),
     );
 
-    if let Some(max_mtime) = max_file_mtime_ns(&conn) {
+    if facts.missing_source_event_count > 0 {
+        checks.push(DoctorCheck::new(
+            "cache",
+            CheckSeverity::Ok,
+            format!(
+                "{} event(s) come from logs no longer on disk",
+                facts.missing_source_event_count
+            ),
+        ));
+    }
+
+    if let Some(max_mtime) = facts.latest_file_mtime_ns {
         checks.push(DoctorCheck::new(
             "cache",
             CheckSeverity::Ok,
@@ -219,78 +238,40 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheInspection,
         ));
     }
 
-    if !table_exists(&conn, "events") {
+    let unknown = facts.unpriced_models;
+    if unknown.is_empty() {
+        checks.push(DoctorCheck::new(
+            "pricing",
+            CheckSeverity::Ok,
+            "all cached Claude/Codex models have static prices",
+        ));
+    } else {
         checks.push(
             DoctorCheck::new(
                 "pricing",
                 CheckSeverity::Warn,
-                "events table is unavailable",
+                format!(
+                    "{} cached Claude/Codex model(s) have no static price",
+                    unknown.len()
+                ),
             )
-            .action("run tokctl daily --rebuild"),
+            .details(unknown)
+            .action("update src/pricing.rs, then run tokctl daily --rebuild"),
         );
-    } else {
-        let unknown = unknown_priced_models(&conn)?;
-        if unknown.is_empty() {
-            checks.push(DoctorCheck::new(
-                "pricing",
-                CheckSeverity::Ok,
-                "all cached Claude/Codex models have static prices",
-            ));
-        } else {
-            checks.push(
-                DoctorCheck::new(
-                    "pricing",
-                    CheckSeverity::Warn,
-                    format!(
-                        "{} cached Claude/Codex model(s) have no static price",
-                        unknown.len()
-                    ),
-                )
-                .details(unknown)
-                .action("update src/pricing.rs, then run tokctl daily --rebuild"),
-            );
-        }
     }
 
-    Ok(CacheInspection {
-        event_count,
-        file_count,
-        repo_count,
-        checks,
-    })
-}
-
-fn read_schema_version(conn: &Connection) -> Option<i64> {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = 'schema_version'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|value| value.parse::<i64>().ok())
-}
-
-fn count_table(conn: &Connection, table: &str) -> Result<u64> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
-    Ok(count.max(0) as u64)
-}
-
-fn table_exists(conn: &Connection, table: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [table],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
-fn max_file_mtime_ns(conn: &Connection) -> Option<i64> {
-    conn.query_row("SELECT MAX(mtime_ns) FROM files", [], |row| {
-        row.get::<_, Option<i64>>(0)
-    })
-    .ok()
-    .flatten()
+    if let Some(provenance) = facts.provenance {
+        let stale = provenance.legacy_cost_rows > 0
+            || provenance.stale_pricing_rows > 0
+            || provenance.stale_parser_files > 0
+            || provenance.stale_calendar;
+        checks.push(DoctorCheck::new("provenance", if stale { CheckSeverity::Warn } else { CheckSeverity::Ok },
+            if stale { "cached derivations need refresh" } else { "cached derivation provenance is current" })
+            .details(vec![format!("legacy cost rows: {}; stale price rows: {}; stale parser files: {}; stale calendar: {}",
+                provenance.legacy_cost_rows, provenance.stale_pricing_rows, provenance.stale_parser_files, provenance.stale_calendar)])
+            .action("run a cached report with the source files available to refresh stale derivations"));
+    }
+    checks
 }
 
 fn format_ns_timestamp(ns: i64) -> String {
@@ -300,50 +281,6 @@ fn format_ns_timestamp(ns: i64) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-pub(crate) fn unknown_priced_models(
-    conn: &Connection,
-) -> std::result::Result<Vec<String>, DoctorCheck> {
-    let mut stmt = conn
-        .prepare("SELECT DISTINCT model, source FROM events ORDER BY model")
-        .map_err(|err| {
-            DoctorCheck::new(
-                "pricing",
-                CheckSeverity::Error,
-                "could not query cached models",
-            )
-            .details(vec![err.to_string()])
-        })?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|err| {
-            DoctorCheck::new(
-                "pricing",
-                CheckSeverity::Error,
-                "could not query cached models",
-            )
-            .details(vec![err.to_string()])
-        })?;
-    let mut unknown = Vec::new();
-    for row in rows {
-        let (model, source) = row.map_err(|err| {
-            DoctorCheck::new(
-                "pricing",
-                CheckSeverity::Error,
-                "could not read cached model row",
-            )
-            .details(vec![err.to_string()])
-        })?;
-        if source != Source::Cursor.as_str() && !pricing::has_price(&model) {
-            unknown.push(model);
-        }
-    }
-    unknown.sort();
-    unknown.dedup();
-    Ok(unknown)
-}
-
 pub(crate) fn cursor_sync_check() -> DoctorCheck {
     let primary = cursor_credentials_path();
     let legacy = tokscale_cursor_credentials_path();
@@ -351,23 +288,36 @@ pub(crate) fn cursor_sync_check() -> DoctorCheck {
         format!("tokctl credentials: {}", primary.display()),
         format!("legacy credentials: {}", legacy.display()),
     ];
-    if primary.exists() || legacy.exists() {
-        details
-            .push("credentials present; doctor did not validate or sync over the network".into());
-        DoctorCheck::new(
-            "cursor-sync",
-            CheckSeverity::Ok,
-            "Cursor credentials are present locally",
-        )
-        .details(details)
-        .action("run tokctl cursor status or tokctl cursor sync to validate remotely")
-    } else {
-        DoctorCheck::new(
+    match crate::cursor_sync::load_credentials_store() {
+        Ok(Some(store)) if !store.accounts.is_empty() => {
+            details.push(
+                "credentials parsed locally; doctor did not validate or sync over the network"
+                    .into(),
+            );
+            DoctorCheck::new(
+                "cursor-sync",
+                CheckSeverity::Ok,
+                "Cursor credentials are configured locally",
+            )
+            .details(details)
+            .action("run tokctl cursor status or tokctl cursor sync to validate remotely")
+        }
+        Ok(_) => DoctorCheck::new(
             "cursor-sync",
             CheckSeverity::Warn,
             "no Cursor credentials found",
         )
         .details(details)
-        .action("run tokctl cursor login to enable optional Cursor sync")
+        .action("run tokctl cursor login to enable optional Cursor sync"),
+        Err(error) => {
+            details.push(error.to_string());
+            DoctorCheck::new(
+                "cursor-sync",
+                CheckSeverity::Error,
+                "Cursor credential configuration is invalid",
+            )
+            .details(details)
+            .action("repair the local credential file, then run tokctl cursor login")
+        }
     }
 }

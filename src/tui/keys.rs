@@ -63,6 +63,7 @@ pub fn map_key(state: &AppState, k: KeyEvent, last_g: &mut Option<Instant>) -> A
         KeyCode::Char('t') => Action::JumpToSection(Section::Provider),
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('e') => Action::ToggleExpand,
+        KeyCode::Char('f') => Action::ToggleFamily,
         KeyCode::Char('s') => Action::CycleSort,
         KeyCode::Char('i') => Action::ToggleDetail,
         KeyCode::Tab => Action::CycleTab,
@@ -85,18 +86,18 @@ pub fn map_key(state: &AppState, k: KeyEvent, last_g: &mut Option<Instant>) -> A
         KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
         KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
         // Time window — uppercase + a/z to avoid clashing with d/w/m/y in Provider.
-        KeyCode::Char('T') => Action::SetWindow(TimeWindow::Today),
-        KeyCode::Char('W') => Action::SetWindow(TimeWindow::Week),
-        KeyCode::Char('M') => Action::SetWindow(TimeWindow::Month),
-        KeyCode::Char('z') => Action::SetWindow(TimeWindow::Year),
+        KeyCode::Char('T') => Action::SetWindow(TimeWindow::D1),
+        KeyCode::Char('W') => Action::SetWindow(TimeWindow::D7),
+        KeyCode::Char('M') => Action::SetWindow(TimeWindow::D30),
+        KeyCode::Char('z') => Action::SetWindow(TimeWindow::D365),
         KeyCode::Char('a') => Action::SetWindow(TimeWindow::All),
         KeyCode::Char('1') => Action::SetSource(SourceFilter::All),
         KeyCode::Char('2') => Action::SetSource(SourceFilter::Claude),
         KeyCode::Char('3') => Action::SetSource(SourceFilter::Codex),
         KeyCode::Char('4') => Action::SetSource(SourceFilter::Cursor),
         // Outside Provider: w/m/y can fall through to time window for back-compat.
-        KeyCode::Char('w') => Action::SetWindow(TimeWindow::Week),
-        KeyCode::Char('m') => Action::SetWindow(TimeWindow::Month),
+        KeyCode::Char('w') => Action::SetWindow(TimeWindow::D7),
+        KeyCode::Char('m') => Action::SetWindow(TimeWindow::D30),
         _ => Action::None,
     }
 }
@@ -207,6 +208,14 @@ mod tests {
     }
 
     #[test]
+    fn f_toggles_models_family() {
+        let state = AppState::default();
+        let mut last_g = None;
+        let action = map_key(&state, key(KeyCode::Char('f')), &mut last_g);
+        assert!(matches!(action, Action::ToggleFamily));
+    }
+
+    #[test]
     fn uppercase_t_sets_today_window() {
         let state = AppState::default();
         let mut last_g = None;
@@ -215,6 +224,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
             &mut last_g,
         );
-        assert!(matches!(action, Action::SetWindow(TimeWindow::Today)));
+        assert!(matches!(action, Action::SetWindow(TimeWindow::D1)));
     }
 }

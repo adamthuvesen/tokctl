@@ -30,6 +30,8 @@ struct PersistedState {
     #[serde(default)]
     expanded: Option<bool>,
     #[serde(default)]
+    models_by_family: Option<bool>,
+    #[serde(default)]
     seen_v3_intro: Option<bool>,
 }
 
@@ -70,6 +72,9 @@ pub fn load(path: &Path) -> AppState {
     if let Some(v) = p.expanded {
         s.expanded = v;
     }
+    if let Some(v) = p.models_by_family {
+        s.models_by_family = v;
+    }
     if let Some(v) = p.seen_v3_intro {
         s.seen_v3_intro = v;
     }
@@ -87,6 +92,7 @@ pub fn save(path: &Path, s: &AppState) -> anyhow::Result<()> {
         tab_per_section: Some(s.tab_per_section.clone()),
         section_selection: Some(s.section_selection.clone()),
         expanded: Some(s.expanded),
+        models_by_family: Some(s.models_by_family),
         seen_v3_intro: Some(s.seen_v3_intro),
     };
     if let Some(parent) = path.parent() {

@@ -1,241 +1,146 @@
 use crate::sources::{
-    parse_claude_line_classified, parse_codex_line, parse_cursor_csv, ClaudeParseResult, CodexCtx,
-    CodexParsed,
+    parse_claude_line_classified, parse_codex_line, parse_cursor_reader, ClaudeParseResult,
+    CodexCtx, CodexParsed,
 };
 use crate::types::UsageEvent;
-use anyhow::Result;
-use memmap2::Mmap;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{File, Metadata};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 #[derive(Debug, Default)]
-pub struct RangeResult {
+pub struct ParseResult {
     pub events: Vec<UsageEvent>,
-    /// Parsed assistant/usage lines we couldn't use (invalid JSON, etc.)
+    /// Claude message id of each event, aligned with `events`; other sources use `None`.
+    pub message_ids: Vec<Option<String>>,
     pub skipped_lines: usize,
 }
 
-/// Below this byte count, stick with BufReader — mmap setup overhead dominates
-/// the savings for small files.
-const MMAP_THRESHOLD: u64 = 1_048_576;
-
-/// Map the given byte range of `file_path` as read-only memory.
-///
-/// Safety invariant (callers must uphold):
-///   The mapped file must not be truncated or rewritten while the map is alive.
-///   tokctl ingests session files that are either (a) fully written and no
-///   longer being touched, or (b) routed to a full-parse via the ingest plan's
-///   safety-window logic before they're considered stable. We never mmap a file
-///   the producer is still appending to.
-///
-/// The returned bytes are the full file contents; callers slice into the
-/// `[from_offset, to_offset)` range themselves.
-fn map_file(file_path: &Path) -> Result<Mmap> {
-    let f = File::open(file_path)?;
-    // SAFETY: see the doc comment above. Upheld by the safety-window guard
-    // in `ingest::plan::plan_ingest`.
-    let map = unsafe { Mmap::map(&f)? };
-    Ok(map)
+fn same_snapshot(left: &Metadata, right: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if left.dev() != right.dev()
+            || left.ino() != right.ino()
+            || left.ctime() != right.ctime()
+            || left.ctime_nsec() != right.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
-fn process_claude_bytes(bytes: &[u8], project_path: Option<&str>, result: &mut RangeResult) {
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    for chunk in bytes.split(|&b| b == b'\n') {
-        if chunk.is_empty() {
-            continue;
-        }
-        let line = match std::str::from_utf8(chunk) {
-            Ok(s) => s,
-            Err(_) => {
-                result.skipped_lines += 1;
-                continue;
-            }
-        };
-        if !crate::sources::claude_line_has_signal(line) {
-            continue;
-        }
-        match parse_claude_line_classified(line, project_path) {
-            ClaudeParseResult::Event(p) => {
-                if let Some(id) = p.message_id {
-                    if !seen_ids.insert(id) {
-                        continue;
-                    }
-                }
-                result.events.push(p.event);
-            }
-            ClaudeParseResult::Skipped => {}
-            ClaudeParseResult::Malformed => result.skipped_lines += 1,
-        }
-    }
-}
-
-fn process_codex_bytes(bytes: &[u8], result: &mut RangeResult) {
-    let mut ctx = CodexCtx::default();
-    for chunk in bytes.split(|&b| b == b'\n') {
-        if chunk.is_empty() {
-            continue;
-        }
-        let line = match std::str::from_utf8(chunk) {
-            Ok(s) => s,
-            Err(_) => {
-                result.skipped_lines += 1;
-                continue;
-            }
-        };
-        if !crate::sources::codex_line_has_signal(line) {
-            continue;
-        }
-        match parse_codex_line(line, &mut ctx) {
-            Some(CodexParsed::Event(ev)) => result.events.push(ev),
-            Some(CodexParsed::ContextUpdated) | Some(CodexParsed::Skipped) => {}
-            None => result.skipped_lines += 1,
-        }
-    }
-}
-
-pub fn ingest_claude_range(
-    file_path: &Path,
-    project_path: Option<&str>,
-    from_offset: u64,
-    to_offset: u64,
-) -> Result<RangeResult> {
-    let mut result = RangeResult::default();
-    let len = to_offset.saturating_sub(from_offset);
-
-    if len >= MMAP_THRESHOLD && from_offset == 0 {
-        // mmap the whole file, process the [from, to) slice
-        let map = map_file(file_path)?;
-        let end = (to_offset as usize).min(map.len());
-        process_claude_bytes(&map[..end], project_path, &mut result);
-        return Ok(result);
-    }
-    if len >= MMAP_THRESHOLD {
-        // Partial mmap range — tail read on a large file
-        let map = map_file(file_path)?;
-        let start = (from_offset as usize).min(map.len());
-        let end = (to_offset as usize).min(map.len());
-        process_claude_bytes(&map[start..end], project_path, &mut result);
-        return Ok(result);
-    }
-
-    // Small-file path: BufReader::take, line-by-line.
-    let mut f = File::open(file_path)?;
-    if from_offset > 0 {
-        f.seek(SeekFrom::Start(from_offset))?;
-    }
-    let reader = BufReader::new(f.take(len));
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => {
-                result.skipped_lines += 1;
-                continue;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if !crate::sources::claude_line_has_signal(&line) {
-            continue;
-        }
-        match parse_claude_line_classified(&line, project_path) {
-            ClaudeParseResult::Event(p) => {
-                if let Some(id) = p.message_id {
-                    if !seen_ids.insert(id) {
-                        continue;
-                    }
-                }
-                result.events.push(p.event);
-            }
-            ClaudeParseResult::Skipped => {}
-            ClaudeParseResult::Malformed => result.skipped_lines += 1,
-        }
-    }
+fn read_snapshot<T>(
+    path: &Path,
+    expected: Option<&crate::discovery::DiscoveredFile>,
+    parse: impl FnOnce(&mut File) -> Result<T>,
+) -> Result<T> {
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let before = file.metadata()?;
+    anyhow::ensure!(before.is_file(), "{} is not a regular file", path.display());
+    anyhow::ensure!(
+        expected.is_none_or(|expected| expected.matches_metadata(&before)),
+        "{} changed since discovery",
+        path.display()
+    );
+    let result = parse(&mut file).with_context(|| format!("reading {}", path.display()))?;
+    let after = file.metadata()?;
+    let current =
+        std::fs::metadata(path).with_context(|| format!("checking {}", path.display()))?;
+    anyhow::ensure!(
+        same_snapshot(&before, &after) && same_snapshot(&after, &current),
+        "{} changed while reading",
+        path.display()
+    );
     Ok(result)
 }
 
-pub fn ingest_codex_range(
-    file_path: &Path,
-    from_offset: u64,
-    to_offset: u64,
-) -> Result<RangeResult> {
-    let mut result = RangeResult::default();
-    let len = to_offset.saturating_sub(from_offset);
-
-    if len >= MMAP_THRESHOLD && from_offset == 0 {
-        let map = map_file(file_path)?;
-        let end = (to_offset as usize).min(map.len());
-        process_codex_bytes(&map[..end], &mut result);
-        return Ok(result);
-    }
-    if len >= MMAP_THRESHOLD {
-        let map = map_file(file_path)?;
-        let start = (from_offset as usize).min(map.len());
-        let end = (to_offset as usize).min(map.len());
-        process_codex_bytes(&map[start..end], &mut result);
-        return Ok(result);
-    }
-
-    // Small-file path
-    let mut f = File::open(file_path)?;
-    if from_offset > 0 {
-        f.seek(SeekFrom::Start(from_offset))?;
-    }
-    let reader = BufReader::new(f.take(len));
-    let mut ctx = CodexCtx::default();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => {
-                result.skipped_lines += 1;
-                continue;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
+pub fn parse_discovered_file(file: &crate::discovery::DiscoveredFile) -> Result<ParseResult> {
+    read_snapshot(&file.path, Some(file), |reader| match file.source {
+        crate::types::Source::Claude => parse_jsonl(reader, file.project.as_deref(), false),
+        crate::types::Source::Codex => parse_jsonl(reader, None, true),
+        crate::types::Source::Cursor => {
+            let (events, skipped_lines) = parse_cursor_reader(reader, &file.path)?;
+            Ok(ParseResult {
+                message_ids: vec![None; events.len()],
+                events,
+                skipped_lines,
+            })
         }
-        if !crate::sources::codex_line_has_signal(&line) {
-            continue;
-        }
-        match parse_codex_line(&line, &mut ctx) {
-            Some(CodexParsed::Event(ev)) => result.events.push(ev),
-            Some(CodexParsed::ContextUpdated) | Some(CodexParsed::Skipped) => {}
-            None => result.skipped_lines += 1,
-        }
-    }
-    Ok(result)
-}
-
-pub fn ingest_cursor_range(file_path: &Path) -> Result<RangeResult> {
-    let (events, skipped_lines) = parse_cursor_csv(file_path);
-    Ok(RangeResult {
-        events,
-        skipped_lines,
     })
+}
+
+fn parse_jsonl(reader: impl Read, project: Option<&str>, codex: bool) -> Result<ParseResult> {
+    let mut result = ParseResult::default();
+    let mut seen_ids = HashSet::new();
+    let mut context = CodexCtx::default();
+    let mut reader = BufReader::new(reader);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if reader.read_until(b'\n', &mut bytes)? == 0 {
+            break;
+        }
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(line) => line.trim(),
+            Err(_) => {
+                result.skipped_lines += 1;
+                continue;
+            }
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let mut message_id = None;
+        let event = if codex {
+            match parse_codex_line(line, &mut context) {
+                Some(CodexParsed::Event(event)) => Some(event),
+                Some(CodexParsed::ContextUpdated | CodexParsed::Skipped) => None,
+                None => {
+                    result.skipped_lines += 1;
+                    None
+                }
+            }
+        } else {
+            match parse_claude_line_classified(line, project) {
+                ClaudeParseResult::Event(parsed) => {
+                    if let Some(id) = parsed.message_id {
+                        if !seen_ids.insert(id.clone()) {
+                            continue;
+                        }
+                        message_id = Some(id);
+                    }
+                    Some(parsed.event)
+                }
+                ClaudeParseResult::Skipped => None,
+                ClaudeParseResult::Malformed => {
+                    result.skipped_lines += 1;
+                    None
+                }
+            }
+        };
+        if let Some(event) = event {
+            if event.validate().is_err() {
+                result.skipped_lines += 1;
+            } else {
+                result.events.push(event);
+                result.message_ids.push(message_id);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub fn parse_claude_file(path: &Path, project: Option<&str>) -> Result<ParseResult> {
+    read_snapshot(path, None, |file| parse_jsonl(file, project, false))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn partial_range_honors_offsets() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("x.jsonl");
-        let mut f = std::fs::File::create(&p).unwrap();
-        writeln!(f, r#"{{"type":"user"}}"#).unwrap();
-        let offset_before_second = f.stream_position().unwrap();
-        writeln!(f, r#"{{"type":"assistant","timestamp":"2026-04-18T09:00:05.000Z","sessionId":"s","message":{{"id":"m","model":"claude-sonnet-4-6","usage":{{"input_tokens":1}}}}}}"#).unwrap();
-        let end = f.metadata().unwrap().len();
-        drop(f);
-
-        let r = ingest_claude_range(&p, None, offset_before_second, end).unwrap();
-        assert_eq!(r.events.len(), 1);
-    }
 
     #[test]
     fn claude_range_dedupes_repeated_message_ids() {
@@ -247,8 +152,7 @@ mod tests {
         writeln!(f, "{}", line).unwrap();
         drop(f);
 
-        let size = std::fs::metadata(&p).unwrap().len();
-        let r = ingest_claude_range(&p, None, 0, size).unwrap();
+        let r = parse_claude_file(&p, None).unwrap();
         assert_eq!(r.events.len(), 1);
         let ev = &r.events[0];
         assert_eq!(ev.input_tokens, 100);
@@ -258,9 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn mmap_path_and_buf_path_agree() {
-        // Build a file slightly over the threshold so mmap kicks in, and a
-        // copy under it — results must match.
+    fn large_buffered_files_parse() {
         let dir = tempfile::tempdir().unwrap();
 
         let small_path = dir.path().join("small.jsonl");
@@ -275,7 +177,7 @@ mod tests {
 
         let big_path = dir.path().join("big.jsonl");
         let mut f = std::fs::File::create(&big_path).unwrap();
-        let target = MMAP_THRESHOLD + 1000;
+        let target = 1_048_576 + 1000;
         let mut i = 0usize;
         while f.metadata().unwrap().len() < target {
             let line = format!(
@@ -286,11 +188,8 @@ mod tests {
         }
         drop(f);
 
-        let small_size = std::fs::metadata(&small_path).unwrap().len();
-        let big_size = std::fs::metadata(&big_path).unwrap().len();
-
-        let small_r = ingest_claude_range(&small_path, None, 0, small_size).unwrap();
-        let big_r = ingest_claude_range(&big_path, None, 0, big_size).unwrap();
+        let small_r = parse_claude_file(&small_path, None).unwrap();
+        let big_r = parse_claude_file(&big_path, None).unwrap();
 
         // Both produce N events where N = (file_size / line_size).
         // The exact count varies per-file; we just check both paths succeed

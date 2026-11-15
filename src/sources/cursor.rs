@@ -4,28 +4,32 @@ use csv::StringRecord;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub fn parse_cursor_csv(path: &Path) -> (Vec<UsageEvent>, usize) {
-    let mut reader = match csv::ReaderBuilder::new().flexible(true).from_path(path) {
-        Ok(reader) => reader,
-        Err(_) => return (Vec::new(), 1),
-    };
+pub fn parse_cursor_csv(path: &Path) -> anyhow::Result<(Vec<UsageEvent>, usize)> {
+    let file = std::fs::File::open(path)?;
+    parse_cursor_reader(file, path)
+}
 
-    let header_fields = match reader.headers() {
-        Ok(headers) => headers.clone(),
-        Err(_) => return (Vec::new(), 1),
-    };
-    let Some(indexes) = CursorColumns::from_header(&header_fields) else {
-        return (Vec::new(), 0);
-    };
+pub fn parse_cursor_reader(
+    reader: impl std::io::Read,
+    path: &Path,
+) -> anyhow::Result<(Vec<UsageEvent>, usize)> {
+    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
+    let header_fields = reader.headers()?.clone();
+    let indexes = CursorColumns::from_header(&header_fields)
+        .ok_or_else(|| anyhow::anyhow!("missing required Cursor CSV columns"))?;
 
     let session_prefix = session_prefix(path);
 
     let mut events = Vec::new();
     let mut skipped = 0usize;
     for (row_idx, record) in reader.records().enumerate() {
-        let Ok(fields) = record else {
-            skipped += 1;
-            continue;
+        let fields = match record {
+            Ok(fields) => fields,
+            Err(error) if error.is_io_error() => anyhow::bail!("Cursor CSV read failed"),
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         if fields.iter().all(|f| f.trim().is_empty()) {
             continue;
@@ -36,7 +40,7 @@ pub fn parse_cursor_csv(path: &Path) -> (Vec<UsageEvent>, usize) {
             CursorRowParse::Malformed => skipped += 1,
         }
     }
-    (events, skipped)
+    Ok((events, skipped))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,10 +164,10 @@ fn parse_row(
         explicit_cost_usd,
     };
 
-    if event.input_tokens + event.output_tokens + event.cache_read_tokens + event.cache_write_tokens
-        == 0
-        && event.explicit_cost_usd.unwrap_or(0.0) == 0.0
-    {
+    if event.validate().is_err() {
+        return CursorRowParse::Malformed;
+    }
+    if event.total_tokens().unwrap() == 0 && event.explicit_cost_usd.unwrap_or(0.0) == 0.0 {
         return CursorRowParse::Skipped;
     }
 
@@ -184,11 +188,7 @@ fn parse_token_count(raw: &str) -> Option<u64> {
 
 fn parse_cost(raw: &str) -> Option<f64> {
     let cleaned = raw.trim().trim_matches('"').replace(['$', ','], "");
-    if cleaned.is_empty()
-        || cleaned.eq_ignore_ascii_case("nan")
-        || cleaned.eq_ignore_ascii_case("included")
-        || cleaned == "-"
-    {
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("included") || cleaned == "-" {
         return Some(0.0);
     }
     cleaned.parse().ok()
@@ -235,7 +235,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, skipped) = parse_cursor_csv(&path);
+        let (events, skipped) = parse_cursor_csv(&path).unwrap();
         assert_eq!(skipped, 0);
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -260,8 +260,8 @@ mod tests {
         std::fs::write(&a, csv).unwrap();
         std::fs::write(&b, csv).unwrap();
 
-        let (a_events, _) = parse_cursor_csv(&a);
-        let (b_events, _) = parse_cursor_csv(&b);
+        let (a_events, _) = parse_cursor_csv(&a).unwrap();
+        let (b_events, _) = parse_cursor_csv(&b).unwrap();
 
         assert_ne!(a_events[0].session_id, b_events[0].session_id);
         assert!(a_events[0].session_id.starts_with("usage-"));
@@ -279,7 +279,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, skipped) = parse_cursor_csv(&path);
+        let (events, skipped) = parse_cursor_csv(&path).unwrap();
 
         assert_eq!(skipped, 0);
         assert_eq!(events[0].model, "gpt-5, codex");
@@ -309,7 +309,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, skipped) = parse_cursor_csv(&path);
+        let (events, skipped) = parse_cursor_csv(&path).unwrap();
 
         assert!(events.is_empty());
         assert_eq!(skipped, 0);
@@ -326,7 +326,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, skipped) = parse_cursor_csv(&path);
+        let (events, skipped) = parse_cursor_csv(&path).unwrap();
 
         assert!(events.is_empty());
         assert_eq!(skipped, 1);
@@ -343,7 +343,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, skipped) = parse_cursor_csv(&path);
+        let (events, skipped) = parse_cursor_csv(&path).unwrap();
 
         assert!(events.is_empty());
         assert_eq!(skipped, 1);
@@ -360,7 +360,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, skipped) = parse_cursor_csv(&path);
+        let (events, skipped) = parse_cursor_csv(&path).unwrap();
 
         assert_eq!(skipped, 0);
         assert_eq!(events.len(), 1);

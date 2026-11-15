@@ -1,8 +1,43 @@
+// These tests corrupt or observe caches from outside, like another process would.
+#![allow(clippy::disallowed_types)]
+
 use std::fs;
 use std::process::Command;
 
-fn tokctl() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tokctl"))
+struct IsolatedCommand {
+    command: Command,
+    _home: tempfile::TempDir,
+}
+impl std::ops::Deref for IsolatedCommand {
+    type Target = Command;
+    fn deref(&self) -> &Command {
+        &self.command
+    }
+}
+impl std::ops::DerefMut for IsolatedCommand {
+    fn deref_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+}
+
+fn tokctl() -> IsolatedCommand {
+    let home = tempfile::tempdir().expect("isolated CLI environment");
+    let path = home.path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tokctl"));
+    command
+        .env("HOME", path)
+        .env("XDG_CONFIG_HOME", path.join("config"))
+        .env("XDG_DATA_HOME", path.join("data"))
+        .env("TOKCTL_CACHE_DIR", path.join("cache"))
+        .env("TOKCTL_CLAUDE_DIR", path.join("claude"))
+        .env("TOKCTL_CODEX_DIR", path.join("codex"))
+        .env("TOKCTL_CURSOR_DIR", path.join("cursor"))
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME");
+    IsolatedCommand {
+        command,
+        _home: home,
+    }
 }
 
 fn isolated_cache_dir() -> tempfile::TempDir {
@@ -201,4 +236,436 @@ fn no_cache_repo_filter_rejects_ambiguous_display_names() {
     assert!(stderr.contains("repo name 'alpha' is ambiguous"));
     assert!(stderr.contains(left_repo.to_str().expect("utf8 left repo")));
     assert!(stderr.contains(right_repo.to_str().expect("utf8 right repo")));
+}
+
+#[test]
+fn concurrent_processes_replace_changed_snapshots_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let claude = workspace.path().join("claude/project");
+    fs::create_dir_all(&claude).unwrap();
+    let path = claude.join("session.jsonl");
+    let event = |id: &str| {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-04-22T12:00:00Z","sessionId":"same","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"input_tokens":1}}}}}}"#
+        )
+    };
+    fs::write(&path, format!("{}\n", event("a"))).unwrap();
+    let make_command = || {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "claude"])
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+    let mut left = make_command();
+    let mut right = make_command();
+    let left = left.spawn().unwrap();
+    let right = right.spawn().unwrap();
+    assert!(left.wait_with_output().unwrap().status.success());
+    assert!(right.wait_with_output().unwrap().status.success());
+    fs::write(&path, format!("{}\n{}\n", event("a"), event("b"))).unwrap();
+    let mut left = make_command();
+    let mut right = make_command();
+    let left = left.spawn().unwrap();
+    let right = right.spawn().unwrap();
+    assert!(left.wait_with_output().unwrap().status.success());
+    assert!(right.wait_with_output().unwrap().status.success());
+    let conn = rusqlite::Connection::open(workspace.path().join("cache/cache.db")).unwrap();
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    let files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((events, files), (2, 1));
+}
+
+#[test]
+fn invalid_date_order_fails_before_config_or_sync_access() {
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("tokctl")).unwrap();
+    fs::write(
+        home.path().join("tokctl/cursor-credentials.json"),
+        "invalid credentials",
+    )
+    .unwrap();
+    let output = tokctl()
+        .args(["daily", "--since", "2026-04-23", "--until", "2026-04-22"])
+        .env("XDG_CONFIG_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--until must be on or after --since"));
+}
+
+#[test]
+fn noninteractive_ui_fails_before_creating_demo_or_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    for demo in [false, true] {
+        let cache = directory.path().join(if demo { "demo" } else { "normal" });
+        let mut command = tokctl();
+        command.arg("ui").env("TOKCTL_CACHE_DIR", &cache);
+        if demo {
+            command.args(["--demo", "--cache-dir"]).arg(&cache);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal")
+        );
+        assert!(!cache.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_symlink_root_keeps_previously_cached_rows_visible() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    let alias = workspace.path().join("alias");
+    fs::create_dir(&root).unwrap();
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    write_codex_session(&root, "session.jsonl", workspace.path(), "saved-session");
+    let report = || {
+        tokctl()
+            .args(["daily", "--json", "--source", "codex"])
+            .env("TOKCTL_CODEX_DIR", &alias)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+            .output()
+            .unwrap()
+    };
+    let initial = report();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let expected: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(expected.as_array().unwrap().len(), 1);
+    fs::rename(&root, workspace.path().join("offline")).unwrap();
+    let offline = report();
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&offline.stdout).unwrap(),
+        expected
+    );
+    assert!(String::from_utf8_lossy(&offline.stderr).contains("warning:"));
+}
+
+#[test]
+fn retained_stale_provenance_warns_only_for_matching_report_scope() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    fs::create_dir(&root).unwrap();
+    write_codex_session(&root, "session.jsonl", workspace.path(), "saved-session");
+    let report = |extra: &[&str]| {
+        tokctl()
+            .args(["daily", "--json", "--source", "codex"])
+            .args(extra)
+            .env("TOKCTL_CODEX_DIR", &root)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+            .output()
+            .unwrap()
+    };
+    assert!(report(&[]).status.success());
+    let connection = rusqlite::Connection::open(workspace.path().join("cache/cache.db")).unwrap();
+    connection.execute_batch("UPDATE events SET cost_provenance='legacy'; UPDATE parser_provenance SET signature='stale';").unwrap();
+    drop(connection);
+    fs::rename(&root, workspace.path().join("offline")).unwrap();
+    let offline = report(&[]);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&offline.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let warnings = String::from_utf8_lossy(&offline.stderr);
+    assert!(
+        warnings.contains("retained 1 legacy cost row(s)"),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("retained 1 file snapshot(s) from a stale parser"),
+        "{warnings}"
+    );
+    let excluded = report(&["--since", "2026-04-21", "--until", "2026-04-21"]);
+    assert!(excluded.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&excluded.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(!String::from_utf8_lossy(&excluded.stderr).contains("retained"));
+}
+
+#[test]
+fn diagnostic_failure_prevents_partial_report_stdout() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    fs::create_dir(&root).unwrap();
+    write_codex_session(&root, "session.jsonl", workspace.path(), "saved-session");
+    let report = |command: &str| {
+        let mut command_line = tokctl();
+        command_line
+            .args([command, "--json", "--source", "codex"])
+            .env("TOKCTL_CODEX_DIR", &root)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"));
+        if command == "compare" {
+            command_line.args(["2026-04-20..2026-04-20", "2026-04-19..2026-04-19"]);
+        }
+        command_line.output().unwrap()
+    };
+    assert!(report("daily").status.success());
+    let connection = rusqlite::Connection::open(workspace.path().join("cache/cache.db")).unwrap();
+    connection
+        .execute("UPDATE ingest_diagnostics SET skipped_records=-1", [])
+        .unwrap();
+    drop(connection);
+    for command in ["daily", "monthly", "session", "repo", "compare"] {
+        let output = report(command);
+        assert!(!output.status.success(), "{command}");
+        assert!(
+            output.stdout.is_empty(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn malformed_only_files_warn_in_selected_source_roots_without_events() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("codex");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("malformed.jsonl"), "{broken json\n").unwrap();
+    for no_cache in [false, true] {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "codex"])
+            .env("TOKCTL_CODEX_DIR", &root)
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"));
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!([])
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("skipped 1 malformed input line(s)")
+        );
+    }
+}
+
+fn claude_line(message_id: &str, session: &str, input: u64, output: u64) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"2026-04-22T12:00:00Z","sessionId":"{session}","message":{{"id":"{message_id}","model":"claude-sonnet-4-6","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+#[test]
+fn a_claude_message_id_in_two_session_files_counts_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("claude/project");
+    fs::create_dir_all(&project).unwrap();
+    // A resumed session replays m1 in a second file under a new session id; m2 is new there.
+    fs::write(
+        project.join("original.jsonl"),
+        claude_line("m1", "s-original", 100, 40) + "\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("resumed.jsonl"),
+        claude_line("m1", "s-resumed", 100, 40)
+            + "\n"
+            + &claude_line("m2", "s-resumed", 10, 5)
+            + "\n",
+    )
+    .unwrap();
+    for no_cache in [false, true] {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "claude"])
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+            .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"));
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            rows[0]["totalTokens"], 155,
+            "no_cache={no_cache}: m1 (140) counts once, plus m2 (15): {rows}"
+        );
+    }
+}
+
+fn write_cursor_credentials(home: &std::path::Path, contents: &str) {
+    let dir = home.join(".config/tokctl");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("cursor-credentials.json"), contents).unwrap();
+}
+
+#[test]
+fn cursor_status_lists_accounts_and_reports_a_failed_validation() {
+    let home = tempfile::tempdir().unwrap();
+    write_cursor_credentials(
+        home.path(),
+        r#"{"version":1,"activeAccountId":"acct-1","accounts":{"acct-1":{"sessionToken":"synthetic-token","createdAt":"2026-04-01T00:00:00Z","label":"work"}}}"#,
+    );
+    // A closed local proxy makes validation fail without any request leaving this machine.
+    let output = tokctl()
+        .args(["cursor", "status"])
+        .env("HOME", home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("* acct-1 (work)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("session: not validated"),
+        "stdout: {stdout}"
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("validating Cursor session"));
+}
+
+#[test]
+fn a_corrupt_cursor_credentials_file_leaves_the_other_sources_reporting() {
+    let workspace = tempfile::tempdir().unwrap();
+    write_cursor_credentials(workspace.path(), "{not json");
+    let project = workspace.path().join("claude/project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("s.jsonl"),
+        claude_line("m1", "s", 100, 40) + "\n",
+    )
+    .unwrap();
+    let output = tokctl()
+        .args(["daily", "--json"])
+        .env("HOME", workspace.path())
+        .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+        .env("TOKCTL_CACHE_DIR", workspace.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["totalTokens"], 140);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cursor unavailable: invalid Cursor credentials at"),
+        "{stderr}"
+    );
+}
+
+fn recent_claude_line(message_id: &str, model: &str, input: u64, output: u64) -> String {
+    let timestamp = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    format!(
+        r#"{{"type":"assistant","timestamp":"{timestamp}","sessionId":"s-{message_id}","message":{{"id":"{message_id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+#[test]
+fn models_defaults_to_30d_sorts_by_cost_and_flags_unpriced_models() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("claude/project");
+    fs::create_dir_all(&project).unwrap();
+    let lines = [
+        recent_claude_line("m1", "claude-sonnet-4-6", 1_000, 100),
+        recent_claude_line("m2", "claude-opus-4-7", 1_000_000, 100),
+        recent_claude_line("m3", "claude-nonesuch-9", 4_000, 0),
+    ];
+    fs::write(project.join("s.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let run = |extra: &[&str]| {
+        let output = tokctl()
+            .args(["models", "--json", "--no-cache", "--source", "claude"])
+            .args(extra)
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let report = run(&[]);
+    assert_eq!(report["window"], "30d");
+    assert!(report["since_ms"].is_i64());
+    assert!(
+        report["previous_total"].is_null(),
+        "no events before the window"
+    );
+    let models: Vec<&str> = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        models,
+        ["claude-opus-4-7", "claude-sonnet-4-6", "claude-nonesuch-9"]
+    );
+    let shares: f64 = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["share"].as_f64().unwrap())
+        .sum();
+    assert!((shares - 1.0).abs() < 1e-9, "{shares}");
+    assert_eq!(report["rows"][2]["priced"], false);
+    assert_eq!(
+        report["unpriced"],
+        serde_json::json!([{ "model": "claude-nonesuch-9", "tokens": 4000 }])
+    );
+
+    let all = run(&["--last", "all"]);
+    assert_eq!(all["window"], "all");
+    assert!(all["previous_total"].is_null());
+    let family = run(&["--last", "1d", "--by", "family"]);
+    assert_eq!(family["rows"][0]["model"], "claude-opus");
+}
+
+#[test]
+fn models_rejects_a_window_that_is_not_rolling_without_stdout() {
+    let output = tokctl().args(["models", "--last", "2d"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid window '2d'"));
 }

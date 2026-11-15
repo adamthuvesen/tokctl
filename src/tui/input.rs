@@ -6,6 +6,8 @@ use crate::tui::data;
 use crate::tui::state::{self, AppState, DrillKind, Section};
 
 pub fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
+    let visible = cache.visible(state);
+    let cache = &visible;
     match state.deepest_drill() {
         Some(d) => match d.kind {
             DrillKind::Sessions { .. } => cache
@@ -15,7 +17,7 @@ pub fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
                         .current_index()
                         .min(cache.sessions.len().saturating_sub(1)),
                 )
-                .map(|r| r.session_id.clone()),
+                .map(|r| format!("{}:{}", r.source.as_str(), r.session_id)),
             DrillKind::Events { source } => cache
                 .events
                 .get(
@@ -26,7 +28,7 @@ pub fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
                 .map(|r| format!("{}/{}@{}", source.as_str(), d.key, r.ts.to_rfc3339())),
         },
         None => match state.current_section {
-            Section::Provider => cache
+            Section::Provider | Section::Repos if state.is_provider_view() => cache
                 .trend
                 .get(
                     state
@@ -41,7 +43,7 @@ pub fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
                         .current_index()
                         .min(cache.sessions.len().saturating_sub(1)),
                 )
-                .map(|r| r.session_id.clone()),
+                .map(|r| format!("{}:{}", r.source.as_str(), r.session_id)),
             _ => cache
                 .left
                 .get(
@@ -55,6 +57,8 @@ pub fn yank_key(state: &AppState, cache: &data::DataCache) -> Option<String> {
 }
 
 pub fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String> {
+    let visible = cache.visible(state);
+    let cache = &visible;
     match state.deepest_drill() {
         Some(d) => match d.kind {
             DrillKind::Sessions { .. } => cache
@@ -94,7 +98,7 @@ pub fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String>
                 }),
         },
         None => match state.current_section {
-            Section::Provider => cache
+            Section::Provider | Section::Repos if state.is_provider_view() => cache
                 .trend
                 .get(
                     state
@@ -134,12 +138,17 @@ pub fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String>
                         .min(cache.left.len().saturating_sub(1)),
                 )
                 .map(|r| {
+                    let cost = if r.model_stats.as_ref().is_some_and(|s| !s.priced) {
+                        "unpriced".to_owned()
+                    } else {
+                        crate::tui::format::fmt_cost(r.cost)
+                    };
+                    if r.model_stats.is_some() {
+                        return format!("{} · {} tokens · {}", r.label, r.total_tokens, cost);
+                    }
                     format!(
                         "{} · {} sessions · {} tokens · {}",
-                        r.label,
-                        r.sessions,
-                        r.total_tokens,
-                        crate::tui::format::fmt_cost(r.cost)
+                        r.label, r.sessions, r.total_tokens, cost
                     )
                 }),
         },
@@ -148,83 +157,98 @@ pub fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String>
 
 /// Build the next drill target from the focused row in the current view.
 pub fn drill_target_for_current(state: &AppState, cache: &data::DataCache) -> Option<state::Drill> {
-    let kind = state.next_drill_kind_hint()?;
-    match kind {
-        DrillKind::Sessions { from_section } => {
-            if cache.left.is_empty() {
-                return None;
-            }
-            let idx = state.current_index().min(cache.left.len() - 1);
-            let row = &cache.left[idx];
-            Some(state::Drill {
-                kind: DrillKind::Sessions { from_section },
-                key: row.key.clone(),
-                label: row.label.clone(),
-                cursor: 0,
-            })
+    let visible = cache.visible(state);
+    let index = state.current_index();
+    let mut scope = state
+        .deepest_drill()
+        .map(|drill| drill.scope.clone())
+        .unwrap_or_default();
+    let (kind, key, label) = match state.next_drill_kind_hint()? {
+        state::NextDrill::Sessions => {
+            let row = visible.left.get(index)?;
+            row.selection.apply_to(&mut scope);
+            (
+                DrillKind::Sessions {
+                    from_section: state.current_section,
+                },
+                row.key.clone(),
+                row.label.clone(),
+            )
         }
-        DrillKind::Events { .. } => match state.deepest_drill() {
-            None => {
-                if state.current_section == Section::Sessions {
-                    if cache.sessions.is_empty() {
-                        return None;
-                    }
-                    let idx = state.current_index().min(cache.sessions.len() - 1);
-                    let row = &cache.sessions[idx];
-                    Some(state::Drill {
-                        kind: DrillKind::Events { source: row.source },
-                        key: row.session_id.clone(),
-                        label: short_session_label(&row.session_id),
-                        cursor: 0,
-                    })
-                } else if cache.left.is_empty() {
-                    None
-                } else {
-                    let idx = state.current_index().min(cache.left.len() - 1);
-                    let row = &cache.left[idx];
-                    let source = row.source.unwrap_or(crate::types::Source::Claude);
-                    Some(state::Drill {
-                        kind: DrillKind::Events { source },
-                        key: row.key.clone(),
-                        label: short_session_label(&row.key),
-                        cursor: 0,
-                    })
-                }
-            }
-            Some(_sessions_drill) => {
-                if cache.sessions.is_empty() {
-                    return None;
-                }
-                let idx = state.current_index().min(cache.sessions.len() - 1);
-                let row = &cache.sessions[idx];
-                Some(state::Drill {
-                    kind: DrillKind::Events { source: row.source },
-                    key: row.session_id.clone(),
-                    label: short_session_label(&row.session_id),
-                    cursor: 0,
-                })
-            }
-        },
-    }
+        state::NextDrill::Events => {
+            let row = visible.sessions.get(index)?;
+            scope.session = Some(crate::store::queries::SessionKey {
+                source: row.source,
+                id: row.session_id.clone(),
+            });
+            (
+                DrillKind::Events { source: row.source },
+                row.session_id.clone(),
+                short_session_label(&row.session_id),
+            )
+        }
+    };
+    Some(state::Drill {
+        kind,
+        key,
+        label,
+        cursor: 0,
+        scope,
+        parent_filter: Default::default(),
+    })
 }
 
 pub fn clamp_cursor_to_visible_rows(state: &mut AppState, cache: &data::DataCache) {
+    let visible = cache.visible(state);
+    let cache = &visible;
     let rows = match state.deepest_drill().map(|d| d.kind) {
         Some(DrillKind::Sessions { .. }) => cache.sessions.len(),
         Some(DrillKind::Events { .. }) => cache.events.len(),
         None => match state.current_section {
-            Section::Provider => cache.trend.len(),
+            Section::Provider | Section::Repos if state.is_provider_view() => cache.trend.len(),
             Section::Sessions => cache.sessions.len(),
             _ => cache.left.len(),
         },
     };
-    if rows == 0 {
-        state.set_current_index(0);
-        return;
+    if !state.drill_active() && !state.section_index.contains_key(&state.current_section) {
+        if let Some(saved) = state.section_selection.get(&state.current_section) {
+            let keys = visible_keys(state, cache);
+            let index = keys.iter().position(|key| key == saved).or_else(|| {
+                (state.current_section == Section::Sessions)
+                    .then(|| {
+                        cache
+                            .sessions
+                            .iter()
+                            .position(|row| &row.session_id == saved)
+                    })
+                    .flatten()
+            });
+            if let Some(index) = index {
+                state.set_current_index(index);
+            }
+        }
     }
-    let cur = state.current_index();
-    if cur >= rows {
-        state.set_current_index(rows - 1);
+    state.set_current_index(state.current_index().min(rows.saturating_sub(1)));
+    if !state.drill_active() {
+        if let Some(key) = visible_keys(state, cache).get(state.current_index()) {
+            state
+                .section_selection
+                .insert(state.current_section, key.clone());
+        }
+    }
+}
+
+fn visible_keys(state: &AppState, cache: &data::VisibleRows) -> Vec<String> {
+    if state.is_provider_view() {
+        cache.trend.iter().map(|row| row.bucket.clone()).collect()
+    } else if state.current_section == Section::Sessions {
+        cache
+            .sessions
+            .iter()
+            .map(|row| format!("{}:{}", row.source.as_str(), row.session_id))
+            .collect()
+    } else {
+        cache.left.iter().map(|row| row.key.clone()).collect()
     }
 }
 
@@ -235,3 +259,6 @@ fn short_session_label(session_id: &str) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests;

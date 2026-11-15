@@ -4,10 +4,10 @@ use nucleo_matcher::{
 };
 
 use crate::tui::data::{LeftRow, SessionRow};
-use crate::tui::state::{AppState, Focus};
+use crate::tui::state::AppState;
 
 pub fn should_filter(state: &AppState) -> bool {
-    !state.filter.query.is_empty() && state.focus == Focus::Main
+    !state.filter.query.is_empty()
 }
 
 pub fn apply_filter_left(rows: &[LeftRow], state: &AppState) -> (Vec<LeftRow>, Vec<u32>) {
@@ -20,7 +20,7 @@ pub fn apply_filter_sessions(rows: &[SessionRow], state: &AppState) -> (Vec<Sess
     })
 }
 
-fn filter_rows<T: Clone>(
+pub(crate) fn filter_rows<T: Clone>(
     rows: &[T],
     state: &AppState,
     label: impl Fn(&T) -> &str,

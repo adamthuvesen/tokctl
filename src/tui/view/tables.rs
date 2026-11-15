@@ -7,22 +7,23 @@ use ratatui::{
     Frame,
 };
 
-use super::layout::{BAR_WIDTH, LEFT_NAME_WIDTH, SESSION_PROJECT_WIDTH};
-use crate::tui::data::{sort_session_rows, DataCache, EventRow, LeftRow, SessionRow, TrendRow};
+use super::layout::{
+    models_column_widths, BAR_WIDTH, LEFT_NAME_WIDTH, MODEL_BAR_WIDTH, MODEL_SHARE_TEXT_WIDTH,
+    MODEL_TREND_WIDTH, SESSION_PROJECT_WIDTH,
+};
+use crate::tui::data::{EventRow, LeftRow, SessionRow, TrendRow, VisibleRows};
 use crate::tui::format::{fmt_cost, fmt_num, fmt_tokens_short, session_when};
-use crate::tui::state::{AppState, Focus, Sort, SourceFilter};
+use crate::tui::state::{AppState, Focus, SourceFilter};
 use crate::tui::theme::Palette;
-use crate::tui::widgets::filter::{apply_filter_left, apply_filter_sessions};
-// -- Section: left-row table (Days, Models, Sessions, Repos Costs tab) ------------
 
 pub(super) fn draw_left_table(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
-    let (rows, _) = apply_filter_left(&cache.left, state);
+    let rows = &cache.left;
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -45,9 +46,9 @@ pub(super) fn draw_left_table(
     let active = state.focus == Focus::Main;
 
     if state.expanded {
-        draw_left_expanded(frame, area, selected, active, &rows, max_cost, palette);
+        draw_left_expanded(frame, area, selected, active, rows, max_cost, palette);
     } else {
-        draw_left_compact(frame, area, selected, active, &rows, max_cost, palette);
+        draw_left_compact(frame, area, selected, active, rows, max_cost, palette);
     }
 }
 
@@ -184,6 +185,122 @@ fn draw_left_expanded(
     frame.render_stateful_widget(table, inner, &mut ts);
 }
 
+/// Models rows: share of the window's cost, cache hit, and a daily-cost trend per row.
+pub(super) fn draw_models_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    cache: &VisibleRows,
+    palette: &Palette,
+) {
+    let rows = &cache.left;
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no rows in this window",
+                palette.dim_text(),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let max_cost = rows.iter().map(|r| r.cost).fold(0f64, f64::max).max(0.0001);
+    let selected = state.current_index().min(rows.len().saturating_sub(1));
+    let active = state.focus == Focus::Main;
+
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let is_selected = i == selected && active;
+            let stats = r.model_stats.as_ref();
+            let priced = stats.is_none_or(|s| s.priced);
+            let (cost_text, cost_style) = if !priced {
+                (
+                    "unpriced".to_owned(),
+                    if is_selected {
+                        palette.selected_row()
+                    } else {
+                        palette.warn_text()
+                    },
+                )
+            } else {
+                (
+                    fmt_cost(r.cost),
+                    if is_selected {
+                        palette.selected_row()
+                    } else {
+                        Style::default().fg(palette.cost_color(r.cost / max_cost))
+                    },
+                )
+            };
+            let share_cell = match stats {
+                Some(s) if priced && cache.left.iter().any(|row| row.cost > 0.0) => {
+                    let mut spans = vec![Span::raw(format!("{:>5.1}% ", s.share * 100.0))];
+                    spans.extend(render_bar(s.share, MODEL_BAR_WIDTH, palette).spans);
+                    Cell::from(Line::from(spans))
+                }
+                _ => Cell::from(format!("{:>1$}", "-", MODEL_SHARE_TEXT_WIDTH as usize - 1)),
+            };
+            let cache_hit = stats
+                .and_then(|s| s.cache_hit)
+                .map_or_else(|| "-".to_owned(), |hit| format!("{:.0}%", hit * 100.0));
+            let trend = stats.map_or_else(String::new, |s| {
+                trend_text(&s.daily_cost, MODEL_TREND_WIDTH as usize)
+            });
+            let mut row = Row::new(vec![
+                label_cell(r.label.clone(), is_selected, palette),
+                Cell::from(format!("{:>8}", fmt_tokens_short(r.total_tokens))),
+                Cell::from(format!("{:>10}", cost_text)).style(cost_style),
+                share_cell,
+                Cell::from(format!("{:>6}", cache_hit)),
+                Cell::from(trend).style(palette.accent_text()),
+            ]);
+            if is_selected {
+                row = row.style(palette.selected_row());
+            }
+            row
+        })
+        .collect();
+
+    let widths = models_column_widths().map(Constraint::Length);
+    let table = Table::new(table_rows, widths).header(
+        Row::new(vec![
+            "model",
+            "     tok",
+            "      cost",
+            "  share of cost",
+            "   hit",
+            "daily cost",
+        ])
+        .style(palette.dim_text()),
+    );
+
+    let mut ts = TableState::default();
+    ts.select(Some(selected));
+    frame.render_stateful_widget(table, area, &mut ts);
+}
+
+/// Block-character sparkline of the last `width` values, scaled to their maximum.
+fn trend_text(values: &[f64], width: usize) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let tail = &values[values.len().saturating_sub(width)..];
+    let max = tail.iter().copied().fold(0f64, f64::max);
+    if max <= 0.0 {
+        return String::new();
+    }
+    tail.iter()
+        .map(|value| {
+            if *value <= 0.0 {
+                return ' ';
+            }
+            let level = ((value / max) * (LEVELS.len() - 1) as f64).round() as usize;
+            LEVELS[level.min(LEVELS.len() - 1)]
+        })
+        .collect()
+}
+
 fn label_cell(label: String, is_selected: bool, palette: &Palette) -> Cell<'static> {
     if is_selected {
         Cell::from(Line::from(vec![
@@ -194,8 +311,6 @@ fn label_cell(label: String, is_selected: bool, palette: &Palette) -> Cell<'stat
         Cell::from(label)
     }
 }
-
-// -- Sessions table ---------------------------------------------------------
 
 pub(super) fn draw_sessions_table(
     frame: &mut Frame<'_>,
@@ -215,7 +330,7 @@ pub(super) fn draw_sessions_table(
         return;
     }
 
-    let filtered = display_session_rows(rows, state);
+    let filtered = rows;
     let max_cost = filtered
         .iter()
         .map(|r| r.cost)
@@ -298,16 +413,6 @@ pub(super) fn draw_sessions_table(
     ts.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut ts);
 }
-
-pub(crate) fn display_session_rows(rows: &[SessionRow], state: &AppState) -> Vec<SessionRow> {
-    let (mut filtered, scores) = apply_filter_sessions(rows, state);
-    if scores.is_empty() {
-        sort_session_rows(&mut filtered, state.sort);
-    }
-    filtered
-}
-
-// -- Events table (deepest drill) -------------------------------------------
 
 pub(super) fn draw_events_table(
     frame: &mut Frame<'_>,
@@ -420,16 +525,14 @@ fn short_model(model: &str) -> String {
     s
 }
 
-// -- Trend table ------------------------------------------------------------
-
 pub(super) fn draw_trend_table(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    cache: &DataCache,
+    cache: &VisibleRows,
     palette: &Palette,
 ) {
-    let rows = display_trend_rows(&cache.trend, state.sort);
+    let rows = &cache.trend;
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -483,8 +586,8 @@ pub(super) fn draw_trend_table(
         .map(|r| trend_row(r, max_total, show_claude, show_codex, show_cursor, palette))
         .collect();
 
-    let (cc_sum, xc_sum, uc_sum, tok_sum, tot_sum): (f64, f64, f64, u64, f64) =
-        rows.iter().fold((0.0, 0.0, 0.0, 0u64, 0.0), |acc, r| {
+    let (cc_sum, xc_sum, uc_sum, tok_sum, tot_sum): (f64, f64, f64, u128, f64) =
+        rows.iter().fold((0.0, 0.0, 0.0, 0u128, 0.0), |acc, r| {
             (
                 acc.0 + r.claude_cost,
                 acc.1 + r.codex_cost,
@@ -536,27 +639,12 @@ pub(super) fn draw_trend_table(
     constraints.push(Constraint::Length(10));
     constraints.push(Constraint::Min(BAR_WIDTH as u16 + 2));
 
-    let table = Table::new(body, constraints).header(header);
-    frame.render_widget(table, area);
-}
-
-pub(crate) fn display_trend_rows(rows: &[TrendRow], sort: Sort) -> Vec<TrendRow> {
-    let mut out = rows.to_vec();
-    out.sort_by(|a, b| match sort {
-        Sort::CostDesc => b
-            .total_cost
-            .partial_cmp(&a.total_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.bucket.cmp(&a.bucket)),
-        Sort::CostAsc => a
-            .total_cost
-            .partial_cmp(&b.total_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.bucket.cmp(&a.bucket)),
-        Sort::RecentDesc | Sort::AlphaDesc => b.bucket.cmp(&a.bucket),
-        Sort::RecentAsc | Sort::AlphaAsc => a.bucket.cmp(&b.bucket),
-    });
-    out
+    let table = Table::new(body, constraints)
+        .header(header)
+        .highlight_style(palette.selected_row());
+    let mut selection = TableState::default();
+    selection.select(Some(state.current_index().min(rows.len() - 1)));
+    frame.render_stateful_widget(table, area, &mut selection);
 }
 
 fn trend_row<'a>(

@@ -1,8 +1,13 @@
 use ratatui::layout::Rect;
 
-use crate::tui::data::DataCache;
+use crate::tui::data::VisibleRows;
 use crate::tui::state::{AppState, DrillKind, Section, SourceFilter};
 pub(crate) const BAR_WIDTH: usize = 20;
+pub(super) const MODEL_BAR_WIDTH: usize = 10;
+pub(super) const MODEL_TREND_WIDTH: u16 = 14;
+/// `100.0% ` ahead of the share bar.
+pub(super) const MODEL_SHARE_TEXT_WIDTH: u16 = 7;
+pub(super) const MODEL_CACHE_HIT_WIDTH: u16 = 6;
 pub(super) const LEFT_NAME_WIDTH: u16 = 28;
 pub(super) const SESSION_PROJECT_WIDTH: u16 = 28;
 pub(super) const TREND_BUCKET_WIDTH: u16 = 20;
@@ -12,12 +17,10 @@ const PANEL_BORDER: u16 = 2;
 // 1 top border + 1 top pad + 1 bottom border.
 const PANEL_CHROME_HEIGHT: u16 = 3;
 
-// -- Main panel sizing ------------------------------------------------------
-
 /// Returns the (width, height) the main bordered panel "wants" given the
 /// currently active section and the data in the cache. The caller clamps
 /// these to the available terminal size.
-pub(crate) fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16, u16) {
+pub(crate) fn main_panel_dimensions(state: &AppState, cache: &VisibleRows) -> (u16, u16) {
     let bar_w = BAR_WIDTH as u16 + 2;
 
     // Drilled view always renders with a 1-row breadcrumb; pick columns
@@ -39,7 +42,11 @@ pub(crate) fn main_panel_dimensions(state: &AppState, cache: &DataCache) -> (u16
     let tab = state.active_tab_index() as usize;
     let (cols, content_h) = match state.current_section {
         Section::Repos if tab == 0 => left_panel_size(state, cache),
-        Section::Days | Section::Models => left_panel_size(state, cache),
+        Section::Models => (
+            table_width(&models_column_widths()),
+            1 + cache.left.len().max(1) as u16,
+        ),
+        Section::Days => left_panel_size(state, cache),
         Section::Sessions => {
             let cells = [12u16, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
             let rows = cache.sessions.len() as u16;
@@ -66,7 +73,19 @@ fn events_column_widths(bar_w: u16) -> Vec<u16> {
     vec![10, 16, 7, 7, 9, 9, 10, bar_w]
 }
 
-fn left_panel_size(state: &AppState, cache: &DataCache) -> (u16, u16) {
+/// name · tokens · cost · share of cost · cache hit · daily trend
+pub(super) fn models_column_widths() -> [u16; 6] {
+    [
+        LEFT_NAME_WIDTH,
+        8,
+        10,
+        MODEL_SHARE_TEXT_WIDTH + MODEL_BAR_WIDTH as u16,
+        MODEL_CACHE_HIT_WIDTH,
+        MODEL_TREND_WIDTH,
+    ]
+}
+
+fn left_panel_size(state: &AppState, cache: &VisibleRows) -> (u16, u16) {
     let bar_w = BAR_WIDTH as u16 + 2;
     let rows = cache.left.len() as u16;
     let cells: &[u16] = if state.expanded {
@@ -89,7 +108,7 @@ fn chrome((w, h): (u16, u16)) -> (u16, u16) {
     (w + PANEL_BORDER, h + PANEL_CHROME_HEIGHT)
 }
 
-fn active_provider_count(state: &AppState, cache: &DataCache) -> u16 {
+fn active_provider_count(state: &AppState, cache: &VisibleRows) -> u16 {
     let rows = &cache.trend;
     let show_claude = rows.iter().any(|r| r.claude_cost > 0.001)
         && !matches!(

@@ -1,13 +1,14 @@
 use chrono::{DateTime, Duration, Local, Utc};
 
-pub use crate::render::fmt_num;
+pub use crate::format::fmt_num;
 
 pub fn fmt_cost(n: f64) -> String {
     format!("${:.2}", n)
 }
 
 /// Short-form for large token counts: `340` / `12K` / `4.2M`.
-pub fn fmt_tokens_short(n: u64) -> String {
+pub fn fmt_tokens_short(n: impl Into<u128>) -> String {
+    let n = n.into();
     if n < 1_000 {
         format!("{n}")
     } else if n < 1_000_000 {
@@ -93,8 +94,8 @@ mod tests {
     }
     #[test]
     fn short_tokens() {
-        assert_eq!(fmt_tokens_short(340), "340");
-        assert_eq!(fmt_tokens_short(12_000), "12.0K");
-        assert_eq!(fmt_tokens_short(4_200_000), "4.2M");
+        assert_eq!(fmt_tokens_short(340_u64), "340");
+        assert_eq!(fmt_tokens_short(12_000_u64), "12.0K");
+        assert_eq!(fmt_tokens_short(4_200_000_u64), "4.2M");
     }
 }
