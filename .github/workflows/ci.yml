@@ -52,6 +52,11 @@ jobs:
 
       - name: Install just
         run: cargo install just --locked --version 1.45.0
+      # check lints the Python verify script with `uvx ruff`.
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.5"
       - name: Check
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.rust-version.outputs.version }}
