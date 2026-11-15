@@ -39,7 +39,8 @@ Each changed file is parsed completely so deduplication and cumulative provider 
 Unchanged files use manifest and parser fingerprints to avoid parsing.
 
 A Claude `message.id` counts once per report. A file keeps the first copy of an id.
-Queries read the `counted_events` view, which also drops a copy whose id appears in a file with a lower path.
+Every scoped query also drops a copy whose id appears in a lower file path within the report's selected roots.
+A cached copy under a root the report does not read never suppresses one it does.
 This stops a resumed or forked session from counting the replayed messages twice.
 
 Parsing runs in bounded parallel batches. SQLite writes run serially.

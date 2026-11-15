@@ -75,14 +75,6 @@ CREATE INDEX IF NOT EXISTS idx_events_repo      ON events(repo);
 CREATE INDEX IF NOT EXISTS idx_events_file      ON events(file_path);
 CREATE INDEX IF NOT EXISTS idx_events_message   ON events(message_id);
 
--- The same Claude message id in two session files (a resumed or forked session) counts once.
--- The copy in the lowest file path wins, so the result does not depend on ingest order.
-CREATE VIEW IF NOT EXISTS counted_events AS
-SELECT e.* FROM events e
-WHERE e.message_id IS NULL
-   OR NOT EXISTS (
-     SELECT 1 FROM events other
-     WHERE other.message_id = e.message_id AND other.source = 'claude'
-       AND other.file_path < e.file_path
-   );
+-- Duplicate Claude messages are resolved per report scope in store::queries::scope_clause.
+DROP VIEW IF EXISTS counted_events;
 "#;

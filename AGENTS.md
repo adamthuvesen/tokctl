@@ -57,4 +57,4 @@ Cite each enforcer as `path::name`; `enforced_rules_table_cites_real_enforcers` 
 | Only the Cursor sync adapter uses the network or spawns processes | `tests/repo_rules.rs::network_and_process_calls_stay_in_the_cursor_sync_owner` |
 | Fixtures hold no real home paths, user names, session IDs, or emails | `tests/repo_rules.rs::fixtures_contain_no_real_identities` |
 | `verify control` must observe FAIL before a verify pass counts | `.agents/skills/verify-tokctl/verify::control` |
-| A Claude message id counts once across all session files | `tests/cli_behavior.rs::a_claude_message_id_in_two_session_files_counts_once` |
+| A Claude message id counts once across the session files in the selected roots | `tests/cli_behavior.rs::a_claude_message_id_in_two_session_files_counts_once`, `tests/cli_behavior.rs::a_duplicate_claude_message_under_an_unselected_cached_root_still_counts` |
