@@ -11,7 +11,8 @@ pub enum AggregateSelection {
         since_ms: i64,
         until_ms: i64,
     },
-    Model(String),
+    /// Raw model ids behind one display row (a normalized id or a family).
+    Model(Vec<String>),
 }
 
 impl AggregateSelection {
@@ -21,7 +22,7 @@ impl AggregateSelection {
             Self::Bucket {
                 since_ms, until_ms, ..
             } => scope.intersect_time(Some(*since_ms), Some(*until_ms)),
-            Self::Model(model) => scope.model = Some(model.clone()),
+            Self::Model(models) => scope.models = Some(models.clone()),
         }
     }
 }
@@ -41,6 +42,27 @@ pub struct LeftRow {
     /// recent sort for aggregate sections and by the Sessions "when" column.
     pub latest_ts: Option<DateTime<Utc>>,
     pub selection: AggregateSelection,
+    /// Present on Models rows only.
+    pub model_stats: Option<ModelStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelStats {
+    /// Fraction of the window's cost.
+    pub share: f64,
+    pub cache_hit: Option<f64>,
+    /// False when no member model has a price; the cost is unknown, not zero.
+    pub priced: bool,
+    pub members: Vec<String>,
+    /// Daily cost, oldest first.
+    pub daily_cost: Vec<f64>,
+}
+
+/// One load of the left table, with the previous-window cost for the header.
+#[derive(Debug, Clone)]
+pub struct LeftLoad {
+    pub rows: Vec<LeftRow>,
+    pub previous_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +178,7 @@ pub struct LeftMemoKey(
     pub TimeWindow,
     pub SourceFilter,
     pub TrendGranularity,
+    pub bool,
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

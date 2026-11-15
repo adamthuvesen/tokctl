@@ -12,6 +12,8 @@ pub(crate) struct CacheFacts {
     pub(crate) schema_version: i64,
     pub(crate) event_count: u64,
     pub(crate) file_count: u64,
+    /// Events whose source file a complete scan no longer found. Only read when the schema is current.
+    pub(crate) missing_source_event_count: u64,
     pub(crate) repo_count: u64,
     pub(crate) latest_file_mtime_ns: Option<i64>,
     pub(crate) unpriced_models: Vec<String>,
@@ -56,6 +58,20 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheFacts, Cach
     let event_count = read_count("events")?;
     let repo_count = read_count("repos")?;
     let unpriced_models = unknown_priced_models(conn)?;
+    let missing_source_event_count = if schema_version == SCHEMA_VERSION {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE file_path IN (SELECT path FROM files WHERE missing_since IS NOT NULL)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| CacheFault::Table {
+            table: "files",
+            error: error.to_string(),
+        })?
+        .max(0) as u64
+    } else {
+        0
+    };
     let provenance = if schema_version == SCHEMA_VERSION {
         Some(
             crate::store::db::provenance_status(conn)
@@ -69,6 +85,7 @@ pub(crate) fn inspect_cache(path: &Path) -> std::result::Result<CacheFacts, Cach
         schema_version,
         event_count,
         file_count,
+        missing_source_event_count,
         repo_count,
         latest_file_mtime_ns: max_file_mtime_ns(conn),
         unpriced_models,
@@ -174,6 +191,27 @@ mod tests {
             }
             other => panic!("expected a table fault, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn events_from_missing_logs_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(DDL).unwrap();
+        conn.execute(
+            "INSERT INTO meta VALUES('schema_version', ?)",
+            [SCHEMA_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO files(path,source,size,mtime_ns,missing_since) VALUES('/gone','claude',1,1,5),('/here','claude',1,1,NULL);
+             INSERT INTO events(file_path,source,ts,day,month,session_id,model,input,output,cache_read,cache_write,cost_usd)
+             VALUES('/gone','claude',1,'2026-04-01','2026-04','s','m',1,0,0,0,0),('/gone','claude',2,'2026-04-01','2026-04','s','m',1,0,0,0,0),('/here','claude',3,'2026-04-01','2026-04','s','m',1,0,0,0,0);",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(inspect_cache(&path).unwrap().missing_source_event_count, 2);
     }
 
     #[test]

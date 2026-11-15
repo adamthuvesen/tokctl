@@ -40,7 +40,8 @@ pub struct QueryScope {
     /// Exclusive upper bound.
     pub until_ms: Option<i64>,
     pub repo: Option<RepoFilterSpec>,
-    pub model: Option<String>,
+    /// Raw model ids; one display row can group several (`claude-x` and `claude-x-20250101`).
+    pub models: Option<Vec<String>>,
     pub session: Option<SessionKey>,
     pub roots: Option<Vec<PathBuf>>,
 }
@@ -91,9 +92,10 @@ pub(crate) fn scope_clause(filter: &QueryScope) -> (String, Vec<Value>) {
             params.extend([Value::Text(prefix.clone()), Value::Text(prefix.clone())]);
         }
     }
-    if let Some(model) = &filter.model {
-        clauses.push("e.model = ?".into());
-        params.push(Value::Text(model.clone()));
+    if let Some(models) = &filter.models {
+        let marks = vec!["?"; models.len()].join(",");
+        clauses.push(format!("e.model IN ({marks})"));
+        params.extend(models.iter().cloned().map(Value::Text));
     }
     if let Some(session) = &filter.session {
         clauses.push("e.source = ? AND e.session_id = ?".into());
@@ -404,7 +406,7 @@ impl PeriodGranularity {
     }
 }
 
-/// Row returned by [`period_buckets`] and [`model_buckets`].
+/// Row returned by [`period_buckets`].
 #[derive(Debug, Clone)]
 pub struct BucketAggregateRow {
     pub key: String,
@@ -439,25 +441,48 @@ pub fn period_buckets(
     run_bucket_aggregate_query(conn, &sql, &filter)
 }
 
-/// Model-grouped buckets for the TUI models section (no repo filter — matches prior TUI SQL).
-pub fn model_buckets(store: &Store, filter: QueryFilter) -> Result<Vec<BucketAggregateRow>> {
+/// Token and cost sums for one (source, model) pair.
+#[derive(Debug, Clone)]
+pub struct ModelUsageRow {
+    pub source: Source,
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd: f64,
+    pub latest_ts_ms: i64,
+    pub events: u64,
+}
+
+pub fn model_usage(store: &Store, filter: QueryFilter) -> Result<Vec<ModelUsageRow>> {
     if store.connection().is_autocommit() {
-        return store.read_snapshot(|store| model_buckets(store, filter));
+        return store.read_snapshot(|store| model_usage(store, filter));
     }
-    let conn = store.connection();
     let sql = format!(
-        r#"SELECT e.model AS model,
-                  COUNT(DISTINCT e.source || char(31) || e.session_id) AS sessions,
-                  SUM(e.cost_usd) AS cost,
-                  SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
-                  MAX(e.ts) AS latest_ts
+        r#"SELECT e.source, e.model,
+                  SUM(e.input), SUM(e.output), SUM(e.cache_read), SUM(e.cache_write),
+                  SUM(e.cost_usd), MAX(e.ts), COUNT(*)
              FROM counted_events e
              WHERE 1=1 {scope}
-             GROUP BY model
-             ORDER BY cost DESC"#,
+             GROUP BY e.source, e.model"#,
         scope = scope_clause(&filter).0,
     );
-    run_bucket_aggregate_query(conn, &sql, &filter)
+    let mut stmt = store.connection().prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(build_params(&filter).iter()), |row| {
+        Ok(ModelUsageRow {
+            source: parse_source_column(row.get(0)?, 0)?,
+            model: row.get(1)?,
+            input: row.get::<_, i64>(2)? as u64,
+            output: row.get::<_, i64>(3)? as u64,
+            cache_read: row.get::<_, i64>(4)? as u64,
+            cache_write: row.get::<_, i64>(5)? as u64,
+            cost_usd: read_cost(row, 6)?,
+            latest_ts_ms: row.get(7)?,
+            events: row.get::<_, i64>(8)? as u64,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn run_bucket_aggregate_query(
@@ -652,7 +677,7 @@ fn diagnostic_file_clause(scope: &QueryScope) -> (String, Vec<Value>) {
     if scope.since_ms.is_some()
         || scope.until_ms.is_some()
         || scope.repo.is_some()
-        || scope.model.is_some()
+        || scope.models.is_some()
         || scope.session.is_some()
     {
         let (clause, values) = scope_clause(scope);
@@ -1042,7 +1067,7 @@ mod tests {
             since_ms: Some(selected.ts),
             until_ms: Some(selected.ts + 1),
             repo: Some(RepoFilterSpec::KeyExact("/repo".into())),
-            model: Some(selected.model.clone()),
+            models: Some(vec![selected.model.clone()]),
             session: Some(SessionKey {
                 source: Source::Claude,
                 id: selected.session_id,
@@ -1063,7 +1088,7 @@ mod tests {
                 ..selected_scope.clone()
             },
             QueryScope {
-                model: Some("different-model".into()),
+                models: Some(vec!["different-model".into()]),
                 ..selected_scope.clone()
             },
             QueryScope {

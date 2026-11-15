@@ -159,3 +159,14 @@ fn demo_filters_drills_resizes_and_restores_terminal() {
     terminal.expect_screen("REPOS › agent-hub");
     terminal.quit();
 }
+
+#[test]
+fn demo_models_section_toggles_family_grouping() {
+    let mut terminal = DemoTerminal::start();
+    terminal.expect_screen("MONTHS");
+    terminal.send(b"]");
+    terminal.expect_screen("share of cost");
+    terminal.send(b"f");
+    terminal.expect_screen("MODELS \u{b7} FAMILY");
+    terminal.quit();
+}

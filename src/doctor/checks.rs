@@ -216,6 +216,17 @@ pub(crate) fn cache_checks(facts: CacheFacts) -> Vec<DoctorCheck> {
         }),
     );
 
+    if facts.missing_source_event_count > 0 {
+        checks.push(DoctorCheck::new(
+            "cache",
+            CheckSeverity::Ok,
+            format!(
+                "{} event(s) come from logs no longer on disk",
+                facts.missing_source_event_count
+            ),
+        ));
+    }
+
     if let Some(max_mtime) = facts.latest_file_mtime_ns {
         checks.push(DoctorCheck::new(
             "cache",

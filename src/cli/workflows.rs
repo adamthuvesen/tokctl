@@ -7,7 +7,7 @@ use super::pipeline::{
 };
 use super::{
     CompareArgs, CursorArgs, CursorCommands, CursorLoginArgs, DemoArgs, DoctorArgs, GroupBy,
-    RepoArgs, ReportArgs, SourceArg, UiArgs,
+    ModelsArgs, ModelsByArg, RepoArgs, ReportArgs, SourceArg, UiArgs,
 };
 use crate::compare;
 use crate::cursor_sync::{
@@ -15,6 +15,7 @@ use crate::cursor_sync::{
     validate_cursor_session,
 };
 use crate::dates::{parse_since, parse_until};
+use crate::models::{self, models_report, ModelsBy};
 use crate::render::{
     render_json, render_repo_json, render_repo_table, render_table, render_warnings,
 };
@@ -24,6 +25,7 @@ use crate::store::queries::{
     ReportDiagnostics,
 };
 use crate::types::{AggregateRow, ReportKind};
+use crate::windows::TimeWindow;
 
 pub(super) fn run_doctor(args: DoctorArgs) -> Result<()> {
     let report = crate::doctor::run();
@@ -114,6 +116,52 @@ pub(super) fn run_compare(args: CompareArgs) -> Result<()> {
             compare::render_json(&report)
         } else {
             compare::render_human(&report)
+        };
+        Ok((body, diagnostics))
+    })?;
+    emit_warnings(&diagnostics);
+    writeln!(io::stdout().lock(), "{body}")?;
+    Ok(())
+}
+
+pub(super) fn run_models(args: ModelsArgs) -> Result<()> {
+    if args.rebuild && args.no_cache {
+        anyhow::bail!("--rebuild and --no-cache are mutually exclusive");
+    }
+    let window: TimeWindow = args.last.parse().context("--last")?;
+    let by = match args.by {
+        ModelsByArg::Model => ModelsBy::Model,
+        ModelsByArg::Family => ModelsBy::Family,
+    };
+    let source = SourceArg::parse(&args.source)?;
+    let scope = source_scope(source);
+    if let Some(warning) = sync_cursor_if_needed(scope, args.cursor_dir.as_deref())? {
+        eprintln!("warning: {warning}");
+    }
+    let mut roots = resolve_root_dirs(
+        args.claude_dir.as_deref(),
+        args.codex_dir.as_deref(),
+        args.cursor_dir.as_deref(),
+    )?;
+
+    let CachedRun { conn, stats } = prepare_run(scope, &mut roots, args.rebuild, args.no_cache)?;
+    let (body, diagnostics) = conn.read_snapshot(|conn| {
+        let mut filter = query_scope(scope, &roots);
+        filter.repo = args
+            .repo
+            .as_deref()
+            .map(|name| resolve_repo_filter_cached(conn, name, &filter))
+            .transpose()?;
+        let now = chrono::Utc::now();
+        let report = models_report(conn, filter.clone(), window, by, true, now)?;
+        let mut scope_filter = filter;
+        scope_filter.intersect_time(report.since_ms, None);
+        let mut diagnostics = report_diagnostics(conn, &scope_filter)?;
+        diagnostics.current_file_errors = stats.file_errors;
+        let body = if args.json {
+            models::render_json(&report)
+        } else {
+            models::render_human(&report)
         };
         Ok((body, diagnostics))
     })?;

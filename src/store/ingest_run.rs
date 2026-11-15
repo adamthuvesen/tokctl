@@ -5,8 +5,8 @@ use crate::ingest::plan::{plan_ingest, IngestPlan, PlanInput};
 use crate::pricing::cost_of;
 use crate::repo::Resolver;
 use crate::store::writes::{
-    delete_file_and_events, insert_events, load_file_manifest, upsert_file_manifest, upsert_repo,
-    EventRow, FileManifestRow, RepoRow,
+    delete_file_and_events, insert_events, load_file_manifest, mark_file_missing,
+    upsert_file_manifest, upsert_repo, EventRow, FileManifestRow, RepoRow,
 };
 use crate::types::{IngestStats, Source, UsageEvent};
 use anyhow::Result;
@@ -234,7 +234,10 @@ fn execute_plan(
     calendar: &Calendar,
 ) -> Result<IngestStats> {
     let mut stats = IngestStats {
-        files_scanned: plan.to_skip.len() + plan.to_full_parse.len() + plan.to_purge.len(),
+        files_scanned: plan.to_skip.len()
+            + plan.to_full_parse.len()
+            + plan.to_purge.len()
+            + plan.to_mark_missing.len(),
         files_skipped: plan.to_skip.len(),
         ..Default::default()
     };
@@ -245,6 +248,15 @@ fn execute_plan(
         tx.execute("INSERT INTO meta(key,value) VALUES('generation','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [])?;
         tx.commit()?;
         stats.files_purged += 1;
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for path in &plan.to_mark_missing {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        mark_file_missing(&tx, path.to_string_lossy().as_ref(), now_ms)?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('generation','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [])?;
+        tx.commit()?;
+        stats.files_marked_missing += 1;
     }
 
     let mut resolver = Resolver::new();
@@ -303,6 +315,7 @@ fn execute_plan(
                     n_events: parsed.rows.len() as u64,
                     session_id: parsed.first_session,
                     model: parsed.first_model,
+                    missing_since: None,
                 },
             )?;
             for (key, identity) in resolver.resolved_repos() {
@@ -354,6 +367,7 @@ mod tests {
             n_events: 1,
             session_id: Some(format!("{source}-session")),
             model: Some("claude-sonnet-4-6".into()),
+            missing_since: None,
         }
     }
 

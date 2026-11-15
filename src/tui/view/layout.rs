@@ -3,6 +3,11 @@ use ratatui::layout::Rect;
 use crate::tui::data::VisibleRows;
 use crate::tui::state::{AppState, DrillKind, Section, SourceFilter};
 pub(crate) const BAR_WIDTH: usize = 20;
+pub(super) const MODEL_BAR_WIDTH: usize = 10;
+pub(super) const MODEL_TREND_WIDTH: u16 = 14;
+/// `100.0% ` ahead of the share bar.
+pub(super) const MODEL_SHARE_TEXT_WIDTH: u16 = 7;
+pub(super) const MODEL_CACHE_HIT_WIDTH: u16 = 6;
 pub(super) const LEFT_NAME_WIDTH: u16 = 28;
 pub(super) const SESSION_PROJECT_WIDTH: u16 = 28;
 pub(super) const TREND_BUCKET_WIDTH: u16 = 20;
@@ -37,7 +42,11 @@ pub(crate) fn main_panel_dimensions(state: &AppState, cache: &VisibleRows) -> (u
     let tab = state.active_tab_index() as usize;
     let (cols, content_h) = match state.current_section {
         Section::Repos if tab == 0 => left_panel_size(state, cache),
-        Section::Days | Section::Models => left_panel_size(state, cache),
+        Section::Models => (
+            table_width(&models_column_widths()),
+            1 + cache.left.len().max(1) as u16,
+        ),
+        Section::Days => left_panel_size(state, cache),
         Section::Sessions => {
             let cells = [12u16, 6, SESSION_PROJECT_WIDTH, 8, 10, bar_w];
             let rows = cache.sessions.len() as u16;
@@ -62,6 +71,18 @@ pub(crate) fn main_panel_dimensions(state: &AppState, cache: &VisibleRows) -> (u
 fn events_column_widths(bar_w: u16) -> Vec<u16> {
     // when · model · in · out · cache_r · cache_w · cost · proportion
     vec![10, 16, 7, 7, 9, 9, 10, bar_w]
+}
+
+/// name · tokens · cost · share of cost · cache hit · daily trend
+pub(super) fn models_column_widths() -> [u16; 6] {
+    [
+        LEFT_NAME_WIDTH,
+        8,
+        10,
+        MODEL_SHARE_TEXT_WIDTH + MODEL_BAR_WIDTH as u16,
+        MODEL_CACHE_HIT_WIDTH,
+        MODEL_TREND_WIDTH,
+    ]
 }
 
 fn left_panel_size(state: &AppState, cache: &VisibleRows) -> (u16, u16) {

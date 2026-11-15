@@ -48,7 +48,7 @@ fn identity_problems(files: &[(PathBuf, String)], local_user: &str) -> Vec<Strin
             }
             for m in token.find_iter(line) {
                 found.push(format!(
-                    "{at}: {:?} looks like a real Cursor credential or account ID",
+                    "{at}: {:?} looks like a real Cursor credential or account ID; use a synthetic placeholder such as user_000",
                     m.as_str()
                 ));
             }
@@ -95,7 +95,10 @@ fn doctor_network_uses(files: &[(PathBuf, String)]) -> Vec<String> {
     let mut found = Vec::new();
     for (path, text) in files {
         for token in banned.iter().filter(|token| text.contains(**token)) {
-            found.push(format!("{}: uses {token}", path.display()));
+            found.push(format!(
+                "{}: uses {token}. Doctor stays offline: read local state only, and let cursor_sync callers do network work",
+                path.display()
+            ));
         }
     }
     found
@@ -111,7 +114,10 @@ fn stray_network_uses(files: &[(PathBuf, String)]) -> Vec<String> {
         .filter(|(path, _)| path != Path::new(NETWORK_OWNER))
     {
         for token in banned.iter().filter(|token| text.contains(**token)) {
-            found.push(format!("{}: uses {token}", path.display()));
+            found.push(format!(
+                "{}: uses {token}. Only {NETWORK_OWNER} may do this; move the call there and call its function",
+                path.display()
+            ));
         }
     }
     found
@@ -133,6 +139,95 @@ fn doctor_stays_offline() {
     assert!(
         found.is_empty(),
         "doctor must stay offline; move network work to cursor_sync callers:\n{}",
+        found.join("\n")
+    );
+}
+
+/// Lowest layer first. A module may import its own layer or a lower one.
+const LAYERS: &[&[&str]] = &[
+    &["types"],
+    &["calendar", "pricing", "repo", "windows", "format", "paths"],
+    &["sources", "dates"],
+    &["discovery", "cursor_sync"],
+    &["ingest"],
+    &["store"],
+    &["doctor", "compare", "models", "render", "demo"],
+    &["cli", "tui"],
+];
+
+/// Upward imports that exist today: `ingest::run` re-exports the store-owned
+/// ingest run, and the plan reads the store's file manifest row.
+const KNOWN_UPWARD: &[(&str, &str, &str)] = &[
+    ("src/ingest/mod.rs", "ingest", "store"),
+    ("src/ingest/plan.rs", "ingest", "store"),
+];
+
+fn layer_of(module: &str) -> Option<usize> {
+    LAYERS.iter().position(|layer| layer.contains(&module))
+}
+
+fn upward_imports(files: &[(PathBuf, String)]) -> Vec<String> {
+    let import = Regex::new(r"crate::(?:\{([^}]*)\}|([a-z_]+))").unwrap();
+    let mut found = Vec::new();
+    for (path, text) in files {
+        let path_str = path.to_str().unwrap();
+        let Some(rest) = path_str.strip_prefix("src/") else {
+            continue;
+        };
+        let module = rest.split('/').next().unwrap().trim_end_matches(".rs");
+        if matches!(module, "lib" | "main") {
+            continue;
+        }
+        let Some(own) = layer_of(module) else {
+            found.push(format!("{path_str}: module `{module}` is not in LAYERS. Add it to one layer of LAYERS in tests/repo_rules.rs"));
+            continue;
+        };
+        for capture in import.captures_iter(text) {
+            let targets: Vec<&str> = match (capture.get(1), capture.get(2)) {
+                (Some(group), _) => group
+                    .as_str()
+                    .split(',')
+                    .filter_map(|item| item.trim().split("::").next())
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+                (_, Some(single)) => vec![single.as_str()],
+                _ => continue,
+            };
+            for target in targets {
+                // `test_support` is the store's fixture helper, re-exported at the crate root.
+                let target = if target == "test_support" {
+                    "store"
+                } else {
+                    target
+                };
+                if target == module {
+                    continue;
+                }
+                let Some(other) = layer_of(target) else {
+                    found.push(format!(
+                        "{path_str}: imports `{target}`, which is not in LAYERS. Add it to one layer of LAYERS in tests/repo_rules.rs"
+                    ));
+                    continue;
+                };
+                if other > own && !KNOWN_UPWARD.contains(&(path_str, module, target)) {
+                    found.push(format!(
+                        "{path_str}: `{module}` imports higher layer `{target}`. Move the shared code down to `{module}`'s layer or lower, or pass it in from the caller (LAYERS in tests/repo_rules.rs)"
+                    ));
+                }
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[test]
+fn layers_point_down() {
+    let found = upward_imports(&files_under(&["src"]));
+    assert!(
+        found.is_empty(),
+        "a module may import only its own layer or a lower one (LAYERS in tests/repo_rules.rs):\n{}",
         found.join("\n")
     );
 }
@@ -300,7 +395,9 @@ fn citation_problems(agents: &str) -> Vec<String> {
             .map(|c| c[1].to_string())
             .collect();
         if names.is_empty() {
-            problems.push(format!("row cites nothing: {row}"));
+            problems.push(format!(
+                "row cites nothing: {row}. Cite its enforcer as `path::name`, for example `tests/repo_rules.rs::layers_point_down`"
+            ));
         }
         for citation in names {
             let defined = citation.split_once("::").is_some_and(|(file, name)| {
@@ -315,7 +412,7 @@ fn citation_problems(agents: &str) -> Vec<String> {
             });
             if !defined {
                 problems.push(format!(
-                    "`{citation}` is not `path::name` defined in that file"
+                    "`{citation}` is not `path::name` defined in that file. Cite a live test, a def, or a config key that the file defines"
                 ));
             }
         }
@@ -351,13 +448,38 @@ fn each_scan_finds_its_known_violation() {
     let doctor = vec![(PathBuf::from("src/doctor/x.rs"), "use reqwest;".to_string())];
     assert_eq!(
         doctor_network_uses(&doctor),
-        ["src/doctor/x.rs: uses reqwest"]
+        ["src/doctor/x.rs: uses reqwest. Doctor stays offline: read local state only, and let cursor_sync callers do network work"]
     );
 
     let net = vec![(PathBuf::from("src/x.rs"), "use reqwest;".to_string())];
-    assert_eq!(stray_network_uses(&net), ["src/x.rs: uses reqwest"]);
+    assert_eq!(
+        stray_network_uses(&net),
+        ["src/x.rs: uses reqwest. Only src/cursor_sync.rs may do this; move the call there and call its function"]
+    );
     assert!(rust_fn_is_live_test("#[test]\nfn a() {}", "a"));
     assert!(!rust_fn_is_live_test("#[test]\n#[ignore]\nfn a() {}", "a"));
+
+    let planted = vec![
+        (
+            PathBuf::from("src/store/x.rs"),
+            "use crate::doctor::DoctorCheck;".to_owned(),
+        ),
+        (
+            PathBuf::from("src/store/y.rs"),
+            "use crate::{types::Source, render::fmt};".to_owned(),
+        ),
+        (
+            PathBuf::from("src/store/z.rs"),
+            "use crate::{types::Source, calendar::Calendar};".to_owned(),
+        ),
+    ];
+    assert_eq!(
+        upward_imports(&planted),
+        [
+            "src/store/x.rs: `store` imports higher layer `doctor`. Move the shared code down to `store`'s layer or lower, or pass it in from the caller (LAYERS in tests/repo_rules.rs)",
+            "src/store/y.rs: `store` imports higher layer `render`. Move the shared code down to `store`'s layer or lower, or pass it in from the caller (LAYERS in tests/repo_rules.rs)",
+        ]
+    );
 
     let allow = format!("#[allow(clippy::{})]", "disallowed_types");
     let stray = vec![(PathBuf::from("src/x.rs"), allow)];
@@ -382,8 +504,8 @@ fn each_scan_finds_its_known_violation() {
     assert_eq!(
         citation_problems(table),
         [
-            "row cites nothing: | bare | prose |",
-            "`tests/repo_rules.rs::no_such_test` is not `path::name` defined in that file",
+            "row cites nothing: | bare | prose |. Cite its enforcer as `path::name`, for example `tests/repo_rules.rs::layers_point_down`",
+            "`tests/repo_rules.rs::no_such_test` is not `path::name` defined in that file. Cite a live test, a def, or a config key that the file defines",
         ]
     );
 }

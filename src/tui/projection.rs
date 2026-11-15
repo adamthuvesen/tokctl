@@ -12,6 +12,7 @@ pub struct VisibleRows {
     pub events: Vec<EventRow>,
     pub trend: Vec<TrendRow>,
     pub sparkline: Vec<f64>,
+    pub left_previous_cost: Option<f64>,
     pub status: CacheStatus,
     pub diagnostics: crate::store::queries::ReportDiagnostics,
     pub cursor_sync_failure: Option<String>,
@@ -27,6 +28,7 @@ impl DataCache {
             cursor_sync_failure: self.cursor_sync_failure.clone(),
             refresh_error: self.refresh_error.clone(),
             sparkline: self.sparkline.clone(),
+            left_previous_cost: self.left_previous_cost,
             ..VisibleRows::default()
         };
         match state.deepest_drill().map(|drill| drill.kind) {

@@ -138,12 +138,17 @@ pub fn yank_summary(state: &AppState, cache: &data::DataCache) -> Option<String>
                         .min(cache.left.len().saturating_sub(1)),
                 )
                 .map(|r| {
+                    let cost = if r.model_stats.as_ref().is_some_and(|s| !s.priced) {
+                        "unpriced".to_owned()
+                    } else {
+                        crate::tui::format::fmt_cost(r.cost)
+                    };
+                    if r.model_stats.is_some() {
+                        return format!("{} · {} tokens · {}", r.label, r.total_tokens, cost);
+                    }
                     format!(
                         "{} · {} sessions · {} tokens · {}",
-                        r.label,
-                        r.sessions,
-                        r.total_tokens,
-                        crate::tui::format::fmt_cost(r.cost)
+                        r.label, r.sessions, r.total_tokens, cost
                     )
                 }),
         },

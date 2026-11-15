@@ -15,7 +15,7 @@ pub struct ResolveInput<'a> {
     pub defaults: Vec<PathBuf>,
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))

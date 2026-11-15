@@ -176,7 +176,7 @@ fn roundtrip_persists_fields() {
     let p = dir.path().join("ui_state.json");
     let mut s = AppState {
         current_section: Section::Provider,
-        time_window: TimeWindow::Today,
+        time_window: TimeWindow::D1,
         source_filter: SourceFilter::Claude,
         trend_granularity: TrendGranularity::Weekly,
         seen_v3_intro: true,
@@ -189,7 +189,7 @@ fn roundtrip_persists_fields() {
     let loaded = load(&p);
     // current_section is intentionally not restored — TUI always boots on Days.
     assert_eq!(loaded.current_section, Section::Days);
-    assert_eq!(loaded.time_window, TimeWindow::Today);
+    assert_eq!(loaded.time_window, TimeWindow::D1);
     assert_eq!(loaded.source_filter, SourceFilter::Claude);
     assert_eq!(loaded.trend_granularity, TrendGranularity::Weekly);
     assert_eq!(loaded.tab_per_section.get(&Section::Repos), Some(&1u8));
@@ -252,7 +252,7 @@ fn missing_file_is_default() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join("nope.json");
     let loaded = load(&p);
-    assert_eq!(loaded.time_window, TimeWindow::Month);
+    assert_eq!(loaded.time_window, TimeWindow::D30);
 }
 
 #[test]
@@ -454,4 +454,28 @@ fn source_filter_inside_events_drill_skips_event_refetch_with_flash() {
     s.flash = None;
     let _ = s.apply(Action::SetSource(SourceFilter::Cursor));
     assert!(s.flash.is_none());
+}
+
+#[test]
+fn family_toggle_applies_only_to_the_models_root() {
+    let mut s = AppState::default();
+    assert!(!s.apply(Action::ToggleFamily).dirty);
+    assert!(!s.models_by_family);
+    s.current_section = Section::Models;
+    assert!(s.apply(Action::ToggleFamily).dirty);
+    assert!(s.models_by_family);
+    s.apply(Action::ToggleFamily);
+    assert!(!s.models_by_family);
+}
+
+#[test]
+fn family_preference_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let s = AppState {
+        models_by_family: true,
+        ..AppState::default()
+    };
+    save(&path, &s).unwrap();
+    assert!(load(&path).models_by_family);
 }

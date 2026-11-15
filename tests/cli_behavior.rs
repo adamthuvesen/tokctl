@@ -590,3 +590,82 @@ fn a_corrupt_cursor_credentials_file_leaves_the_other_sources_reporting() {
         "{stderr}"
     );
 }
+
+fn recent_claude_line(message_id: &str, model: &str, input: u64, output: u64) -> String {
+    let timestamp = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    format!(
+        r#"{{"type":"assistant","timestamp":"{timestamp}","sessionId":"s-{message_id}","message":{{"id":"{message_id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+#[test]
+fn models_defaults_to_30d_sorts_by_cost_and_flags_unpriced_models() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("claude/project");
+    fs::create_dir_all(&project).unwrap();
+    let lines = [
+        recent_claude_line("m1", "claude-sonnet-4-6", 1_000, 100),
+        recent_claude_line("m2", "claude-opus-4-7", 1_000_000, 100),
+        recent_claude_line("m3", "claude-nonesuch-9", 4_000, 0),
+    ];
+    fs::write(project.join("s.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let run = |extra: &[&str]| {
+        let output = tokctl()
+            .args(["models", "--json", "--no-cache", "--source", "claude"])
+            .args(extra)
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join("claude"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let report = run(&[]);
+    assert_eq!(report["window"], "30d");
+    assert!(report["since_ms"].is_i64());
+    assert!(
+        report["previous_total"].is_null(),
+        "no events before the window"
+    );
+    let models: Vec<&str> = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        models,
+        ["claude-opus-4-7", "claude-sonnet-4-6", "claude-nonesuch-9"]
+    );
+    let shares: f64 = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["share"].as_f64().unwrap())
+        .sum();
+    assert!((shares - 1.0).abs() < 1e-9, "{shares}");
+    assert_eq!(report["rows"][2]["priced"], false);
+    assert_eq!(
+        report["unpriced"],
+        serde_json::json!([{ "model": "claude-nonesuch-9", "tokens": 4000 }])
+    );
+
+    let all = run(&["--last", "all"]);
+    assert_eq!(all["window"], "all");
+    assert!(all["previous_total"].is_null());
+    let family = run(&["--last", "1d", "--by", "family"]);
+    assert_eq!(family["rows"][0]["model"], "claude-opus");
+}
+
+#[test]
+fn models_rejects_a_window_that_is_not_rolling_without_stdout() {
+    let output = tokctl().args(["models", "--last", "2d"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid window '2d'"));
+}

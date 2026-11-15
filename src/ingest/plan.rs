@@ -1,5 +1,6 @@
 use crate::discovery::{DiscoveredFile, Discovery};
 use crate::store::FileManifestRow;
+use crate::types::Source;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -8,6 +9,7 @@ pub struct IngestPlan {
     pub to_skip: Vec<PathBuf>,
     pub to_full_parse: Vec<DiscoveredFile>,
     pub to_purge: Vec<PathBuf>,
+    pub to_mark_missing: Vec<PathBuf>,
 }
 
 pub struct PlanInput<'a> {
@@ -24,7 +26,8 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
         }
         match input.manifest.get(&file.path) {
             Some(row)
-                if row.size == file.size
+                if row.missing_since.is_none()
+                    && row.size == file.size
                     && row.mtime_ns == file.mtime_ns
                     && row.file_identity.is_some()
                     && row.file_identity == file.file_identity
@@ -46,7 +49,11 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
                 .iter()
                 .any(|(source, root)| row.source == *source && p.starts_with(root))
         {
-            plan.to_purge.push(p.clone());
+            if row.source == Source::Cursor {
+                plan.to_purge.push(p.clone());
+            } else if row.missing_since.is_none() {
+                plan.to_mark_missing.push(p.clone());
+            }
         }
     }
 
@@ -56,7 +63,6 @@ pub fn plan_ingest(input: PlanInput<'_>) -> IngestPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Source;
     use std::path::PathBuf;
 
     fn mk_file(path: &str, size: u64, mtime: i64) -> DiscoveredFile {
@@ -88,6 +94,7 @@ mod tests {
             n_events: 0,
             session_id: None,
             model: None,
+            missing_since: None,
         }
     }
 
@@ -168,12 +175,16 @@ mod tests {
         assert_eq!(plan.to_full_parse.len(), 1);
     }
 
-    #[test]
-    fn disappeared_file_goes_to_purge() {
-        let discovery = Discovery {
-            complete_roots: vec![(Source::Claude, PathBuf::from("/"))],
+    fn complete_root_discovery(source: Source) -> Discovery {
+        Discovery {
+            complete_roots: vec![(source, PathBuf::from("/"))],
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn disappeared_log_is_marked_missing_once_and_keeps_its_events() {
+        let discovery = complete_root_discovery(Source::Claude);
         let mut manifest = HashMap::new();
         manifest.insert(
             PathBuf::from("/gone.jsonl"),
@@ -183,7 +194,52 @@ mod tests {
             manifest: &manifest,
             discovery: &discovery,
         });
-        assert_eq!(plan.to_purge, vec![PathBuf::from("/gone.jsonl")]);
+        assert_eq!(plan.to_mark_missing, vec![PathBuf::from("/gone.jsonl")]);
+        assert!(plan.to_purge.is_empty());
+
+        manifest
+            .get_mut(&PathBuf::from("/gone.jsonl"))
+            .unwrap()
+            .missing_since = Some(5);
+        let plan = plan_ingest(PlanInput {
+            manifest: &manifest,
+            discovery: &discovery,
+        });
+        assert!(plan.to_mark_missing.is_empty() && plan.to_purge.is_empty());
+    }
+
+    #[test]
+    fn disappeared_cursor_export_goes_to_purge() {
+        let discovery = complete_root_discovery(Source::Cursor);
+        let mut manifest = HashMap::new();
+        let mut row = mk_row("/usage.csv", 100, 1, 100);
+        row.source = Source::Cursor;
+        manifest.insert(PathBuf::from("/usage.csv"), row);
+        let plan = plan_ingest(PlanInput {
+            manifest: &manifest,
+            discovery: &discovery,
+        });
+        assert_eq!(plan.to_purge, vec![PathBuf::from("/usage.csv")]);
+        assert!(plan.to_mark_missing.is_empty());
+    }
+
+    #[test]
+    fn reappearing_missing_file_is_reparsed_even_when_stats_match() {
+        let mt = far_past_ns();
+        let discovery = Discovery {
+            files: vec![mk_file("/x.jsonl", 500, mt)],
+            ..Default::default()
+        };
+        let mut row = mk_row("/x.jsonl", 500, mt, 500);
+        row.missing_since = Some(5);
+        let mut manifest = HashMap::new();
+        manifest.insert(PathBuf::from("/x.jsonl"), row);
+        let plan = plan_ingest(PlanInput {
+            manifest: &manifest,
+            discovery: &discovery,
+        });
+        assert_eq!(plan.to_full_parse.len(), 1);
+        assert!(plan.to_skip.is_empty());
     }
 
     #[test]
@@ -237,6 +293,7 @@ mod tests {
                 n_events: 0,
                 session_id: None,
                 model: None,
+                missing_since: None,
             },
         );
         let plan = plan_ingest(PlanInput {
@@ -273,6 +330,7 @@ mod tests {
                 n_events: 0,
                 session_id: None,
                 model: None,
+                missing_since: None,
             },
         );
         let plan = plan_ingest(PlanInput {

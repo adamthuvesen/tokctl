@@ -2,10 +2,11 @@ use chrono::{DateTime, NaiveDate, Utc};
 use std::collections::BTreeMap;
 
 use super::load::{
-    base_filter, load_cache_status, load_events_for, load_left_axis, load_sessions_for, load_trend,
+    base_filter, load_cache_status, load_events_for, load_left_axis, load_models,
+    load_sessions_for, load_trend,
 };
 use super::rows::{
-    CacheStatus, EventRow, LeftMemoKey, LeftRow, RefreshError, RefreshScope, SessionRow,
+    CacheStatus, EventRow, LeftLoad, LeftMemoKey, LeftRow, RefreshError, RefreshScope, SessionRow,
     TrendMemoKey, TrendRow,
 };
 use crate::store::queries::{report_diagnostics, scoped_sparkline, QueryScope, ReportDiagnostics};
@@ -16,7 +17,7 @@ use crate::tui::state::{AppState, DrillKind, Section, TrendGranularity};
 pub(crate) enum ViewQuery {
     Repos(QueryScope),
     Buckets(QueryScope, TrendGranularity),
-    Models(QueryScope),
+    Models(QueryScope, bool),
     Sessions(QueryScope),
     Events(QueryScope),
     Provider(QueryScope, TrendGranularity),
@@ -26,6 +27,8 @@ pub(crate) enum ViewQuery {
 pub struct DataCache {
     pub source_roots: Option<Vec<std::path::PathBuf>>,
     pub left: Vec<LeftRow>,
+    /// Cost of the window before the current one; set for Models rows only.
+    pub left_previous_cost: Option<f64>,
     pub sessions: Vec<SessionRow>,
     pub events: Vec<EventRow>,
     pub sparkline: Vec<f64>,
@@ -37,7 +40,7 @@ pub struct DataCache {
     pub refresh_error: Option<RefreshError>,
     pub loaded_state: Option<AppState>,
     pub loaded_scope: Option<QueryScope>,
-    pub(crate) left_memo: BTreeMap<LeftMemoKey, Vec<LeftRow>>,
+    pub(crate) left_memo: BTreeMap<LeftMemoKey, LeftLoad>,
     pub(crate) trend_memo: BTreeMap<TrendMemoKey, Vec<TrendRow>>,
     pub(crate) sparkline_memo: Option<Vec<f64>>,
     pub(crate) memo_generation: Option<u64>,
@@ -66,7 +69,7 @@ impl DataCache {
             None => match state.current_section {
                 Section::Repos => ViewQuery::Repos(scope),
                 Section::Days => ViewQuery::Buckets(scope, state.trend_granularity),
-                Section::Models => ViewQuery::Models(scope),
+                Section::Models => ViewQuery::Models(scope, state.models_by_family),
                 Section::Sessions => ViewQuery::Sessions(scope),
                 Section::Provider => unreachable!(),
             },
@@ -204,6 +207,7 @@ impl DataCache {
                 self.sessions = load_sessions_for(store, scope.clone())
                     .map_err(|e| RefreshError::new(RefreshScope::Sessions, e))?;
                 self.left.clear();
+                self.left_previous_cost = None;
             }
             None if state.is_provider_view() => {}
             None => {
@@ -212,21 +216,38 @@ impl DataCache {
                     state.time_window,
                     state.source_filter,
                     state.trend_granularity,
+                    state.models_by_family,
                 );
-                self.left = match self.left_memo.get(&key) {
-                    Some(rows) => rows.clone(),
+                let load = match self.left_memo.get(&key) {
+                    Some(load) => load.clone(),
                     None => {
-                        let rows = load_left_axis(
-                            store,
-                            state.current_section,
-                            scope.clone(),
-                            state.trend_granularity,
-                        )
+                        let load = if state.current_section == Section::Models {
+                            load_models(
+                                store,
+                                scope.clone(),
+                                state.time_window,
+                                state.models_by_family,
+                                now,
+                            )
+                        } else {
+                            load_left_axis(
+                                store,
+                                state.current_section,
+                                scope.clone(),
+                                state.trend_granularity,
+                            )
+                            .map(|rows| LeftLoad {
+                                rows,
+                                previous_cost: None,
+                            })
+                        }
                         .map_err(|e| RefreshError::new(RefreshScope::Left, e))?;
-                        self.left_memo.insert(key, rows.clone());
-                        rows
+                        self.left_memo.insert(key, load.clone());
+                        load
                     }
                 };
+                self.left = load.rows;
+                self.left_previous_cost = load.previous_cost;
             }
         }
         let key = TrendMemoKey(

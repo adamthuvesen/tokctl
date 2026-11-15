@@ -44,11 +44,12 @@ pub(super) fn draw_header(
         Span::raw("  "),
         Span::styled(
             format!(
-                "{}{} · {} · {} tok",
+                "{}{} · {} · {} tok{}",
                 window_label,
                 scope_suffix,
                 fmt_cost(total_cost),
                 crate::format::fmt_wide_num(total_tokens),
+                previous_window_change(state, cache, total_cost),
             ),
             palette.dim_text(),
         ),
@@ -60,6 +61,22 @@ pub(super) fn draw_header(
         palette.dim_text(),
     ));
     frame.render_widget(Paragraph::new(vec![line1, line2]), area);
+}
+
+/// Cost change against the previous window of the same length, for the Models section only.
+/// Omitted for `all`, inside a drill, and while a filter changes the total.
+fn previous_window_change(state: &AppState, cache: &VisibleRows, total_cost: f64) -> String {
+    let Some(previous) = cache.left_previous_cost else {
+        return String::new();
+    };
+    if state.current_section != Section::Models || state.drill_active() || should_filter(state) {
+        return String::new();
+    }
+    format!(
+        " · {} vs prev {}",
+        crate::models::signed_percent(total_cost, previous),
+        state.time_window.as_str()
+    )
 }
 
 /// Pick the totals shown in the header so they match what's actually on screen.
@@ -219,6 +236,9 @@ pub(super) fn draw_footer(
     if !state.current_section.tabs().is_empty() && !state.drill_active() {
         view_group.push(("tab", "tabs"));
     }
+    if state.current_section == Section::Models && !state.drill_active() {
+        view_group.push(("f", "family"));
+    }
     if matches!(state.current_section, Section::Provider | Section::Days) && !state.drill_active() {
         view_group.push(("d/w/m/y", "bucket"));
     }
@@ -317,7 +337,7 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
         .border_type(BorderType::Rounded)
         .border_style(palette.active_border())
         .title(Span::styled(" HELP ", palette.active_border()));
-    let help_area = centered(area, 72, 28);
+    let help_area = centered(area, 72, 30);
     frame.render_widget(Clear, help_area);
     let inner = block.inner(help_area);
     frame.render_widget(block, help_area);
@@ -360,9 +380,10 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
         hint("t", "jump to Provider section"),
         hint("d/w/m/y", "bucket granularity (Provider / Days)"),
         hint("e", "compact / expanded"),
+        hint("f", "Models: group by model / family"),
         hint("s", "cycle sort"),
         hint("/", "fuzzy filter"),
-        hint("T W M z a", "window: today/week/month/year/all"),
+        hint("T W M z a", "window: 1d/7d/30d/365d/all"),
         hint("1 2 3 4", "source: all/claude/codex/cursor"),
         hint("i", "row details"),
         hint("r", "refresh (no ingest)"),
@@ -521,6 +542,9 @@ pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String>
                     .min(cache.left.len().saturating_sub(1)),
             )
             .map(|row| {
+                if let Some(stats) = &row.model_stats {
+                    return model_detail_lines(row, stats);
+                }
                 vec![
                     format!("name: {}", row.label),
                     format!("key: {}", row.key),
@@ -535,6 +559,36 @@ pub(crate) fn detail_lines(state: &AppState, cache: &VisibleRows) -> Vec<String>
             })
             .unwrap_or_else(|| vec!["no row selected".into()]),
     }
+}
+
+fn model_detail_lines(
+    row: &crate::tui::data::LeftRow,
+    stats: &crate::tui::data::ModelStats,
+) -> Vec<String> {
+    vec![
+        format!("model: {}", row.label),
+        format!("raw ids: {}", stats.members.join(", ")),
+        format!(
+            "tokens: {}",
+            crate::format::fmt_wide_num(u128::from(row.total_tokens))
+        ),
+        if stats.priced {
+            format!(
+                "cost: {} ({:.1}% of window)",
+                fmt_cost(row.cost),
+                stats.share * 100.0
+            )
+        } else {
+            "cost: unpriced (no price for this model)".into()
+        },
+        format!(
+            "cache hit: {}",
+            stats
+                .cache_hit
+                .map_or_else(|| "-".into(), |hit| format!("{:.1}%", hit * 100.0))
+        ),
+        "copy: y key, Y summary".into(),
+    ]
 }
 
 pub(super) fn draw_filter_prompt(

@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod format;
 pub mod ingest;
+pub mod models;
 pub mod paths;
 pub mod pricing;
 pub mod render;

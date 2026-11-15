@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub use crate::windows::TimeWindow;
 pub const STATE_VERSION: u32 = 3;
 
 /// Top-level navigation entries — one per sidebar row.
@@ -79,47 +81,6 @@ impl Section {
     /// nothing meaningful to drill into; everything else does.
     pub fn rows_drill_to_sessions(self) -> bool {
         !matches!(self, Section::Provider | Section::Sessions)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeWindow {
-    Today,
-    Week,
-    Month,
-    Year,
-    All,
-}
-
-impl TimeWindow {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TimeWindow::Today => "today",
-            TimeWindow::Week => "week",
-            TimeWindow::Month => "month",
-            TimeWindow::Year => "year",
-            TimeWindow::All => "all",
-        }
-    }
-    /// Millisecond lower-bound for this window, computed against local `now`.
-    pub fn since_ms(self, now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Option<i64>> {
-        if self == Self::All {
-            return Ok(None);
-        }
-        let calendar = crate::calendar::Calendar::system()?;
-        let days = match self {
-            Self::Today => 0,
-            Self::Week => 6,
-            Self::Month => 29,
-            Self::Year => 364,
-            Self::All => unreachable!(),
-        };
-        let date = calendar
-            .local_date(now)
-            .checked_sub_signed(chrono::Duration::days(days))
-            .ok_or_else(|| anyhow::anyhow!("time window exceeds calendar range"))?;
-        Ok(Some(calendar.day_start(date)?.timestamp_millis()))
     }
 }
 
@@ -284,6 +245,8 @@ pub struct AppState {
     pub flash: Option<String>,
     /// Whether tables show expanded columns. Default false = compact.
     pub expanded: bool,
+    /// Models section groups by `model_family()` instead of normalized model id.
+    pub models_by_family: bool,
     /// One-shot intro flash on first launch under v3. Persisted so it shows once.
     pub seen_v3_intro: bool,
     /// Set once a source-filter no-op flash has fired in the current events
@@ -296,7 +259,7 @@ impl Default for AppState {
         let sidebar_index = 0;
         Self {
             current_section: Section::Days,
-            time_window: TimeWindow::Month,
+            time_window: TimeWindow::D30,
             source_filter: SourceFilter::All,
             sort: Sort::CostDesc,
             trend_granularity: TrendGranularity::Monthly,
@@ -311,6 +274,7 @@ impl Default for AppState {
             filter: FilterState::default(),
             flash: None,
             expanded: false,
+            models_by_family: false,
             seen_v3_intro: false,
             source_filter_hint_fired: false,
         }

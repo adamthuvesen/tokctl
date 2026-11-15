@@ -76,9 +76,10 @@ Use `tokctl demo --cache-dir /tmp/tokctl-demo --overwrite` to seed the same synt
 | `Tab` | cycle main-pane tabs |
 | `t` | jump to Provider section |
 | `d` `w` `m` `y` | bucket: day / week / month / year |
-| `T` `W` `M` `z` `a` | window: today / week / month / year / all |
+| `T` `W` `M` `z` `a` | window: 1d / 7d / 30d / 365d / all (rolling) |
 | `1` `2` `3` `4` | source: all / claude / codex / cursor |
 | `s` / `e` | sort cycle / compact-vs-expanded |
+| `f` | Models: group by model / model family |
 | `/` | fuzzy filter |
 | `r` | re-query cache (no ingest) |
 | `i` | row details |
@@ -89,6 +90,8 @@ Use `tokctl demo --cache-dir /tmp/tokctl-demo --overwrite` to seed the same synt
 UI preferences persist to `<cache_dir>/ui_state.json` (delete to reset). Default builds include [`arboard`](https://crates.io/crates/arboard); on headless Linux `cargo install --path . --no-default-features` to omit clipboard support. Copy failures appear in the UI status.
 
 **Drill levels.** The main pane is a stack: pick a row in any section (except `Provider`) and `Enter` drills one level deeper. Repos / Days / Models drill into their session list; Sessions drills directly into per-turn events; inside a sessions drill another `Enter` drills into events. The breadcrumb shows where you are (`Repos › tokctl › 72a0a659…`); `Esc` or `←` pops one level at a time. Drills retain their parent bucket, repo, model, and provider constraints. Copied session keys use `source:id`.
+
+**Models section.** Rows match `tokctl models`: one row per normalized model id (dated and `[1m]` variants merge across sources), with tokens, cost, share of cost, cache hit, and a daily-cost trend (last 14 days with spend). Cursor rows count toward tokens and cost but not cache hit. A model with no price shows `unpriced` instead of `$0.00`. `f` groups by model family. The header shows the window total and its change against the previous window of the same length (not for `all`). `Enter` drills into the sessions of every raw model id in the row.
 
 ---
 
@@ -118,6 +121,10 @@ tokctl repo                               # by git repo, cost desc
 tokctl repo tokctl                        # sessions inside one repo
 tokctl compare                            # this month-to-date vs comparable previous month
 tokctl compare this-week last-week --by repo
+tokctl models                             # tokens, cost, share, cache hit per model (last 30d)
+tokctl models --last 7d                   # rolling windows: 1d | 7d | 30d | 365d | all
+tokctl models --last 365d --by family     # group versions of one model line (display only)
+tokctl models --source claude --json      # one object: window, rows, total, previous_total (null for all or no earlier events), unpriced
 tokctl doctor                             # roots, cache, pricing, sync readiness
 tokctl demo                               # seed a synthetic cache for public demos
 tokctl ui --demo                          # launch UI against synthetic data only
@@ -137,6 +144,8 @@ tokctl daily --rebuild                    # transactionally clear cache, full re
 tokctl daily --no-cache                   # temporary SQLite, no persistent report cache
 tokctl export-db                          # print cache path (does not create DB)
 ```
+
+`tokctl models` shows the period total against the previous period of the same length (not for `all`; `previous Nd: no data` when that period has no events). A model with no price shows as `unpriced` and is named in a warning, so its cost is never silently $0.00.
 
 Run `tokctl doctor` if anything looks off. It checks roots, discovered inputs, cache health, pricing coverage, and Cursor sync readiness without mutating local data.
 

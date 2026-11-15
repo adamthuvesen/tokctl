@@ -83,6 +83,7 @@ pub struct IngestStats {
     pub files_skipped: usize,
     pub files_full_parsed: usize,
     pub files_purged: usize,
+    pub files_marked_missing: usize,
     pub file_errors: usize,
     pub events_inserted: usize,
     pub skipped_lines: usize,

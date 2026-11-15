@@ -61,6 +61,9 @@ These reports are estimates, not billing records.
 
 Schema migrations run transactionally. Supported older caches retain their rows.
 Schema 8 adds nullable file identity and ctime, plus source-root alias mappings.
+Schema 10 adds `files.missing_since`. A migration adds the column in place and keeps every row.
+Claude and Codex session logs expire or move away, so their cache rows are the only copy of old history. When a complete scan no longer finds one, ingest sets `missing_since` and keeps the file row and its events. The next run does not plan that file again. If the path reappears, the file is parsed like a changed file, and the parse replaces its events, so nothing counts twice. `doctor` reports how many events come from missing logs.
+Cursor exports are the exception. Cursor sync overwrites one `usage.csv` with the full export, and a hand-saved CSV can repeat the same rows. A purged file can therefore come back as rows in another file, and keeping its events would count them twice. Ingest still purges the events of a Cursor CSV that a complete scan no longer finds.
 Unsupported schemas fail without deleting the database. `--rebuild` clears cache data transactionally.
 
 Events retain original explicit costs and cost provenance. Parser, price, and calendar fingerprints derive from authoritative definitions.
@@ -75,6 +78,7 @@ Reports prepare output and scoped diagnostics in the same snapshot before writin
 Current input failures are run-level diagnostics because some failures have no usable event identity.
 
 Public reports share `QueryScope`: source, source roots, repository, model, source-qualified session, and timestamp bounds.
+`tokctl models` (`src/models.rs`) reports one rolling `TimeWindow` through this scope, and the TUI reuses its aggregation. A model with no price shows as unpriced, not as zero cost. `--by family` is a display grouping only.
 Repository identity matches exactly. User path prefixes are literal, including `%` and `_`.
 Time ranges are half-open internally. CLI `--until YYYY-MM-DD` remains inclusive of that local date.
 Weeks use ISO week years. Calendar rules handle daylight-saving transitions and skipped midnight.
@@ -90,6 +94,9 @@ Report JSON field names remain compatible. Source-qualified session keys disting
 A drill stores its structural parent scope. The current global source and time window intersect that scope at query time.
 Changing a window can widen a drill only within its parent bucket.
 Configured source roots also constrain Provider views, sparklines, and every drill.
+
+The Models section loads through `models::models_report` (merged across sources), so its rows, unpriced detection, and previous-window cost match `tokctl models`.
+A row keeps the raw model ids behind it, and its drill scope filters on all of them. The family toggle is a UI preference.
 
 `projection.rs` builds the visible row order. Rendering, selection, details, copying, and visible totals consume that projection.
 A displayed row and an activated row therefore have one authoritative identity.

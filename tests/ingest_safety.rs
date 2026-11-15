@@ -60,8 +60,92 @@ fn absent_unselected_and_failed_roots_preserve_snapshots() {
     assert_eq!(stats.files_purged, 0);
     fs::remove_file(right.join("b.jsonl")).unwrap();
     let stats = run_ingest(&mut store, options(&right, Source::Claude)).unwrap();
-    assert_eq!(stats.files_purged, 1);
-    assert_eq!(event_rows(&store, QueryScope::default()).unwrap().len(), 1);
+    assert_eq!(stats.files_purged, 0);
+    assert_eq!(stats.files_marked_missing, 1);
+    assert_eq!(event_rows(&store, QueryScope::default()).unwrap().len(), 2);
+}
+
+fn event_count(store: &Store) -> usize {
+    event_rows(store, QueryScope::default()).unwrap().len()
+}
+
+fn codex(tokens: u64) -> String {
+    format!(
+        r#"{{"type": "session_meta","payload":{{"id":"same"}}}}
+{{"type": "turn_context","payload":{{"model":"gpt-5.4"}}}}
+{{"type": "event_msg","timestamp":"2026-04-22T12:00:01Z","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{tokens},"cached_input_tokens":0,"output_tokens":1}}}}}}}}
+"#
+    )
+}
+
+#[test]
+fn deleted_logs_keep_their_events_and_a_reappearing_log_does_not_double_count() {
+    for source in [Source::Claude, Source::Codex] {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = root(&workspace, "logs");
+        let path = root.join("a.jsonl");
+        let body = if source == Source::Claude {
+            claude("a", 3)
+        } else {
+            codex(3)
+        };
+        fs::write(&path, &body).unwrap();
+        let mut store = Store::ephemeral().unwrap();
+        run_ingest(&mut store, options(&root, source)).unwrap();
+        assert_eq!(event_count(&store), 1);
+
+        fs::remove_file(&path).unwrap();
+        let stats = run_ingest(&mut store, options(&root, source)).unwrap();
+        assert_eq!((stats.files_marked_missing, stats.files_purged), (1, 0));
+        assert_eq!(event_count(&store), 1);
+        let stats = run_ingest(&mut store, options(&root, source)).unwrap();
+        assert_eq!(stats.files_marked_missing, 0);
+
+        fs::write(&path, &body).unwrap();
+        let stats = run_ingest(&mut store, options(&root, source)).unwrap();
+        assert_eq!(stats.files_full_parsed, 1);
+        assert_eq!(event_count(&store), 1);
+        let stats = run_ingest(&mut store, options(&root, source)).unwrap();
+        assert_eq!(stats.files_skipped, 1);
+    }
+}
+
+#[test]
+fn deleted_cursor_exports_are_still_purged() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "cursor");
+    let path = root.join("usage.csv");
+    fs::write(&path,"Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost\n2026-04-22,gpt-5.4,2,2,0,1,0.5\n").unwrap();
+    let mut store = Store::ephemeral().unwrap();
+    run_ingest(&mut store, options(&root, Source::Cursor)).unwrap();
+    assert_eq!(event_count(&store), 1);
+    fs::remove_file(&path).unwrap();
+    let stats = run_ingest(&mut store, options(&root, Source::Cursor)).unwrap();
+    assert_eq!((stats.files_purged, stats.files_marked_missing), (1, 0));
+    assert_eq!(event_count(&store), 0);
+}
+
+#[test]
+fn schema_nine_cache_migrates_in_place_and_keeps_deleted_log_events() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = root(&workspace, "claude");
+    let path = root.join("a.jsonl");
+    fs::write(&path, claude("a", 3)).unwrap();
+    let db = workspace.path().join("cache.db");
+    let mut store = Store::open(&db).unwrap();
+    run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    drop(store);
+    let legacy = rusqlite::Connection::open(&db).unwrap();
+    legacy
+        .execute_batch("ALTER TABLE files DROP COLUMN missing_since; UPDATE meta SET value='9' WHERE key='schema_version';")
+        .unwrap();
+    drop(legacy);
+    fs::remove_file(&path).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    assert_eq!(event_count(&store), 1);
+    let stats = run_ingest(&mut store, options(&root, Source::Claude)).unwrap();
+    assert_eq!(stats.files_marked_missing, 1);
+    assert_eq!(event_count(&store), 1);
 }
 
 #[test]
@@ -158,7 +242,7 @@ fn exact_repo_and_literal_prefix_model_session_and_time_scopes_compose() {
     conn.execute_batch("INSERT INTO events(file_path,source,ts,day,month,session_id,repo,model,input,output,cache_read,cache_write,cost_usd) VALUES ('/root/a','claude',1,'2025-12-29','2025-12','same','/repo_%','wanted',1,0,0,0,1),('/root/b','codex',1,'2025-12-29','2025-12','same','/repo_%','wanted',9,0,0,0,1),('/root/c','claude',2,'2025-12-29','2025-12','same','/repoZZ','other',9,0,0,0,1);").unwrap();
     let mut scope = QueryScope {
         repo: Some(RepoFilterSpec::KeyPrefix("/repo_%".into())),
-        model: Some("wanted".into()),
+        models: Some(vec!["wanted".into()]),
         session: Some(SessionKey {
             source: Source::Claude,
             id: "same".into(),

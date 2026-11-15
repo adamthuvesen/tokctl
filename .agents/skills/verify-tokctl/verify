@@ -253,7 +253,14 @@ def drive_report(run: Run, expected: dict[str, int] | None = None) -> str:
         row["session_id"]: row["source"] for row in json.loads(run.tokctl("session", "--json"))
     }
     check(sessions, {"s-claude": "claude", "s-codex": "codex"}, "session sources")
-    return "daily and session JSON match fixtures; a grown session file replaces, not double-counts"
+    models = json.loads(run.tokctl("models", "--last", "all", "--json"))
+    check(
+        {row["model"]: row["totalTokens"] for row in models["rows"]},
+        {"claude-sonnet-4-6": 855, "gpt-5.4": 260},
+        "models totals from fixtures",
+    )
+    check(models["previous_total"], None, "models --last all previous_total")
+    return "daily, session, and models JSON match fixtures; a grown session file replaces, not double-counts"
 
 
 def drive_doctor(run: Run) -> str:

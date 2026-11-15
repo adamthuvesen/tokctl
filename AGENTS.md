@@ -47,11 +47,13 @@ Cite each enforcer as `path::name`; `enforced_rules_table_cites_real_enforcers` 
 | SQL has one connection owner | `clippy.toml::disallowed-types`, `tests/repo_rules.rs::connection_lint_allows_stay_in_store` |
 | A file has one provider claim | `tests/ingest_safety.rs::conflicting_provider_claims_fail_before_any_ingest_mutation` |
 | Missing or failed roots never authorize deletion | `tests/ingest_safety.rs::absent_unselected_and_failed_roots_preserve_snapshots`, `tests/ingest_safety.rs::complete_other_provider_root_cannot_purge_unavailable_source` |
+| A deleted Claude or Codex log keeps its events; a deleted Cursor export is purged | `tests/ingest_safety.rs::deleted_logs_keep_their_events_and_a_reappearing_log_does_not_double_count`, `tests/ingest_safety.rs::deleted_cursor_exports_are_still_purged` |
 | A failed replacement keeps the last valid snapshot | `tests/ingest_safety.rs::malformed_only_replacement_preserves_nonempty_valid_snapshot` |
 | Report values and warnings describe one snapshot | `tests/ingest_safety.rs::read_batches_pin_one_snapshot_and_readonly_queries_reject_changed_provenance`, `tests/cli_behavior.rs::diagnostic_failure_prevents_partial_report_stdout` |
 | Displayed and activated rows agree | `src/tui/input/tests.rs::filtered_highlight_copy_details_totals_and_drill_use_the_same_repo` |
 | Demo overwrite needs a synthetic cache | `src/demo.rs::overwrite_refuses_normal_cache_without_changing_rows`, `tests/ingest_safety.rs::normal_ingestion_and_rebuild_remove_demo_overwrite_authority` |
 | Doctor is read-only and offline | `tests/cli_behavior.rs::doctor_json_does_not_create_cache_or_config`, `tests/repo_rules.rs::doctor_stays_offline` |
+| Modules import only their own layer or a lower one (types, calendar, sources, discovery, ingest, store, doctor/compare/render, cli/tui) | `tests/repo_rules.rs::layers_point_down` |
 | Only the Cursor sync adapter uses the network or spawns processes | `tests/repo_rules.rs::network_and_process_calls_stay_in_the_cursor_sync_owner` |
 | Fixtures hold no real home paths, user names, session IDs, or emails | `tests/repo_rules.rs::fixtures_contain_no_real_identities` |
 | `verify control` must observe FAIL before a verify pass counts | `.agents/skills/verify-tokctl/verify::control` |

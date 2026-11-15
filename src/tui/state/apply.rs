@@ -191,6 +191,13 @@ impl AppState {
             }
             Action::Yank => {}
             Action::YankSummary => {}
+            Action::ToggleFamily => {
+                if self.current_section == Section::Models && !self.drill_active() {
+                    self.models_by_family = !self.models_by_family;
+                    self.section_index.remove(&Section::Models);
+                    out.dirty = true;
+                }
+            }
             Action::ToggleExpand => {
                 self.expanded = !self.expanded;
                 out.dirty = true;

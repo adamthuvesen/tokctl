@@ -127,6 +127,9 @@ fn migrate_provenance(conn: &mut Connection) -> Result<()> {
     if !file_columns.iter().any(|column| column == "ctime_ns") {
         tx.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;")?;
     }
+    if !file_columns.iter().any(|column| column == "missing_since") {
+        tx.execute_batch("ALTER TABLE files ADD COLUMN missing_since INTEGER;")?;
+    }
     tx.execute_batch(DDL)?;
     tx.execute(
         "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?1)",
@@ -187,7 +190,7 @@ pub fn provenance_status(conn: &Connection) -> Result<ProvenanceStatus> {
         |row| row.get(0),
     )?;
     let mut statement = conn.prepare(
-        "SELECT f.source,p.signature FROM files f LEFT JOIN parser_provenance p ON p.path=f.path",
+        "SELECT f.source,p.signature FROM files f LEFT JOIN parser_provenance p ON p.path=f.path WHERE f.missing_since IS NULL",
     )?;
     let signatures = statement
         .query_map([], |row| {

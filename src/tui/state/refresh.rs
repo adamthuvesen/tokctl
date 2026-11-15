@@ -39,6 +39,7 @@ pub enum Action {
     Yank,
     YankSummary,
     ToggleExpand,
+    ToggleFamily,
     DismissFlash,
     None,
 }

@@ -18,6 +18,8 @@ pub struct FileManifestRow {
     pub n_events: u64,
     pub session_id: Option<String>,
     pub model: Option<String>,
+    /// Unix ms when a complete scan first found the file gone. Its events stay in the cache.
+    pub missing_since: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +53,7 @@ pub struct RepoRow {
 
 pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileManifestRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns FROM files",
+        "SELECT path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns, missing_since FROM files",
     )?;
     let rows = stmt.query_map([], |row| {
         let path: String = row.get(0)?;
@@ -75,6 +77,7 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
             model: row.get(8)?,
             file_identity: row.get(9)?,
             ctime_ns: row.get(10)?,
+            missing_since: row.get(11)?,
         })
     })?;
     let mut map = HashMap::new();
@@ -88,8 +91,8 @@ pub fn load_file_manifest(conn: &Connection) -> Result<HashMap<PathBuf, FileMani
 pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Result<()> {
     tx.execute(
         r#"INSERT INTO files
-             (path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             (path, source, project, size, mtime_ns, last_offset, n_events, session_id, model, file_identity, ctime_ns, missing_since)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
            ON CONFLICT(path) DO UPDATE SET
              source      = excluded.source,
              project     = excluded.project,
@@ -97,6 +100,7 @@ pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Resu
              mtime_ns    = excluded.mtime_ns,
              file_identity = excluded.file_identity,
              ctime_ns = excluded.ctime_ns,
+             missing_since = excluded.missing_since,
              last_offset = excluded.last_offset,
              n_events    = excluded.n_events,
              session_id  = COALESCE(excluded.session_id, files.session_id),
@@ -113,6 +117,7 @@ pub fn upsert_file_manifest(tx: &Transaction<'_>, row: &FileManifestRow) -> Resu
             row.model,
             row.file_identity,
             row.ctime_ns,
+            row.missing_since,
         ],
     )?;
     Ok(())
@@ -127,6 +132,14 @@ pub fn upsert_repo(tx: &Transaction<'_>, row: &RepoRow) -> Result<()> {
              display_name = excluded.display_name,
              origin_url   = excluded.origin_url"#,
         params![row.key, row.display_name, row.origin_url, row.first_seen],
+    )?;
+    Ok(())
+}
+
+pub fn mark_file_missing(tx: &Transaction<'_>, file_path: &str, now_ms: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE files SET missing_since = ?2 WHERE path = ?1",
+        params![file_path, now_ms],
     )?;
     Ok(())
 }
@@ -248,6 +261,7 @@ mod tests {
             n_events: 5,
             session_id: Some("sess".into()),
             model: Some("claude-sonnet-4-6".into()),
+            missing_since: None,
         };
         let tx = conn.transaction().unwrap();
         upsert_file_manifest(&tx, &row).unwrap();
@@ -277,6 +291,7 @@ mod tests {
                 n_events: 1,
                 session_id: None,
                 model: None,
+                missing_since: None,
             },
         )
         .unwrap();

@@ -2,10 +2,13 @@ use crate::store::Store;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 
-use super::rows::{AggregateSelection, CacheStatus, EventRow, LeftRow, SessionRow, TrendRow};
+use super::rows::{
+    AggregateSelection, CacheStatus, EventRow, LeftLoad, LeftRow, ModelStats, SessionRow, TrendRow,
+};
 
+use crate::models::{models_report, ModelsBy};
 use crate::store::queries::{
-    daily_cost_by_source, event_rows, model_buckets, period_buckets, repo_report, session_report,
+    daily_cost_by_source, daily_report, event_rows, period_buckets, repo_report, session_report,
     store_status, BucketAggregateRow, PeriodGranularity, QueryFilter, QueryScope, RepoAggregateRow,
     RepoFilterSpec,
 };
@@ -35,6 +38,7 @@ fn bucket_to_left_row(r: BucketAggregateRow, selection: AggregateSelection) -> L
                 .unwrap_or_else(Utc::now),
         ),
         selection,
+        model_stats: None,
     }
 }
 
@@ -188,6 +192,7 @@ pub fn load_left_axis(
                     } else {
                         RepoFilterSpec::KeyExact(r.key.clone())
                     }),
+                    model_stats: None,
                 })
                 .collect())
         }
@@ -205,18 +210,100 @@ pub fn load_left_axis(
                 ))
             })
             .collect(),
-        Section::Models => model_buckets(conn, filter).map(|rows| {
-            rows.into_iter()
-                .map(|row| {
-                    let selection = AggregateSelection::Model(row.key.clone());
-                    bucket_to_left_row(row, selection)
-                })
-                .collect()
-        }),
-        Section::Sessions => Ok(Vec::new()),
-        // Provider section uses load_trend; left-axis loading is a no-op.
+        Section::Sessions | Section::Models => Ok(Vec::new()),
+        // Provider section uses load_trend; Models uses load_models; left-axis loading is a no-op.
         Section::Provider => Ok(Vec::new()),
     }
+}
+
+/// Columns of a model row's trend; a window longer than this sums several days per column.
+const MODEL_TREND_BUCKETS: i64 = 14;
+
+/// Daily cost per row, as `(day, cost)` pairs; empty days are absent.
+type DailyCost = Vec<(NaiveDate, f64)>;
+
+/// Models rows come from `tokctl models` aggregation, merged across sources. `scope` carries the
+/// window's lower bound; the aggregation derives the previous window from `window` itself.
+pub fn load_models(
+    conn: &Store,
+    mut scope: QueryScope,
+    window: crate::tui::state::TimeWindow,
+    by_family: bool,
+    now: DateTime<Utc>,
+) -> Result<LeftLoad> {
+    scope.since_ms = None;
+    scope.until_ms = None;
+    let by = if by_family {
+        ModelsBy::Family
+    } else {
+        ModelsBy::Model
+    };
+    let report = models_report(conn, scope.clone(), window, by, false, now)?;
+    let mut daily: Vec<DailyCost> = Vec::with_capacity(report.rows.len());
+    for row in &report.rows {
+        let mut row_scope = scope.clone();
+        row_scope.intersect_time(report.since_ms, None);
+        row_scope.models = Some(row.members.clone());
+        let days = daily_report(conn, row_scope)?
+            .into_iter()
+            .map(|day| {
+                let date = NaiveDate::parse_from_str(&day.key, "%Y-%m-%d")?;
+                Ok((date, day.cost_usd))
+            })
+            .collect::<Result<DailyCost>>()?;
+        daily.push(days);
+    }
+
+    let today = crate::calendar::Calendar::system()?.local_date(now);
+    let span_days = match window.days() {
+        Some(days) => days,
+        None => daily
+            .iter()
+            .flatten()
+            .map(|(date, _)| (today - *date).num_days() + 1)
+            .max()
+            .unwrap_or(1),
+    };
+    let rows = report
+        .rows
+        .into_iter()
+        .zip(daily)
+        .map(|(row, days)| LeftRow {
+            label: row.model.clone(),
+            key: row.model,
+            sessions: 0,
+            total_tokens: row.usage.total_tokens(),
+            cost: row.usage.cost_usd,
+            is_no_repo: false,
+            latest_ts: Utc.timestamp_millis_opt(row.latest_ts_ms).single(),
+            selection: AggregateSelection::Model(row.members.clone()),
+            model_stats: Some(ModelStats {
+                share: row.share,
+                cache_hit: row.usage.cache_hit(),
+                priced: row.priced,
+                members: row.members,
+                daily_cost: bucket_daily_cost(&days, today, span_days),
+            }),
+        })
+        .collect();
+    Ok(LeftLoad {
+        rows,
+        previous_cost: report.previous_total.map(|total| total.cost_usd),
+    })
+}
+
+/// Spreads `span_days` ending at `today` over at most `MODEL_TREND_BUCKETS` equal columns, so
+/// every row of one window lines up. Days without spend count as zero.
+fn bucket_daily_cost(days: &DailyCost, today: NaiveDate, span_days: i64) -> Vec<f64> {
+    let buckets = span_days.clamp(1, MODEL_TREND_BUCKETS);
+    let mut out = vec![0.0; buckets as usize];
+    for (date, cost) in days {
+        let offset = span_days - 1 - (today - *date).num_days();
+        if (0..span_days).contains(&offset) {
+            out[(offset * buckets / span_days) as usize] += cost;
+        }
+    }
+    out
 }
 
 pub fn load_sessions_for(conn: &Store, scope: QueryScope) -> Result<Vec<SessionRow>> {

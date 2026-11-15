@@ -20,7 +20,8 @@ fn cache() -> DataCache {
             cost: 4.2,
             is_no_repo: false,
             latest_ts: None,
-            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+            selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+            model_stats: None,
         }],
         sessions: vec![SessionRow {
             session_id: "session-abcdef".into(),
@@ -47,7 +48,7 @@ fn context_includes_section_and_filters() {
     let state = AppState {
         current_section: Section::Provider,
         source_filter: SourceFilter::Cursor,
-        time_window: TimeWindow::Month,
+        time_window: TimeWindow::D30,
         sort: Sort::RecentDesc,
         ..AppState::default()
     };
@@ -300,7 +301,8 @@ fn header_cache() -> DataCache {
                 cost: 4.2,
                 is_no_repo: false,
                 latest_ts: None,
-                selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+                selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+                model_stats: None,
             },
             LeftRow {
                 label: "other-repo".into(),
@@ -310,7 +312,8 @@ fn header_cache() -> DataCache {
                 cost: 1.5,
                 is_no_repo: false,
                 latest_ts: None,
-                selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+                selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+                model_stats: None,
             },
         ],
         sessions: vec![
@@ -550,4 +553,87 @@ fn cursor_sync_failure_remains_visible_with_filters_and_other_warnings() {
     let messages = footer_messages(&state, &cache.visible(&state));
     assert!(messages[0].is_error);
     assert_eq!(messages[0].text, cache.cursor_sync_failure.unwrap());
+}
+
+fn model_row(label: &str, cost: f64, priced: bool, share: f64) -> LeftRow {
+    LeftRow {
+        label: label.into(),
+        key: label.into(),
+        sessions: 0,
+        total_tokens: 1_500_000,
+        cost,
+        is_no_repo: false,
+        latest_ts: None,
+        selection: crate::tui::data::AggregateSelection::Model(vec![label.into()]),
+        model_stats: Some(crate::tui::data::ModelStats {
+            share,
+            cache_hit: priced.then_some(0.5),
+            priced,
+            members: vec![label.into()],
+            daily_cost: vec![1.0, 3.0, 2.0],
+        }),
+    }
+}
+
+fn render_text(state: &AppState, cache: &DataCache) -> String {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::view::draw(frame, state, cache))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    buffer
+        .content()
+        .chunks(buffer.area.width as usize)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn models_section_shows_share_cache_hit_trend_and_unpriced_marker() {
+    let state = AppState {
+        current_section: Section::Models,
+        ..AppState::default()
+    };
+    let cache = DataCache {
+        left: vec![
+            model_row("claude-opus-4-7", 8.0, true, 0.8),
+            model_row("mystery-model", 0.0, false, 0.0),
+        ],
+        left_previous_cost: Some(4.0),
+        ..Default::default()
+    };
+    let text = render_text(&state, &cache);
+    let opus = text
+        .lines()
+        .find(|l| l.contains("claude-opus-4-7"))
+        .unwrap();
+    assert!(opus.contains("$8.00"));
+    assert!(opus.contains("80.0%"));
+    assert!(opus.contains("50%"));
+    assert!(opus.contains("▃█▆"));
+    let mystery = text.lines().find(|l| l.contains("mystery-model")).unwrap();
+    assert!(mystery.contains("unpriced"));
+    assert!(!mystery.contains("$0.00"));
+    assert!(text.contains("+100.0% vs prev 30d"));
+}
+
+#[test]
+fn models_family_title_and_previous_window_change_hide_when_not_applicable() {
+    let mut state = AppState {
+        current_section: Section::Models,
+        models_by_family: true,
+        time_window: TimeWindow::All,
+        ..AppState::default()
+    };
+    let mut cache = DataCache {
+        left: vec![model_row("claude-opus", 8.0, true, 1.0)],
+        ..Default::default()
+    };
+    let text = render_text(&state, &cache);
+    assert!(text.contains("MODELS · FAMILY"));
+    assert!(!text.contains("vs prev"));
+    cache.left_previous_cost = Some(4.0);
+    state.current_section = Section::Days;
+    assert!(!render_text(&state, &cache).contains("vs prev"));
 }

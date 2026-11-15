@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS files (
   last_offset INTEGER NOT NULL DEFAULT 0,
   n_events    INTEGER NOT NULL DEFAULT 0,
   session_id  TEXT,
-  model       TEXT
+  model       TEXT,
+  missing_since INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS events (

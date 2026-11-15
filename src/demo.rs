@@ -143,6 +143,7 @@ fn seed_demo_cache_at(
             n_events: events.iter().filter(|event| event.source == source).count() as u64,
             session_id: None,
             model: None,
+            missing_since: None,
         })
         .collect();
     let event_count = Store::seed_demo(&cache_path, overwrite, &events, &repos, &files)?;
@@ -306,6 +307,13 @@ fn base36(mut n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_demo_model_has_a_price_unless_cursor_reports_it() {
+        for demo in SOURCES.iter().filter(|s| s.source != Source::Cursor) {
+            assert!(pricing::has_price(demo.model), "no price: {}", demo.model);
+        }
+    }
 
     #[test]
     fn seed_demo_cache_writes_public_synthetic_rows() {

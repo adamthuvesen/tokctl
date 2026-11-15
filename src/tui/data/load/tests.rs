@@ -35,7 +35,8 @@ fn sort_changes_loaded_rows() {
             cost: 2.0,
             is_no_repo: false,
             latest_ts: None,
-            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+            selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+            model_stats: None,
         },
         LeftRow {
             label: "alpha".into(),
@@ -45,7 +46,8 @@ fn sort_changes_loaded_rows() {
             cost: 1.0,
             is_no_repo: false,
             latest_ts: None,
-            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+            selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+            model_stats: None,
         },
     ];
     sort_left_rows(&mut left, Section::Repos, Sort::AlphaAsc);
@@ -88,7 +90,8 @@ fn sessions_section_recent_sort_is_global_across_sources() {
             cost: 100.0,
             is_no_repo: false,
             latest_ts: Some("2026-04-18T09:00:00Z".parse().unwrap()),
-            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+            selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+            model_stats: None,
         },
         LeftRow {
             label: "codex-new".into(),
@@ -98,7 +101,8 @@ fn sessions_section_recent_sort_is_global_across_sources() {
             cost: 1.0,
             is_no_repo: false,
             latest_ts: Some("2026-04-19T09:00:00Z".parse().unwrap()),
-            selection: crate::tui::data::AggregateSelection::Model("fixture".into()),
+            selection: crate::tui::data::AggregateSelection::Model(vec!["fixture".into()]),
+            model_stats: None,
         },
     ];
 
@@ -113,6 +117,7 @@ fn left_memo_key(state: &AppState) -> LeftMemoKey {
         state.time_window,
         state.source_filter,
         state.trend_granularity,
+        state.models_by_family,
     )
 }
 
@@ -317,7 +322,7 @@ fn model_session_drill_uses_first_non_null_project_path() {
     let rows = load_sessions_for(
         &conn,
         QueryScope {
-            model: Some("model-x".into()),
+            models: Some(vec!["model-x".into()]),
             ..Default::default()
         },
     )
@@ -708,7 +713,7 @@ fn model_and_exact_repo_scopes_survive_session_event_drills() {
     tx.commit().unwrap();
     let scope = QueryScope {
         repo: Some(RepoFilterSpec::KeyExact("/repo".into())),
-        model: Some("model-a".into()),
+        models: Some(vec!["model-a".into()]),
         source: Some(Source::Claude),
         ..Default::default()
     };
@@ -741,7 +746,7 @@ fn calendar_rollover_invalidates_memos_without_data_changes() {
     .unwrap();
     tx.commit().unwrap();
     let state = AppState {
-        time_window: TimeWindow::Today,
+        time_window: TimeWindow::D1,
         trend_granularity: TrendGranularity::Daily,
         ..AppState::default()
     };
@@ -788,7 +793,7 @@ fn failed_scope_refresh_keeps_the_data_and_its_previous_scope() {
     let cost = cache.left.iter().map(|row| row.cost).sum::<f64>();
     store.execute_batch("DROP TABLE events").unwrap();
     state.current_section = Section::Models;
-    state.time_window = TimeWindow::Today;
+    state.time_window = TimeWindow::D1;
     cache.refresh_all(&store, &state);
     assert!(cache.refresh_error.is_some());
     assert_eq!(
@@ -838,7 +843,7 @@ fn widening_the_global_window_keeps_the_bucket_and_releases_the_previous_window(
         .day_start(NaiveDate::from_ymd_opt(2026, 4, 22).unwrap())
         .unwrap();
     let mut state = AppState {
-        time_window: TimeWindow::Today,
+        time_window: TimeWindow::D1,
         trend_granularity: TrendGranularity::Monthly,
         sort: Sort::AlphaAsc,
         ..AppState::default()
@@ -877,7 +882,7 @@ fn failed_rollover_preserves_resolved_scope_and_does_not_retry_every_tick() {
     .unwrap();
     tx.commit().unwrap();
     let state = AppState {
-        time_window: TimeWindow::Today,
+        time_window: TimeWindow::D1,
         ..AppState::default()
     };
     let mut cache = DataCache::default();
@@ -1043,4 +1048,209 @@ fn refresh_and_scope_changes_preserve_cursor_sync_failure() {
         cache.visible(&state).cursor_sync_failure.as_deref(),
         Some(failure)
     );
+}
+
+fn model_event(ts_ms: i64, session: &str, source: Source, model: &str, cost: f64) -> EventRow {
+    let mut row = mk_event(ts_ms, "2026-04-22", "2026-04", source, cost);
+    row.session_id = session.into();
+    row.model = model.into();
+    row
+}
+
+fn models_store() -> Store {
+    let mut store = mk_conn();
+    let tx = store.transaction().unwrap();
+    insert_events(
+        &tx,
+        &[
+            model_event(
+                1_000,
+                "dated",
+                Source::Claude,
+                "claude-opus-4-7-20250101",
+                3.0,
+            ),
+            model_event(2_000, "plain", Source::Claude, "claude-opus-4-7", 2.0),
+            model_event(3_000, "sonnet", Source::Claude, "claude-sonnet-4-6", 1.0),
+            model_event(4_000, "mystery", Source::Claude, "mystery-model", 0.0),
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    store
+}
+
+fn models_state(by_family: bool) -> AppState {
+    AppState {
+        current_section: Section::Models,
+        time_window: TimeWindow::All,
+        models_by_family: by_family,
+        ..AppState::default()
+    }
+}
+
+#[test]
+fn models_section_groups_by_normalized_id_and_marks_unpriced() {
+    let store = models_store();
+    let mut cache = DataCache::default();
+    cache.refresh_all(&store, &models_state(false));
+    assert!(cache.refresh_error.is_none());
+    let keys: Vec<_> = cache.left.iter().map(|row| row.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["claude-opus-4-7", "claude-sonnet-4-6", "mystery-model"]
+    );
+    let opus = cache.left[0].model_stats.as_ref().unwrap();
+    assert_eq!(cache.left[0].cost, 5.0);
+    assert_eq!(
+        opus.members,
+        ["claude-opus-4-7", "claude-opus-4-7-20250101"]
+    );
+    assert!(opus.priced);
+    assert!(!cache.left[2].model_stats.as_ref().unwrap().priced);
+    assert!(cache.left_previous_cost.is_none());
+}
+
+#[test]
+fn models_family_toggle_regroups_and_gets_its_own_memo() {
+    let store = models_store();
+    let mut cache = DataCache::default();
+    cache.refresh_all(&store, &models_state(false));
+    cache.refresh_all(&store, &models_state(true));
+    let keys: Vec<_> = cache.left.iter().map(|row| row.key.as_str()).collect();
+    assert_eq!(keys, ["claude-opus", "claude-sonnet", "mystery-model"]);
+    assert_eq!(cache.left_memo.len(), 2);
+}
+
+#[test]
+fn models_drill_includes_sessions_of_every_raw_id_in_the_group() {
+    let store = models_store();
+    let mut cache = DataCache::default();
+    let mut state = models_state(false);
+    cache.refresh_all(&store, &state);
+    let drill = crate::tui::input::drill_target_for_current(&state, &cache).unwrap();
+    assert_eq!(drill.label, "claude-opus-4-7");
+    state.push_drill(drill);
+    cache.refresh_all(&store, &state);
+    let mut sessions: Vec<_> = cache
+        .sessions
+        .iter()
+        .map(|s| s.session_id.as_str())
+        .collect();
+    sessions.sort_unstable();
+    assert_eq!(sessions, ["dated", "plain"]);
+}
+
+#[test]
+fn models_section_reports_the_previous_window_cost() {
+    let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+    let day = 86_400_000;
+    let mut store = mk_conn();
+    let tx = store.transaction().unwrap();
+    insert_events(
+        &tx,
+        &[
+            model_event(
+                now.timestamp_millis() - day,
+                "now",
+                Source::Claude,
+                "claude-opus-4-7",
+                6.0,
+            ),
+            model_event(
+                now.timestamp_millis() - 9 * day,
+                "before",
+                Source::Claude,
+                "claude-opus-4-7",
+                4.0,
+            ),
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let state = AppState {
+        time_window: TimeWindow::D7,
+        ..models_state(false)
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_at(&store, &state, now);
+    assert!(cache.refresh_error.is_none());
+    assert_eq!(cache.left.iter().map(|r| r.cost).sum::<f64>(), 6.0);
+    assert_eq!(cache.left_previous_cost, Some(4.0));
+}
+
+#[test]
+fn model_trend_has_one_zero_filled_column_per_day_so_rows_line_up() {
+    let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+    let day = 86_400_000;
+    let mut store = mk_conn();
+    let tx = store.transaction().unwrap();
+    insert_events(
+        &tx,
+        &[
+            model_event(
+                now.timestamp_millis(),
+                "a-today",
+                Source::Claude,
+                "claude-opus-4-7",
+                2.0,
+            ),
+            model_event(
+                now.timestamp_millis() - 5 * day,
+                "a-old",
+                Source::Claude,
+                "claude-opus-4-7",
+                1.0,
+            ),
+            model_event(
+                now.timestamp_millis() - 2 * day,
+                "b-mid",
+                Source::Claude,
+                "claude-sonnet-4-6",
+                3.0,
+            ),
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    store
+        .execute_batch(
+            "UPDATE events SET day = strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime')",
+        )
+        .unwrap();
+    let state = AppState {
+        time_window: TimeWindow::D7,
+        ..models_state(false)
+    };
+    let mut cache = DataCache::default();
+    cache.refresh_at(&store, &state, now);
+    let trend = |key: &str| {
+        cache
+            .left
+            .iter()
+            .find(|row| row.key == key)
+            .and_then(|row| row.model_stats.as_ref())
+            .unwrap()
+            .daily_cost
+            .clone()
+    };
+    assert_eq!(
+        trend("claude-opus-4-7"),
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0]
+    );
+    assert_eq!(
+        trend("claude-sonnet-4-6"),
+        [0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn long_windows_sum_days_into_equal_buckets() {
+    let today = NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+    let days = vec![(today, 1.0), (today - chrono::Duration::days(29), 2.0)];
+    let out = super::bucket_daily_cost(&days, today, 30);
+    assert_eq!(out.len(), 14);
+    assert_eq!(out[0], 2.0);
+    assert_eq!(out[13], 1.0);
+    assert_eq!(out.iter().sum::<f64>(), 3.0);
 }

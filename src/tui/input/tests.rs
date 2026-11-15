@@ -14,6 +14,7 @@ fn aggregate(label: &str, cost: f64) -> LeftRow {
         is_no_repo: false,
         latest_ts: None,
         selection: AggregateSelection::Repo(RepoFilterSpec::KeyExact(format!("/repo/{label}"))),
+        model_stats: None,
     }
 }
 
@@ -139,7 +140,7 @@ fn event_drill_keeps_the_complete_parent_scope() {
         ..AppState::default()
     };
     let scope = QueryScope {
-        model: Some("model-x".into()),
+        models: Some(vec!["model-x".into()]),
         repo: Some(RepoFilterSpec::KeyExact("/repo/exact".into())),
         since_ms: Some(123),
         until_ms: Some(456),
@@ -168,7 +169,7 @@ fn event_drill_keeps_the_complete_parent_scope() {
     };
     let drill = drill_target_for_current(&state, &cache).unwrap();
     assert_eq!(drill.scope.repo, scope.repo);
-    assert_eq!(drill.scope.model, scope.model);
+    assert_eq!(drill.scope.models, scope.models);
     assert_eq!(drill.scope.since_ms, scope.since_ms);
     assert_eq!(drill.scope.until_ms, scope.until_ms);
     assert_eq!(drill.scope.session.unwrap().source, Source::Codex);
