@@ -61,7 +61,50 @@ impl QueryScope {
 
 pub type QueryFilter = QueryScope;
 
+/// Filters plus the duplicate-message rule, for queries over `events e`.
 pub(crate) fn scope_clause(filter: &QueryScope) -> (String, Vec<Value>) {
+    let (mut clause, mut params) = filter_clause(filter);
+    clause.push_str(&counted_clause(filter, &mut params));
+    (clause, params)
+}
+
+/// The same Claude message id in two session files (a resumed or forked session) counts once.
+/// The copy in the lowest file path within the selected roots wins, so the result depends on
+/// neither ingest order nor roots the report does not read.
+fn counted_clause(filter: &QueryScope, params: &mut Vec<Value>) -> String {
+    let roots = match &filter.roots {
+        Some(roots) => format!(" AND {}", root_clause("other", roots, params)),
+        None => String::new(),
+    };
+    format!(
+        " AND (e.message_id IS NULL OR NOT EXISTS (SELECT 1 FROM events other \
+         WHERE other.message_id = e.message_id AND other.source = 'claude' \
+         AND other.file_path < e.file_path{roots}))"
+    )
+}
+
+fn root_clause(alias: &str, roots: &[PathBuf], params: &mut Vec<Value>) -> String {
+    let mut root_clauses = Vec::new();
+    for root in roots {
+        let root = root.to_string_lossy();
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        root_clauses.push(format!(
+            "({alias}.file_path = ? OR substr({alias}.file_path,1,length(?)) = ?)"
+        ));
+        params.extend([
+            Value::Text(root.into_owned()),
+            Value::Text(prefix.clone()),
+            Value::Text(prefix),
+        ]);
+    }
+    if root_clauses.is_empty() {
+        "0".into()
+    } else {
+        format!("({})", root_clauses.join(" OR "))
+    }
+}
+
+fn filter_clause(filter: &QueryScope) -> (String, Vec<Value>) {
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     if let Some(source) = filter.source {
@@ -105,22 +148,7 @@ pub(crate) fn scope_clause(filter: &QueryScope) -> (String, Vec<Value>) {
         ]);
     }
     if let Some(roots) = &filter.roots {
-        let mut root_clauses = Vec::new();
-        for root in roots {
-            let root = root.to_string_lossy();
-            let prefix = format!("{}/", root.trim_end_matches('/'));
-            root_clauses.push("(e.file_path = ? OR substr(e.file_path,1,length(?)) = ?)");
-            params.extend([
-                Value::Text(root.into_owned()),
-                Value::Text(prefix.clone()),
-                Value::Text(prefix),
-            ]);
-        }
-        clauses.push(if root_clauses.is_empty() {
-            "0".into()
-        } else {
-            format!("({})", root_clauses.join(" OR "))
-        });
+        clauses.push(root_clause("e", roots, &mut params));
     }
     (
         if clauses.is_empty() {
@@ -182,7 +210,7 @@ pub fn daily_report(store: &Store, filter: QueryFilter) -> Result<Vec<AggregateR
              SUM(e.cache_write) AS cache_write_tokens,
              SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
              SUM(e.cost_usd)    AS cost_usd
-           FROM counted_events e
+           FROM events e
            WHERE 1=1 {scope}
            GROUP BY key
            ORDER BY key ASC"#,
@@ -205,7 +233,7 @@ pub fn monthly_report(store: &Store, filter: QueryFilter) -> Result<Vec<Aggregat
              SUM(e.cache_write) AS cache_write_tokens,
              SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
              SUM(e.cost_usd)    AS cost_usd
-           FROM counted_events e
+           FROM events e
            WHERE 1=1 {scope}
            GROUP BY key
            ORDER BY key ASC"#,
@@ -247,7 +275,7 @@ pub fn session_report(store: &Store, filter: QueryFilter) -> Result<Vec<Aggregat
     let sql = format!(
         r#"WITH filtered AS (
              SELECT e.*
-             FROM counted_events e
+             FROM events e
              WHERE 1=1 {scope}
            )
            SELECT
@@ -354,7 +382,7 @@ pub fn repo_report(store: &Store, filter: QueryFilter) -> Result<Vec<RepoAggrega
              SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
              SUM(e.cost_usd)    AS cost_usd,
              MAX(e.ts)          AS latest_ts
-           FROM counted_events e
+           FROM events e
            LEFT JOIN repos r ON r.key = e.repo
            WHERE 1=1 {scope}
            GROUP BY COALESCE(e.repo, '{no_repo}')
@@ -431,7 +459,7 @@ pub fn period_buckets(
                   SUM(e.cost_usd) AS cost,
                   SUM(e.input + e.output + e.cache_read + e.cache_write) AS total_tokens,
                   MAX(e.ts) AS latest_ts
-             FROM counted_events e
+             FROM events e
              WHERE 1=1 {scope}
              GROUP BY bucket
              ORDER BY bucket DESC"#,
@@ -463,7 +491,7 @@ pub fn model_usage(store: &Store, filter: QueryFilter) -> Result<Vec<ModelUsageR
         r#"SELECT e.source, e.model,
                   SUM(e.input), SUM(e.output), SUM(e.cache_read), SUM(e.cache_write),
                   SUM(e.cost_usd), MAX(e.ts), COUNT(*)
-             FROM counted_events e
+             FROM events e
              WHERE 1=1 {scope}
              GROUP BY e.source, e.model"#,
         scope = scope_clause(&filter).0,
@@ -519,7 +547,7 @@ pub fn daily_cost_by_source(
                    e.source,
                    SUM(e.cost_usd) AS cost,
                    SUM(e.input + e.output + e.cache_read + e.cache_write) AS tokens
-                 FROM counted_events e
+                 FROM events e
                  WHERE 1=1 {}
                  GROUP BY e.day, e.source"#,
         scope_clause(&filter).0
@@ -556,7 +584,7 @@ pub fn resolve_repo_filter_scoped(
     }
     let (clause, mut parameters) = scope_clause(scope);
     parameters.push(Value::Text(name.into()));
-    let sql = format!("SELECT DISTINCT e.repo FROM counted_events e JOIN repos r ON r.key=e.repo WHERE 1=1 {clause} AND r.display_name=? ORDER BY e.repo");
+    let sql = format!("SELECT DISTINCT e.repo FROM events e JOIN repos r ON r.key=e.repo WHERE 1=1 {clause} AND r.display_name=? ORDER BY e.repo");
     let mut statement = store.connection().prepare_cached(&sql)?;
     let keys = statement
         .query_map(params_from_iter(parameters), |row| row.get::<_, String>(0))?
@@ -616,7 +644,7 @@ pub fn report_diagnostics_for_scopes(
     };
     let connection = store.connection();
     let mut statement = connection.prepare_cached(&format!(
-        "SELECT DISTINCT e.model FROM counted_events e WHERE e.source <> 'cursor' AND ({events})"
+        "SELECT DISTINCT e.model FROM events e WHERE e.source <> 'cursor' AND ({events})"
     ))?;
     let unknown_models = statement
         .query_map(params_from_iter(&event_parameters), |row| {
@@ -629,7 +657,7 @@ pub fn report_diagnostics_for_scopes(
     let mut cost_parameters = vec![Value::Text(crate::pricing::signature())];
     cost_parameters.extend(event_parameters);
     let (legacy_cost_rows, stale_pricing_rows) = connection.query_row(
-        &format!("SELECT COALESCE(SUM(e.cost_provenance='legacy'),0), COALESCE(SUM(e.cost_provenance NOT IN ('legacy','source',?)),0) FROM counted_events e WHERE {events}"),
+        &format!("SELECT COALESCE(SUM(e.cost_provenance='legacy'),0), COALESCE(SUM(e.cost_provenance NOT IN ('legacy','source',?)),0) FROM events e WHERE {events}"),
         params_from_iter(cost_parameters),
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -670,7 +698,7 @@ fn diagnostic_file_clause(scope: &QueryScope) -> (String, Vec<Value>) {
         roots: scope.roots.clone(),
         ..Default::default()
     };
-    let (clause, mut parameters) = scope_clause(&files);
+    let (clause, mut parameters) = filter_clause(&files);
     let mut file_clause = clause
         .replace("e.source", "f.source")
         .replace("e.file_path", "f.path");
@@ -682,7 +710,7 @@ fn diagnostic_file_clause(scope: &QueryScope) -> (String, Vec<Value>) {
     {
         let (clause, values) = scope_clause(scope);
         file_clause.push_str(&format!(
-            " AND EXISTS(SELECT 1 FROM counted_events e WHERE e.file_path=f.path {clause})"
+            " AND EXISTS(SELECT 1 FROM events e WHERE e.file_path=f.path {clause})"
         ));
         parameters.extend(values);
     }
@@ -732,7 +760,7 @@ pub fn event_rows(store: &Store, scope: QueryScope) -> Result<Vec<EventReportRow
         return store.read_snapshot(|store| event_rows(store, scope));
     }
     let (clause, parameters) = scope_clause(&scope);
-    let sql = format!("SELECT e.ts,e.model,e.input,e.output,e.cache_read,e.cache_write,e.cost_usd FROM counted_events e WHERE 1=1 {clause} ORDER BY e.ts,e.id");
+    let sql = format!("SELECT e.ts,e.model,e.input,e.output,e.cache_read,e.cache_write,e.cost_usd FROM events e WHERE 1=1 {clause} ORDER BY e.ts,e.id");
     let mut statement = store.connection().prepare_cached(&sql)?;
     let rows = statement.query_map(params_from_iter(parameters), |row| {
         let millis = row.get(0)?;
@@ -786,14 +814,14 @@ pub(crate) fn comparison_rows(
 ) -> Result<Vec<ComparisonRow>> {
     let (clause, mut parameters) = scope_clause(scope);
     parameters.extend([Value::Text(start.into()), Value::Text(end.into())]);
-    let aggregate_sql = format!("SELECT COALESCE(SUM(e.input+e.output+e.cache_read+e.cache_write),0),COALESCE(SUM(e.cost_usd),0) FROM counted_events e WHERE 1=1 {clause} AND e.day >= ? AND e.day <= ?");
+    let aggregate_sql = format!("SELECT COALESCE(SUM(e.input+e.output+e.cache_read+e.cache_write),0),COALESCE(SUM(e.cost_usd),0) FROM events e WHERE 1=1 {clause} AND e.day >= ? AND e.day <= ?");
     store
         .connection()
         .query_row(&aggregate_sql, params_from_iter(parameters.iter()), |row| {
             let _: u64 = row.get(0)?;
             read_cost(row, 1)
         })?;
-    let sql = format!("SELECT e.source,e.session_id,e.repo,COALESCE(r.display_name,'(no-repo)'),e.model,e.input,e.output,e.cache_read,e.cache_write,e.cost_usd FROM counted_events e LEFT JOIN repos r ON r.key=e.repo WHERE 1=1 {clause} AND e.day >= ? AND e.day <= ?");
+    let sql = format!("SELECT e.source,e.session_id,e.repo,COALESCE(r.display_name,'(no-repo)'),e.model,e.input,e.output,e.cache_read,e.cache_write,e.cost_usd FROM events e LEFT JOIN repos r ON r.key=e.repo WHERE 1=1 {clause} AND e.day >= ? AND e.day <= ?");
     let mut statement = store.connection().prepare_cached(&sql)?;
     let rows = statement.query_map(params_from_iter(parameters), |row| {
         Ok(ComparisonRow {

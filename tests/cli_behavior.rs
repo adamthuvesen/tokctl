@@ -528,6 +528,47 @@ fn a_claude_message_id_in_two_session_files_counts_once() {
     }
 }
 
+#[test]
+fn a_duplicate_claude_message_under_an_unselected_cached_root_still_counts() {
+    let workspace = tempfile::tempdir().unwrap();
+    // `a` sorts before `b`, so the copy under the unselected root would win a global dedupe.
+    for root in ["a", "b"] {
+        let project = workspace.path().join(root).join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("session.jsonl"),
+            claude_line("m1", "s-1", 100, 40) + "\n",
+        )
+        .unwrap();
+    }
+    let cache = workspace.path().join("cache");
+    let report = |root: &str, no_cache: bool| {
+        let mut command = tokctl();
+        command
+            .args(["daily", "--json", "--source", "claude"])
+            .env("TOKCTL_CLAUDE_DIR", workspace.path().join(root))
+            .env("TOKCTL_CACHE_DIR", &cache);
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    report("a", false);
+    for no_cache in [false, true] {
+        let rows = report("b", no_cache);
+        assert_eq!(
+            rows[0]["totalTokens"], 140,
+            "no_cache={no_cache}: the copy under b counts once: {rows}"
+        );
+    }
+}
+
 fn write_cursor_credentials(home: &std::path::Path, contents: &str) {
     let dir = home.join(".config/tokctl");
     fs::create_dir_all(&dir).unwrap();
